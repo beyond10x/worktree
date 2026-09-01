@@ -2,8 +2,8 @@
 
 use b10x_worktree::RegistryPort;
 use b10x_worktree_domain::{
-    Lifecycle, OperationEvidence, Refusal, SURFACE_VERSION, WorkspacePolicy, WorktreeId,
-    WorktreeRecord,
+    Lifecycle, OperationEvidence, Refusal, RelocationIntent, SURFACE_VERSION, WorkspacePolicy,
+    WorktreeId, WorktreeRecord,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -206,7 +206,14 @@ impl SqliteRegistry {
                    recorded_at INTEGER NOT NULL,
                    payload TEXT NOT NULL
                  );
-                 PRAGMA user_version=1;",
+                 CREATE TABLE IF NOT EXISTS relocations (
+                   worktree_id TEXT PRIMARY KEY REFERENCES worktrees(id) ON DELETE CASCADE,
+                   from_path TEXT NOT NULL,
+                   to_path TEXT NOT NULL UNIQUE,
+                   head TEXT NOT NULL,
+                   planned_at INTEGER NOT NULL
+                 );
+                 PRAGMA user_version=2;",
             )
             .map_err(|error| Refusal::new("registry-migration-failed", error.to_string()))?;
         Ok(Self {
@@ -361,6 +368,103 @@ impl RegistryPort for SqliteRegistry {
         let connection = self.connection()?;
         insert_record(&connection, record)
     }
+
+    fn relocation(&self, id: &str) -> Result<Option<RelocationIntent>, Refusal> {
+        self.connection()?
+            .query_row(
+                "SELECT worktree_id,from_path,to_path,head,planned_at FROM relocations WHERE worktree_id=?1",
+                [id],
+                |row| {
+                    let id: String = row.get(0)?;
+                    Ok(RelocationIntent {
+                        id: WorktreeId::new(id).map_err(sql_conversion_error)?,
+                        from: PathBuf::from(row.get::<_, String>(1)?),
+                        to: PathBuf::from(row.get::<_, String>(2)?),
+                        head: row.get(3)?,
+                        planned_at: row.get(4)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(database_error)
+    }
+
+    fn begin_relocation(&self, intent: &RelocationIntent) -> Result<(), Refusal> {
+        if let Some(existing) = self.relocation(intent.id.as_str())? {
+            return if existing == *intent {
+                Ok(())
+            } else {
+                Err(Refusal::new(
+                    "relocation-already-planned",
+                    "a different relocation intent already exists",
+                ))
+            };
+        }
+        self.connection()?
+            .execute(
+                "INSERT INTO relocations(worktree_id,from_path,to_path,head,planned_at) VALUES(?1,?2,?3,?4,?5)",
+                params![
+                    intent.id.as_str(),
+                    path_text(&intent.from)?,
+                    path_text(&intent.to)?,
+                    intent.head,
+                    intent.planned_at,
+                ],
+            )
+            .map(|_| ())
+            .map_err(database_error)
+    }
+
+    fn complete_relocation(
+        &self,
+        intent: &RelocationIntent,
+        evidence: &OperationEvidence,
+    ) -> Result<(), Refusal> {
+        let connection = self.connection()?;
+        let transaction = connection.unchecked_transaction().map_err(database_error)?;
+        changed(
+            transaction.execute(
+                "UPDATE worktrees SET path=?2,head=?3,last_seen_at=?4 WHERE id=?1 AND path=?5",
+                params![
+                    intent.id.as_str(),
+                    path_text(&intent.to)?,
+                    intent.head,
+                    evidence.recorded_at,
+                    path_text(&intent.from)?,
+                ],
+            ),
+            "relocate",
+        )?;
+        transaction
+            .execute(
+                "INSERT INTO events(worktree_id,operation,recorded_at,payload) VALUES(?1,?2,?3,?4)",
+                params![
+                    intent.id.as_str(),
+                    evidence.operation,
+                    evidence.recorded_at,
+                    format!(
+                        "from={} to={} head={}",
+                        intent.from.display(),
+                        intent.to.display(),
+                        intent.head
+                    )
+                ],
+            )
+            .map_err(database_error)?;
+        changed(
+            transaction.execute(
+                "DELETE FROM relocations WHERE worktree_id=?1 AND from_path=?2 AND to_path=?3 AND head=?4",
+                params![
+                    intent.id.as_str(),
+                    path_text(&intent.from)?,
+                    path_text(&intent.to)?,
+                    intent.head,
+                ],
+            ),
+            "complete-relocation",
+        )?;
+        transaction.commit().map_err(database_error)
+    }
 }
 
 fn insert_record(connection: &Connection, record: &WorktreeRecord) -> Result<(), Refusal> {
@@ -469,5 +573,50 @@ mod tests {
         };
         registry.adopt(&record).unwrap();
         assert_eq!(registry.list().unwrap(), vec![record]);
+    }
+
+    #[test]
+    fn relocation_intent_is_durable_until_path_update_commits() {
+        let temporary = tempdir().unwrap();
+        let registry = SqliteRegistry::open(&temporary.path().join("registry.sqlite3")).unwrap();
+        let record = WorktreeRecord {
+            id: WorktreeId::new("legacy-one").unwrap(),
+            repository_root: "/repo".into(),
+            path: "/legacy/one".into(),
+            purpose: "migration test".into(),
+            owner: "test".into(),
+            lifecycle: Lifecycle::Active,
+            created_at: 1,
+            last_seen_at: 1,
+            finished_at: None,
+            head: Some("abc".into()),
+        };
+        registry.adopt(&record).unwrap();
+        let intent = RelocationIntent {
+            id: record.id.clone(),
+            from: record.path.clone(),
+            to: "/managed/repo/legacy-one".into(),
+            head: "abc".into(),
+            planned_at: 2,
+        };
+        registry.begin_relocation(&intent).unwrap();
+        assert_eq!(
+            registry.relocation("legacy-one").unwrap(),
+            Some(intent.clone())
+        );
+
+        let evidence = OperationEvidence {
+            operation: "migrate".into(),
+            id: record.id,
+            path: intent.to.clone(),
+            head: Some("abc".into()),
+            recovery: None,
+            recorded_at: 3,
+        };
+        registry.complete_relocation(&intent, &evidence).unwrap();
+        assert!(registry.relocation("legacy-one").unwrap().is_none());
+        let migrated = registry.list().unwrap().pop().unwrap();
+        assert_eq!(migrated.path, intent.to);
+        assert_eq!(migrated.head.as_deref(), Some("abc"));
     }
 }

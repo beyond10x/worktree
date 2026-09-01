@@ -311,6 +311,54 @@ pub struct CleanupAssessment {
     pub evidence: Option<OperationEvidence>,
 }
 
+/// One manager-owned registry inconsistency that can be reconciled safely.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "kebab-case")]
+pub enum ReconciliationAction {
+    /// Move an adopted linked worktree into the configured managed root.
+    Migrate {
+        /// Current canonical path.
+        from: PathBuf,
+        /// Policy-derived destination.
+        to: PathBuf,
+    },
+    /// Record that a worktree which is already absent is no longer active.
+    TombstoneMissing {
+        /// Missing registered path.
+        path: PathBuf,
+    },
+}
+
+/// One reconciliation assessment, returned by dry-runs and apply operations.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReconciliationAssessment {
+    /// Registered worktree.
+    pub record: WorktreeRecord,
+    /// Proposed or applied action.
+    pub action: ReconciliationAction,
+    /// Whether all reconciliation preconditions currently pass.
+    pub eligible: bool,
+    /// Refusal explaining why the record is retained.
+    pub refusal: Option<Refusal>,
+    /// Evidence when an apply run changed Git or registry state.
+    pub evidence: Option<OperationEvidence>,
+}
+
+/// Durable intent used to recover an interrupted legacy relocation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelocationIntent {
+    /// Worktree identity.
+    pub id: WorktreeId,
+    /// Registered source path.
+    pub from: PathBuf,
+    /// Policy-derived destination path.
+    pub to: PathBuf,
+    /// HEAD observed before the move.
+    pub head: String,
+    /// Time at which the intent was recorded.
+    pub planned_at: i64,
+}
+
 /// Typed refusal: absence of permission or evidence, not an unstructured error.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
 #[error("{code}: {message}")]

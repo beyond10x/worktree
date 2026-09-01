@@ -47,6 +47,18 @@ flowchart LR
 Dry-run garbage collection traverses the same proof but stops before revalidation and removal.
 Unknown, offline, dirty, locked, live, local-only, and out-of-root states retain the tree.
 
+## Legacy reconciliation
+
+Adopted worktrees that predate the managed root are never deleted in place. Reconciliation records
+a durable relocation intent, moves the linked tree with non-forced `git worktree move`, verifies
+that HEAD is unchanged, and atomically updates the registry. A subsequent apply can complete an
+interrupted move when Git reports exactly one of the recorded source or destination paths.
+
+When a registered path is already absent, reconciliation changes registry state only after Git no
+longer reports the worktree, no lease is live, and the stored HEAD is freshly reachable from a
+remote branch or tag. Failed provisioning records without a HEAD may be tombstoned only when no
+filesystem or Git artifact exists.
+
 ## Durable state
 
 Activated profiles live under `$XDG_CONFIG_HOME/worktree/config.toml`. The ownership registry,

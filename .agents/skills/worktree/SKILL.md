@@ -31,6 +31,7 @@ Hook integrations should run `worktree hook session-start --session <id>` on ent
 
 - Run `worktree status` for durable lifecycle state.
 - Run `worktree repo list --repo <path>` to distinguish managed, unmanaged, primary, and linked checkouts.
+- Run `worktree reconcile --repo <path> --dry-run` to assess adopted legacy paths and missing records. Apply only reviewed ids with repeated `--id` arguments.
 - Run `worktree doctor --check` for prerequisites and configuration.
 - Use `worktree repo adopt ...` only after a human explicitly decides an existing tree should become manager-owned.
 

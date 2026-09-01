@@ -2,7 +2,10 @@
 
 use anyhow::{Context, Result, anyhow};
 use b10x_worktree::{GitPort, RegistryPort, SystemClock, WorktreeManager};
-use b10x_worktree_domain::{CreateRequest, GitRevision, Refusal, SURFACE_VERSION, WorktreeId};
+use b10x_worktree_domain::{
+    CreateRequest, GitRevision, ReconciliationAction, ReconciliationAssessment, Refusal,
+    SURFACE_VERSION, WorktreeId,
+};
 use b10x_worktree_git::ProcessGit;
 use b10x_worktree_state::{
     ProfileTemplate, SqliteRegistry, config_path, load_config, registry_path, resolve_policy,
@@ -39,6 +42,8 @@ enum Command {
     },
     /// Assess or safely remove finished and expired worktrees.
     Gc(GcArgs),
+    /// Reconcile adopted legacy paths and already-missing registry records.
+    Reconcile(ReconcileArgs),
     /// Check configuration, registry and Git prerequisites.
     Doctor {
         /// Exit unsuccessfully if any check fails.
@@ -97,6 +102,22 @@ struct GcArgs {
     #[arg(long, default_value = ".")]
     repo: PathBuf,
     /// Apply eligible removals. Without this flag, GC is a dry-run.
+    #[arg(long, conflicts_with = "dry_run")]
+    apply: bool,
+    /// Explicitly document dry-run intent.
+    #[arg(long)]
+    dry_run: bool,
+}
+
+#[derive(Debug, Args)]
+struct ReconcileArgs {
+    /// Repository used to select its activated workspace policy.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Exact registered id to assess or apply; repeat for multiple records.
+    #[arg(long = "id")]
+    ids: Vec<String>,
+    /// Apply reviewed reconciliation actions. Requires at least one id.
     #[arg(long, conflicts_with = "dry_run")]
     apply: bool,
     /// Explicitly document dry-run intent.
@@ -189,6 +210,7 @@ fn run(cli: &Cli) -> Result<()> {
             })
         }
         Command::Gc(args) => gc(args, cli.json),
+        Command::Reconcile(args) => reconcile(args, cli.json),
         Command::Doctor { check } => doctor(*check, cli.json),
         Command::Repo { command } => repo(command, cli.json),
         Command::Hook { command } => hook(command, cli.json),
@@ -305,6 +327,68 @@ fn gc(args: &GcArgs, json: bool) -> Result<()> {
                         item.record.id,
                         item.record.path.display()
                     )
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+    })
+}
+
+#[derive(Serialize)]
+struct ReconciliationReport<'a> {
+    reconciliation_version: u32,
+    assessments: &'a [ReconciliationAssessment],
+}
+
+fn reconcile(args: &ReconcileArgs, json: bool) -> Result<()> {
+    if args.apply && args.ids.is_empty() {
+        return Err(anyhow!(
+            "reconcile --apply requires at least one reviewed --id"
+        ));
+    }
+    let repository = ProcessGit
+        .repository_snapshot(&args.repo)
+        .map_err(anyhow::Error::new)?;
+    let config =
+        load_config(&config_path().map_err(anyhow::Error::new)?).map_err(anyhow::Error::new)?;
+    let policy = resolve_policy(&config, &repository.root).map_err(anyhow::Error::new)?;
+    let ids = args
+        .ids
+        .iter()
+        .map(|id| WorktreeId::new(id.clone()).map_err(anyhow::Error::new))
+        .collect::<Result<Vec<_>>>()?;
+    let assessments = manager()?
+        .reconcile(policy, &ids, args.apply)
+        .map_err(anyhow::Error::new)?;
+    let report = ReconciliationReport {
+        reconciliation_version: 1,
+        assessments: &assessments,
+    };
+    emit(json, &report, || {
+        if assessments.is_empty() {
+            "no reconciliation candidates".into()
+        } else {
+            assessments
+                .iter()
+                .map(|item| {
+                    let action = match &item.action {
+                        ReconciliationAction::Migrate { from, to } => {
+                            format!("migrate {} -> {}", from.display(), to.display())
+                        }
+                        ReconciliationAction::TombstoneMissing { path } => {
+                            format!("tombstone missing {}", path.display())
+                        }
+                    };
+                    let outcome = item.evidence.as_ref().map_or_else(
+                        || {
+                            item.refusal.as_ref().map_or_else(
+                                || "eligible".into(),
+                                |reason| format!("retained: {reason}"),
+                            )
+                        },
+                        |_| "applied".into(),
+                    );
+                    format!("{}\t{outcome}\t{action}", item.record.id)
                 })
                 .collect::<Vec<_>>()
                 .join("\n")
@@ -600,6 +684,7 @@ Hook integrations should run `worktree hook session-start --session <id>` on ent
 
 - Run `worktree status` for durable lifecycle state.
 - Run `worktree repo list --repo <path>` to distinguish managed, unmanaged, primary, and linked checkouts.
+- Run `worktree reconcile --repo <path> --dry-run` to assess adopted legacy paths and missing records. Apply only reviewed ids with repeated `--id` arguments.
 - Run `worktree doctor --check` for prerequisites and configuration.
 - Use `worktree repo adopt ...` only after a human explicitly decides an existing tree should become manager-owned.
 
