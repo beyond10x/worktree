@@ -1,0 +1,15 @@
+schema: b10x-change/v1
+id: worktree/managed-worktrees-0.1.0
+repository: worktree
+publishedAt: 2026-09-01T09:12:28Z
+title: Managed worktrees gain a reusable lifecycle toolchain
+summary: Worktree 0.1.0 publishes the embeddable lifecycle service, Git and SQLite adapters, CLI, hook protocol, and generated agent skill.
+kind: capability
+impact: significant
+source:
+  url: https://github.com/beyond10x/worktree/releases/tag/0.1.0
+  version: 0.1.0
+journeys: [build-agents, operate-services]
+affectedSurfaces: [worktree/docs]
+relations:
+  - {target: change:agentplugins/workspace-hygiene-0.3.0, kind: enables, label: Supplies the generated worktree skill}
