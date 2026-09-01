@@ -167,6 +167,23 @@ impl GitPort for ProcessGit {
         )
     }
 
+    fn move_worktree(&self, repository: &Path, from: &Path, to: &Path) -> Result<(), Refusal> {
+        if let Some(parent) = to.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| Refusal::new("move-worktree-parent-failed", error.to_string()))?;
+        }
+        Self::status(
+            repository,
+            [
+                OsStr::new("worktree"),
+                OsStr::new("move"),
+                from.as_os_str(),
+                to.as_os_str(),
+            ],
+        )
+        .map_err(|error| Refusal::new("move-worktree-failed", error.message))
+    }
+
     fn list_worktrees(&self, repository: &Path) -> Result<Vec<DiscoveredWorktree>, Refusal> {
         let output = Self::output(repository, ["worktree", "list", "--porcelain"])?;
         let mut result = Vec::new();
@@ -203,5 +220,90 @@ impl GitPort for ProcessGit {
             }
         }
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn git(repository: &Path, args: &[&OsStr]) {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(repository)
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    #[test]
+    fn moves_a_dirty_linked_tree_without_losing_state() {
+        let temporary = tempdir().unwrap();
+        let repository = temporary.path().join("repo");
+        std::fs::create_dir(&repository).unwrap();
+        git(
+            &repository,
+            &[OsStr::new("init"), OsStr::new("-b"), OsStr::new("main")],
+        );
+        git(
+            &repository,
+            &[
+                OsStr::new("config"),
+                OsStr::new("user.email"),
+                OsStr::new("test@example.invalid"),
+            ],
+        );
+        git(
+            &repository,
+            &[
+                OsStr::new("config"),
+                OsStr::new("user.name"),
+                OsStr::new("Worktree Test"),
+            ],
+        );
+        std::fs::write(repository.join("tracked"), "one\n").unwrap();
+        git(&repository, &[OsStr::new("add"), OsStr::new("tracked")]);
+        git(
+            &repository,
+            &[
+                OsStr::new("commit"),
+                OsStr::new("-m"),
+                OsStr::new("initial"),
+            ],
+        );
+
+        let legacy = temporary.path().join("legacy");
+        git(
+            &repository,
+            &[
+                OsStr::new("worktree"),
+                OsStr::new("add"),
+                OsStr::new("--detach"),
+                legacy.as_os_str(),
+                OsStr::new("HEAD"),
+            ],
+        );
+        std::fs::write(legacy.join("untracked"), "preserve me\n").unwrap();
+        let managed = temporary.path().join("managed").join("one");
+
+        ProcessGit
+            .move_worktree(&repository, &legacy, &managed)
+            .unwrap();
+
+        assert!(!legacy.exists());
+        assert_eq!(
+            std::fs::read_to_string(managed.join("untracked")).unwrap(),
+            "preserve me\n"
+        );
+        assert!(
+            ProcessGit
+                .worktree_snapshot(&repository, &managed)
+                .unwrap()
+                .dirty
+        );
+        let discovered = ProcessGit.list_worktrees(&repository).unwrap();
+        assert!(discovered.iter().any(|item| item.path == managed));
     }
 }

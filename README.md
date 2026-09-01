@@ -21,6 +21,7 @@ worktree create --purpose dependency-refresh
 worktree status
 worktree finish
 worktree gc --dry-run
+worktree reconcile --repo /path/to/repository --dry-run
 worktree doctor --check
 ```
 
@@ -40,6 +41,11 @@ Use `worktree repo list --repo <path>` to inventory linked trees without adoptin
 Existing trees only become manager-owned through the explicit `repo adopt` command. Hook integrations
 can maintain cleanup-blocking leases with `hook session-start`, `hook heartbeat`, and
 `hook session-end`.
+
+`worktree reconcile` repairs manager-owned legacy state without weakening cleanup containment. It
+moves adopted linked trees into the configured managed root with `git worktree move`, and can
+tombstone an already-missing record only when Git no longer reports the tree and its stored commit
+has fresh remote recovery proof. Apply mode requires the exact reviewed `--id` values.
 
 ## Embed
 
