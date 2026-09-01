@@ -10,13 +10,13 @@ XDG-state SQLite registry.
 
 ## Install
 
-```console
+```bash
 cargo install --git https://github.com/beyond10x/worktree --tag 0.1.0 b10x-worktree-cli
 ```
 
 ## Use
 
-```console
+```bash
 worktree create --purpose dependency-refresh
 worktree status
 worktree finish
@@ -29,7 +29,7 @@ workspace profile with `worktree activate --profile profile.toml --workspace /pa
 
 Generate portable agent guidance from the exact installed command surface:
 
-```console
+```bash
 worktree skill --out .agents/skills/worktree
 ```
 
