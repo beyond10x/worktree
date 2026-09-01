@@ -1,0 +1,4 @@
+version = 1
+name = "default"
+expire_after_seconds = 604800
+protect_workspace_root = false

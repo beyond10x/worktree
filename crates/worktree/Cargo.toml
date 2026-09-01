@@ -1,0 +1,20 @@
+[package]
+name = "b10x-worktree"
+description = "Embeddable worktree lifecycle service and ports"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+b10x-worktree-domain.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true
+

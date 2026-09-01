@@ -1,0 +1,21 @@
+[package]
+name = "b10x-worktree-git"
+description = "Process-backed Git adapter for b10x-worktree"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+b10x-worktree-domain.workspace = true
+b10x-worktree.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true
+

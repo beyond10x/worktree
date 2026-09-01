@@ -1,0 +1,4 @@
+interface:
+  display_name: "Worktree"
+  short_description: "Safely manage isolated Git worktree lifecycles"
+  default_prompt: "Use the worktree CLI to create or maintain an isolated checkout, preserve recovery evidence, and clean it up safely."

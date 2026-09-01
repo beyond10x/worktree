@@ -1,0 +1,11 @@
+version: '3'
+
+tasks:
+  check:
+    desc: Run the complete offline repository gate.
+    cmds:
+      - cargo fmt --all -- --check
+      - cargo clippy --workspace --all-targets --locked -- -D warnings
+      - cargo test --workspace --locked
+      - cargo run --quiet --locked -- skill --out .agents/skills/worktree --check
+
