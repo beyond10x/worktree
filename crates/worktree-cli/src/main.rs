@@ -336,7 +336,7 @@ fn gc(args: &GcArgs, json: bool) -> Result<()> {
 
 #[derive(Serialize)]
 struct ReconciliationReport<'a> {
-    reconciliation_version: u32,
+    version: u32,
     assessments: &'a [ReconciliationAssessment],
 }
 
@@ -361,7 +361,7 @@ fn reconcile(args: &ReconcileArgs, json: bool) -> Result<()> {
         .reconcile(policy, &ids, args.apply)
         .map_err(anyhow::Error::new)?;
     let report = ReconciliationReport {
-        reconciliation_version: 1,
+        version: SURFACE_VERSION,
         assessments: &assessments,
     };
     emit(json, &report, || {
@@ -705,6 +705,19 @@ fn skill_interface() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reconciliation_report_uses_standard_version_key() {
+        let assessments = Vec::<ReconciliationAssessment>::new();
+        let value = serde_json::to_value(ReconciliationReport {
+            version: SURFACE_VERSION,
+            assessments: &assessments,
+        })
+        .unwrap();
+
+        assert_eq!(value["version"], SURFACE_VERSION);
+        assert!(value.get("reconciliation_version").is_none());
+    }
 
     #[test]
     fn managed_guidance_is_replaced_idempotently() {
