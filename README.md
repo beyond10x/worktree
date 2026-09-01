@@ -57,3 +57,9 @@ See [docs/architecture.md](docs/architecture.md) for the dependency direction an
 - `b10x-worktree-git`: process-backed Git adapter.
 - `b10x-worktree-state`: SQLite registry and XDG configuration.
 - `b10x-worktree-cli`: `worktree` binary, hook protocol and skill renderer.
+
+<!-- b10x-docs:start -->
+## Documentation
+
+[Worktree documentation](https://beyond10x.github.io/docs/worktree/) · [Start](https://beyond10x.github.io/) · [Ecosystem](https://beyond10x.github.io/ecosystem/) · [Impact](https://beyond10x.github.io/changes/) · [Releases](https://beyond10x.github.io/releases/)
+<!-- b10x-docs:end -->
