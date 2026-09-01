@@ -41,6 +41,21 @@ impl ProcessGit {
     {
         Self::output(repository, args).map(|_| ())
     }
+
+    fn existing_ancestor(path: &Path) -> Result<&Path, Refusal> {
+        let mut candidate = path;
+        loop {
+            if candidate.exists() {
+                return Ok(candidate);
+            }
+            candidate = candidate.parent().ok_or_else(|| {
+                Refusal::new(
+                    "move-worktree-parent-missing",
+                    format!("{} has no existing ancestor", path.display()),
+                )
+            })?;
+        }
+    }
 }
 
 impl GitPort for ProcessGit {
@@ -184,6 +199,11 @@ impl GitPort for ProcessGit {
         .map_err(|error| Refusal::new("move-worktree-failed", error.message))
     }
 
+    fn validate_move_worktree(&self, from: &Path, to: &Path) -> Result<(), Refusal> {
+        let destination_parent = Self::existing_ancestor(to)?;
+        same_filesystem(from, destination_parent)
+    }
+
     fn list_worktrees(&self, repository: &Path) -> Result<Vec<DiscoveredWorktree>, Refusal> {
         let output = Self::output(repository, ["worktree", "list", "--porcelain"])?;
         let mut result = Vec::new();
@@ -221,6 +241,35 @@ impl GitPort for ProcessGit {
         }
         Ok(result)
     }
+}
+
+#[cfg(unix)]
+fn same_filesystem(from: &Path, to: &Path) -> Result<(), Refusal> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let from_device = std::fs::metadata(from)
+        .map_err(|error| Refusal::new("worktree-metadata-failed", error.to_string()))?
+        .dev();
+    let to_device = std::fs::metadata(to)
+        .map_err(|error| Refusal::new("worktree-metadata-failed", error.to_string()))?
+        .dev();
+    if from_device == to_device {
+        Ok(())
+    } else {
+        Err(Refusal::new(
+            "cross-device-worktree-move",
+            format!(
+                "{} and {} are on different filesystems",
+                from.display(),
+                to.display()
+            ),
+        ))
+    }
+}
+
+#[cfg(not(unix))]
+fn same_filesystem(_from: &Path, _to: &Path) -> Result<(), Refusal> {
+    Ok(())
 }
 
 #[cfg(test)]
@@ -288,6 +337,9 @@ mod tests {
         std::fs::write(legacy.join("untracked"), "preserve me\n").unwrap();
         let managed = temporary.path().join("managed").join("one");
 
+        ProcessGit
+            .validate_move_worktree(&legacy, &managed)
+            .unwrap();
         ProcessGit
             .move_worktree(&repository, &legacy, &managed)
             .unwrap();

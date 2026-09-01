@@ -48,6 +48,8 @@ pub trait GitPort: Send + Sync {
     fn remove(&self, repository: &Path, worktree: &Path) -> Result<(), Refusal>;
     /// Move a linked worktree without forcing Git.
     fn move_worktree(&self, repository: &Path, from: &Path, to: &Path) -> Result<(), Refusal>;
+    /// Refuse a move that the platform cannot perform atomically.
+    fn validate_move_worktree(&self, from: &Path, to: &Path) -> Result<(), Refusal>;
     /// Discover all linked worktrees known to Git.
     fn list_worktrees(&self, repository: &Path) -> Result<Vec<DiscoveredWorktree>, Refusal>;
 }
@@ -521,6 +523,7 @@ where
                         format!("{} already exists", to.display()),
                     ));
                 }
+                self.git.validate_move_worktree(from, to)?;
                 let snapshot = self.git.worktree_snapshot(&record.repository_root, from)?;
                 if let Some(intent) = self.registry.relocation(record.id.as_str())?
                     && snapshot.head != intent.head
@@ -797,6 +800,10 @@ mod tests {
                 .find(|item| item.path == from)
                 .unwrap();
             item.path = to.to_path_buf();
+            Ok(())
+        }
+
+        fn validate_move_worktree(&self, _from: &Path, _to: &Path) -> Result<(), Refusal> {
             Ok(())
         }
 
