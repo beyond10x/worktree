@@ -60,7 +60,7 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
 name = "b10x-worktree"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "b10x-worktree-domain",
  "tempfile",
@@ -68,7 +68,7 @@ dependencies = [
 
 [[package]]
 name = "b10x-worktree-cli"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "anyhow",
  "b10x-worktree",
@@ -85,7 +85,7 @@ dependencies = [
 
 [[package]]
 name = "b10x-worktree-domain"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "serde",
  "thiserror",
@@ -93,7 +93,7 @@ dependencies = [
 
 [[package]]
 name = "b10x-worktree-git"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "b10x-worktree",
  "b10x-worktree-domain",
@@ -102,7 +102,7 @@ dependencies = [
 
 [[package]]
 name = "b10x-worktree-state"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "b10x-worktree",
  "b10x-worktree-domain",

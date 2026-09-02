@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 0.3.2 — 2026-09-02
+
+- Say in the generated skill that `gc --repo` selects the activated workspace profile rather than
+  the repository, so its dry-run assesses every record under that profile's `workspace_root` and
+  an unreviewed apply would remove another repository's work.
+- Say that `status` accepts no filter and reports every record in every profile, so its output must
+  be read against each record's `repository_root`.
+
 ## 0.3.1 — 2026-09-02
 
 - Retire finished external legacy trees that were stranded by a stale pre-0.3 relocation intent,
