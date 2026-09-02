@@ -1,6 +1,6 @@
 ---
 name: worktree
-description: Safely create, inspect, finish, and garbage-collect managed Git worktrees. Use whenever an agent needs an isolated checkout for repository changes, must hand off a worktree, or needs to audit and clean linked worktrees.
+description: Safely create, inspect, finish, reconcile, recover, and garbage-collect managed Git worktrees. Use whenever an agent needs an isolated checkout for repository changes, must hand off a worktree, or needs to audit, recover, or clean linked worktrees.
 ---
 
 # Worktree
@@ -11,7 +11,7 @@ Use the `worktree` CLI as the sole owner of linked-worktree lifecycle. It keeps 
 
 ## Start repository work
 
-1. From a primary checkout, run `worktree create --purpose <short-purpose>`. Add `--repo <path>`, `--base <revision>`, or `--id <stable-id>` when needed.
+1. Invoke `$worktree`, then from a primary checkout run `worktree create --purpose <short-purpose>`. Add `--repo <path>`, `--base <revision>`, or `--id <stable-id>` when needed.
 2. Treat the printed path as the task checkout and do all changes there.
 3. If already inside a managed tree, reuse it; do not nest another worktree.
 4. For automation, add `--json` and consume the versioned output.
@@ -23,16 +23,20 @@ Hook integrations should run `worktree hook session-start --session <id>` on ent
 ## Finish and clean up
 
 1. Commit and publish every wanted change. A local-only commit is deliberately not cleanup-safe.
-2. In the managed tree, run `worktree finish`. It refuses dirty, locked, unmanaged, or live worktrees.
+2. In the managed tree, run `worktree finish`. It refuses dirty, locked, unmanaged, live, or mid-operation Git worktrees.
 3. Run `worktree gc --repo <primary> --dry-run` and inspect every result.
-4. Run `worktree gc --repo <primary> --apply` only when removal is intended. The command fetches and revalidates immediately before non-forced removal.
+4. Run `worktree gc --repo <primary> --apply --id <reviewed-id>` with repeated `--id` values only for the exact results intended for removal. The command refreshes remote advertisements, fetches required objects, and revalidates immediately before non-forced removal.
 
 ## Audit and recovery
 
 - Run `worktree status` for durable lifecycle state.
 - Run `worktree repo list --repo <path>` to distinguish managed, unmanaged, primary, and linked checkouts.
-- Run `worktree reconcile --repo <path> --dry-run` to assess adopted legacy paths and missing records. Apply only reviewed ids with repeated `--id` arguments.
+- Run `worktree reconcile --repo <path> --dry-run` to assess interrupted provisioning, adopted legacy paths, finished external trees, and missing records.
+- Apply reconciliation only to ids copied from that immediately preceding dry-run with `worktree reconcile --repo <path> --apply --id <reviewed-id>` and repeated `--id` arguments when needed.
+- If that dry-run explicitly proposes `retire-external`, confirm that destructive action separately by adding `--allow-external-retirement`; never add it for an unrelated migration or missing-record repair.
+- If removal is interrupted while the path still exists, rerun GC dry-run and exact-id apply. If the path is already absent, use reconciliation dry-run and exact-id apply; its durable removal intent can safely finish the recorded transition.
+- A missing Active record without matching durable removal intent must remain refused. Preserve and investigate its registry evidence; never manually tombstone it, delete related state, or fabricate recovery proof.
 - Run `worktree doctor --check` for prerequisites and configuration.
-- Use `worktree repo adopt ...` only after a human explicitly decides an existing tree should become manager-owned.
+- Only after a human explicitly decides an existing linked tree should become manager-owned, run `worktree repo adopt --repo <primary> --path <linked-tree> --id <stable-id> --purpose <purpose>`. Then review `reconcile --dry-run` and use exact-id apply only if migration is intended.
 
 Never run `git worktree remove --force`, recursively delete a linked tree, place managed trees below the primary workspace, or clean up a tree merely because it looks old.

@@ -12,10 +12,7 @@ publish.workspace = true
 [dependencies]
 b10x-worktree-domain.workspace = true
 b10x-worktree.workspace = true
-
-[dev-dependencies]
 tempfile.workspace = true
 
 [lints]
 workspace = true
-

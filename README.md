@@ -11,7 +11,7 @@ XDG-state SQLite registry.
 ## Install
 
 ```bash
-cargo install --git https://github.com/beyond10x/worktree --tag 0.1.0 b10x-worktree-cli
+cargo install --git https://github.com/beyond10x/worktree --tag 0.3.0 b10x-worktree-cli
 ```
 
 ## Use
@@ -20,32 +20,68 @@ cargo install --git https://github.com/beyond10x/worktree --tag 0.1.0 b10x-workt
 worktree create --purpose dependency-refresh
 worktree status
 worktree finish
-worktree gc --dry-run
+worktree gc --repo /path/to/repository --dry-run
+worktree gc --repo /path/to/repository --apply --id <reviewed-id>
 worktree reconcile --repo /path/to/repository --dry-run
+worktree reconcile --repo /path/to/repository --apply --id <reviewed-id>
 worktree doctor --check
 ```
 
-Managed trees default to `$XDG_STATE_HOME/worktree/trees/<repository>/<id>`. Activate a stricter
+Managed trees default to `$XDG_STATE_HOME/worktree/trees/<profile>/<repository>/<id>`. Activate a
 workspace profile with `worktree activate --profile profile.toml --workspace /path/to/workspace`.
+Workspace and managed roots are canonical, disjoint paths. Create plans resolve the requested base
+to an immutable commit and revalidate the repository, policy-derived destination, and exact Git
+worktree membership before changing state.
 
 Generate portable agent guidance from the exact installed command surface:
 
 ```bash
 worktree skill --out .agents/skills/worktree
+worktree skill --out .agents/skills/worktree --check
 ```
 
-The command refuses dirty, unpublished, locked, live, out-of-root or remotely unverifiable cleanup
-candidates. It never uses forced worktree removal.
+The generated skill and its interface metadata are generator-owned; update them with `worktree
+skill`, not by hand.
+
+Before removal, the manager treats tracked, untracked, and ignored files as dirty and checks Git
+worktree locks, operational lock files, and paused merge/rebase/sequencer state. It refuses live
+leases, non-members, a HEAD that changes while proof and removal intent are collected, ambiguous
+or symlink-redirected paths, and incomplete remote evidence. Finish persists the final HEAD
+atomically with the lease check. Cleanup of an expired active tree first claims its lifecycle
+atomically, which prevents new sessions from racing the removal.
+
+Recovery proof is based only on exact refs currently advertised by configured remotes. Branches,
+tags, pull-request refs such as `refs/pull/*`, and custom namespaces can all prove recovery. The
+manager fetches only required missing objects without creating local refs, re-reads the
+advertisements, and proves that the exact HEAD is reachable. Local-only tags and stale or
+fabricated remote-tracking refs do not count. Replacement refs and grafted ancestry are disabled;
+repository graft files cause refusal. Offline, changed, or ambiguous advertisements cause refusal.
 
 Use `worktree repo list --repo <path>` to inventory linked trees without adopting or deleting them.
 Existing trees only become manager-owned through the explicit `repo adopt` command. Hook integrations
 can maintain cleanup-blocking leases with `hook session-start`, `hook heartbeat`, and
 `hook session-end`.
 
-`worktree reconcile` repairs manager-owned legacy state without weakening cleanup containment. It
-moves adopted linked trees into the configured managed root with `git worktree move`, and can
-tombstone an already-missing record only when Git no longer reports the tree and its stored commit
-has fresh remote recovery proof. Apply mode requires the exact reviewed `--id` values.
+Dry-runs may assess all candidates or selected ids. Both `gc --apply` and `reconcile --apply`
+require one or more exact, reviewed `--id` values; repeat the option to apply more than one result.
+Ordinary GC remains restricted to the managed root.
+
+`worktree reconcile` repairs manager-owned legacy and interrupted state without weakening that GC
+boundary. It can recover a provisioning record when Git created the exact linked tree, migrate an
+active legacy tree into the managed root, retire a finished clean external legacy tree in place,
+and tombstone a tree that is already absent. External retirement is the explicit exact-id path for
+a legacy tree that cannot be moved across filesystems; it still requires an idle, unlocked, clean
+tree, a HEAD stable across final proof/removal observations, and fresh advertised-remote proof.
+Applying that action additionally requires `--allow-external-retirement`, so an id reviewed for
+migration cannot silently drift into an external deletion.
+
+Relocation and removal intents are durable. Recovery proof is stored before `git worktree remove`,
+and registry lifecycle, evidence, and intent completion are committed atomically afterward. If an
+operation is interrupted, rerun GC while the path exists or reconciliation once it is absent; the
+same dry-run and exact-id apply discipline safely finishes the recorded transition.
+
+Non-hook CLI JSON uses protocol version 2, reconciliation JSON uses version 2, and lifecycle hooks
+remain on version 1. Configuration and workspace-policy schemas also remain on version 1.
 
 ## Embed
 
