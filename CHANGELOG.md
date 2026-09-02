@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.2.0 — 2026-09-02
+
 - Add reviewed legacy reconciliation that migrates adopted linked trees into the managed root and
   records safely missing worktrees without weakening cleanup containment.
 
