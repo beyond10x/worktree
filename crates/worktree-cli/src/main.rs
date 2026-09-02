@@ -855,12 +855,12 @@ Hook integrations should run `worktree hook session-start --session <id>` on ent
 
 1. Commit and publish every wanted change. A local-only commit is deliberately not cleanup-safe.
 2. In the managed tree, run `worktree finish`. It refuses dirty, locked, unmanaged, live, or mid-operation Git worktrees.
-3. Run `worktree gc --repo <primary> --dry-run` and inspect every result.
+3. Run `worktree gc --repo <primary> --dry-run` and inspect every result. `--repo` selects the activated workspace profile, not the repository: the assessment covers every record under that profile's `workspace_root`, so it lists trees belonging to other repositories. There is no per-repository filter, and an unreviewed `--apply` would remove another repository's work.
 4. Run `worktree gc --repo <primary> --apply --id <reviewed-id>` with repeated `--id` values only for the exact results intended for removal. The command refreshes remote advertisements, fetches required objects, and revalidates immediately before non-forced removal.
 
 ## Audit and recovery
 
-- Run `worktree status` for durable lifecycle state.
+- Run `worktree status` for durable lifecycle state. It accepts no filter and reports every record in every profile, so read `repository_root` on each one before acting.
 - Run `worktree repo list --repo <path>` to distinguish managed, unmanaged, primary, and linked checkouts.
 - Run `worktree reconcile --repo <path> --dry-run` to assess interrupted provisioning, adopted legacy paths, finished external trees, and missing records.
 - Apply reconciliation only to ids copied from that immediately preceding dry-run with `worktree reconcile --repo <path> --apply --id <reviewed-id>` and repeated `--id` arguments when needed.
