@@ -1,0 +1,8 @@
+version: aep.project/1
+
+# Written by `protocol reverse init`. It points; it does not duplicate — a rule restated
+# here would be a second copy with no way to say which one is in force. Principles and
+# profiles of this project's own go under `principles/` and `profiles/` beside this file.
+protocol: adp/1
+profile: development.standard
+protocols: git+https://github.com/beyond10x/aep.git#1c4e614829cfa9a35e9b809c44855bd3c8aefd9d
