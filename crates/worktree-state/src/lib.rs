@@ -2,13 +2,15 @@
 
 use b10x_worktree::RegistryPort;
 use b10x_worktree_domain::{
-    Lifecycle, OperationEvidence, Refusal, RelocationIntent, SURFACE_VERSION, WorkspacePolicy,
-    WorktreeId, WorktreeRecord,
+    Lifecycle, OperationEvidence, RecoveryProof, Refusal, RelocationIntent, RemovalIntent,
+    SURFACE_VERSION, WorkspacePolicy, WorktreeId, WorktreeRecord,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+
+const REGISTRY_SCHEMA_VERSION: i64 = 3;
 
 /// Persisted collection of activated profiles.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -46,16 +48,24 @@ impl ProfileTemplate {
     /// Resolve a portable profile for one absolute workspace.
     pub fn resolve(
         self,
-        workspace_root: PathBuf,
+        workspace_root: &Path,
         state_home: &Path,
     ) -> Result<WorkspacePolicy, Refusal> {
+        let workspace_root = std::fs::canonicalize(workspace_root).map_err(|error| {
+            Refusal::new(
+                "workspace-root-invalid",
+                format!("{}: {error}", workspace_root.display()),
+            )
+        })?;
+        let requested_worktree_root = self
+            .worktree_root
+            .unwrap_or_else(|| state_home.join("worktree").join("trees").join(&self.name));
+        let worktree_root = canonicalize_future_path(&requested_worktree_root)?;
         let policy = WorkspacePolicy {
             version: self.version,
             name: self.name.clone(),
             workspace_root,
-            worktree_root: self
-                .worktree_root
-                .unwrap_or_else(|| state_home.join("worktree").join("trees").join(self.name)),
+            worktree_root,
             expire_after_seconds: self.expire_after_seconds,
             protect_workspace_root: self.protect_workspace_root,
         };
@@ -108,6 +118,11 @@ pub fn load_config(path: &Path) -> Result<Config, Refusal> {
         .map_err(|error| Refusal::new("config-read-failed", error.to_string()))?;
     let config: Config = toml::from_str(&source)
         .map_err(|error| Refusal::new("config-invalid", error.to_string()))?;
+    validate_config(&config)?;
+    Ok(config)
+}
+
+fn validate_config(config: &Config) -> Result<(), Refusal> {
     if config.version != SURFACE_VERSION {
         return Err(Refusal::new(
             "unsupported-config-version",
@@ -116,12 +131,26 @@ pub fn load_config(path: &Path) -> Result<Config, Refusal> {
     }
     for policy in &config.profiles {
         policy.validate()?;
+        let workspace_root = std::fs::canonicalize(&policy.workspace_root).map_err(|error| {
+            Refusal::new(
+                "workspace-root-invalid",
+                format!("{}: {error}", policy.workspace_root.display()),
+            )
+        })?;
+        let worktree_root = canonicalize_future_path(&policy.worktree_root)?;
+        if workspace_root != policy.workspace_root || worktree_root != policy.worktree_root {
+            return Err(Refusal::new(
+                "non-canonical-policy-path",
+                format!("profile {} contains a non-canonical root", policy.name),
+            ));
+        }
     }
-    Ok(config)
+    Ok(())
 }
 
 /// Atomically persist configuration.
 pub fn save_config(path: &Path, config: &Config) -> Result<(), Refusal> {
+    validate_config(config)?;
     let parent = path
         .parent()
         .ok_or_else(|| Refusal::new("config-path-invalid", path.display().to_string()))?;
@@ -150,6 +179,12 @@ pub fn resolve_policy<'a>(
     config: &'a Config,
     repository: &Path,
 ) -> Result<&'a WorkspacePolicy, Refusal> {
+    let repository = std::fs::canonicalize(repository).map_err(|error| {
+        Refusal::new(
+            "repository-not-found",
+            format!("{}: {error}", repository.display()),
+        )
+    })?;
     config
         .profiles
         .iter()
@@ -177,6 +212,17 @@ impl SqliteRegistry {
         }
         let connection = Connection::open(path)
             .map_err(|error| Refusal::new("registry-open-failed", error.to_string()))?;
+        let existing_version: i64 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .map_err(database_error)?;
+        if existing_version > REGISTRY_SCHEMA_VERSION {
+            return Err(Refusal::new(
+                "unsupported-registry-version",
+                format!(
+                    "registry version {existing_version} is newer than supported version {REGISTRY_SCHEMA_VERSION}"
+                ),
+            ));
+        }
         connection
             .execute_batch(
                 "PRAGMA journal_mode=WAL;
@@ -213,7 +259,15 @@ impl SqliteRegistry {
                    head TEXT NOT NULL,
                    planned_at INTEGER NOT NULL
                  );
-                 PRAGMA user_version=2;",
+                 CREATE TABLE IF NOT EXISTS removal_intents (
+                   worktree_id TEXT PRIMARY KEY REFERENCES worktrees(id) ON DELETE CASCADE,
+                   path TEXT NOT NULL,
+                   head TEXT NOT NULL,
+                   recovery_json TEXT NOT NULL,
+                   operation TEXT NOT NULL,
+                   planned_at INTEGER NOT NULL
+                 );
+                 PRAGMA user_version=3;",
             )
             .map_err(|error| Refusal::new("registry-migration-failed", error.to_string()))?;
         Ok(Self {
@@ -237,7 +291,8 @@ impl RegistryPort for SqliteRegistry {
     fn activate(&self, id: &str, head: &str, now: i64) -> Result<(), Refusal> {
         changed(
             self.connection()?.execute(
-                "UPDATE worktrees SET lifecycle='active', head=?2, last_seen_at=?3 WHERE id=?1 AND lifecycle='provisioning'",
+                "UPDATE worktrees SET lifecycle='active', head=?2, last_seen_at=?3
+                 WHERE id=?1 AND lifecycle IN ('provisioning','failed')",
                 params![id, head, now],
             ),
             "activate",
@@ -287,13 +342,66 @@ impl RegistryPort for SqliteRegistry {
         )
     }
 
-    fn mark_finished(&self, id: &str, now: i64) -> Result<(), Refusal> {
+    fn mark_finished(
+        &self,
+        id: &str,
+        head: &str,
+        now: i64,
+        lease_timeout: i64,
+    ) -> Result<(), Refusal> {
+        let lease_cutoff = now.saturating_sub(lease_timeout);
         changed(
             self.connection()?.execute(
-                "UPDATE worktrees SET lifecycle='finished', finished_at=?2, last_seen_at=?2 WHERE id=?1 AND lifecycle='active'",
-                params![id, now],
+                "UPDATE worktrees
+                 SET lifecycle='finished', head=?2, finished_at=?3, last_seen_at=?3
+                 WHERE id=?1 AND lifecycle='active'
+                   AND NOT EXISTS (
+                     SELECT 1 FROM leases
+                     WHERE worktree_id=?1 AND last_seen_at>=?4
+                   )",
+                params![id, head, now, lease_cutoff],
             ),
             "finish",
+        )
+    }
+
+    fn claim_expired(
+        &self,
+        id: &str,
+        head: &str,
+        now: i64,
+        expire_before: i64,
+        lease_timeout: i64,
+    ) -> Result<(), Refusal> {
+        let lease_cutoff = now.saturating_sub(lease_timeout);
+        changed(
+            self.connection()?.execute(
+                "UPDATE worktrees
+                 SET lifecycle='finished', head=?2, finished_at=?3, last_seen_at=?3
+                 WHERE id=?1 AND lifecycle='active' AND last_seen_at<=?4
+                   AND NOT EXISTS (
+                     SELECT 1 FROM leases
+                     WHERE worktree_id=?1 AND last_seen_at>=?5
+                   )",
+                params![id, head, now, expire_before, lease_cutoff],
+            ),
+            "claim-expired",
+        )
+    }
+
+    fn claim_relocation(&self, id: &str, now: i64, lease_timeout: i64) -> Result<(), Refusal> {
+        let lease_cutoff = now.saturating_sub(lease_timeout);
+        changed(
+            self.connection()?.execute(
+                "UPDATE worktrees SET lifecycle='relocating',last_seen_at=?2
+                 WHERE id=?1 AND lifecycle='active'
+                   AND NOT EXISTS (
+                     SELECT 1 FROM leases
+                     WHERE worktree_id=?1 AND last_seen_at>=?3
+                   )",
+                params![id, now, lease_cutoff],
+            ),
+            "claim-relocation",
         )
     }
 
@@ -344,14 +452,17 @@ impl RegistryPort for SqliteRegistry {
     }
 
     fn acquire_lease(&self, id: &str, session: &str, now: i64) -> Result<(), Refusal> {
-        self.connection()?
-            .execute(
-                "INSERT INTO leases(worktree_id,session,last_seen_at) VALUES(?1,?2,?3)
-                 ON CONFLICT(worktree_id,session) DO UPDATE SET last_seen_at=excluded.last_seen_at",
+        changed(
+            self.connection()?.execute(
+                "INSERT INTO leases(worktree_id,session,last_seen_at)
+                 SELECT ?1,?2,?3 FROM worktrees
+                 WHERE id=?1 AND lifecycle='active'
+                 ON CONFLICT(worktree_id,session)
+                 DO UPDATE SET last_seen_at=excluded.last_seen_at",
                 params![id, session, now],
-            )
-            .map(|_| ())
-            .map_err(database_error)
+            ),
+            "acquire-lease",
+        )
     }
 
     fn release_lease(&self, id: &str, session: &str) -> Result<(), Refusal> {
@@ -424,7 +535,9 @@ impl RegistryPort for SqliteRegistry {
         let transaction = connection.unchecked_transaction().map_err(database_error)?;
         changed(
             transaction.execute(
-                "UPDATE worktrees SET path=?2,head=?3,last_seen_at=?4 WHERE id=?1 AND path=?5",
+                "UPDATE worktrees
+                 SET path=?2,head=?3,last_seen_at=?4,lifecycle='active'
+                 WHERE id=?1 AND path=?5 AND lifecycle='relocating'",
                 params![
                     intent.id.as_str(),
                     path_text(&intent.to)?,
@@ -462,6 +575,131 @@ impl RegistryPort for SqliteRegistry {
                 ],
             ),
             "complete-relocation",
+        )?;
+        transaction.commit().map_err(database_error)
+    }
+
+    fn removal(&self, id: &str) -> Result<Option<RemovalIntent>, Refusal> {
+        self.connection()?
+            .query_row(
+                "SELECT worktree_id,path,head,recovery_json,operation,planned_at
+                 FROM removal_intents WHERE worktree_id=?1",
+                [id],
+                |row| {
+                    let id: String = row.get(0)?;
+                    let recovery_json: String = row.get(3)?;
+                    let recovery =
+                        serde_json::from_str::<RecoveryProof>(&recovery_json).map_err(|error| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                3,
+                                rusqlite::types::Type::Text,
+                                Box::new(error),
+                            )
+                        })?;
+                    Ok(RemovalIntent {
+                        id: WorktreeId::new(id).map_err(sql_conversion_error)?,
+                        path: PathBuf::from(row.get::<_, String>(1)?),
+                        head: row.get(2)?,
+                        recovery,
+                        operation: row.get(4)?,
+                        planned_at: row.get(5)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(database_error)
+    }
+
+    fn begin_removal(&self, intent: &RemovalIntent) -> Result<(), Refusal> {
+        let recovery_json = serde_json::to_string(&intent.recovery)
+            .map_err(|error| Refusal::new("recovery-proof-encode-failed", error.to_string()))?;
+        if let Some(existing) = self.removal(intent.id.as_str())? {
+            if existing.path != intent.path || existing.operation != intent.operation {
+                return Err(Refusal::new(
+                    "removal-already-planned",
+                    "a different removal intent already exists",
+                ));
+            }
+            return changed(
+                self.connection()?.execute(
+                    "UPDATE removal_intents SET head=?2,recovery_json=?3,planned_at=?4
+                     WHERE worktree_id=?1 AND path=?5 AND operation=?6",
+                    params![
+                        intent.id.as_str(),
+                        intent.head,
+                        recovery_json,
+                        intent.planned_at,
+                        path_text(&intent.path)?,
+                        intent.operation,
+                    ],
+                ),
+                "refresh-removal-intent",
+            );
+        }
+        self.connection()?
+            .execute(
+                "INSERT INTO removal_intents(worktree_id,path,head,recovery_json,operation,planned_at)
+                 VALUES(?1,?2,?3,?4,?5,?6)",
+                params![
+                    intent.id.as_str(),
+                    path_text(&intent.path)?,
+                    intent.head,
+                    recovery_json,
+                    intent.operation,
+                    intent.planned_at,
+                ],
+            )
+            .map(|_| ())
+            .map_err(database_error)
+    }
+
+    fn complete_removal(
+        &self,
+        intent: &RemovalIntent,
+        evidence: &OperationEvidence,
+    ) -> Result<(), Refusal> {
+        let connection = self.connection()?;
+        let transaction = connection.unchecked_transaction().map_err(database_error)?;
+        changed(
+            transaction.execute(
+                "UPDATE worktrees SET lifecycle='removed',head=?2,last_seen_at=?3
+                 WHERE id=?1 AND path=?4",
+                params![
+                    intent.id.as_str(),
+                    intent.head,
+                    evidence.recorded_at,
+                    path_text(&intent.path)?,
+                ],
+            ),
+            "complete-removal",
+        )?;
+        transaction
+            .execute(
+                "INSERT INTO events(worktree_id,operation,recorded_at,payload) VALUES(?1,?2,?3,?4)",
+                params![
+                    intent.id.as_str(),
+                    evidence.operation,
+                    evidence.recorded_at,
+                    format!(
+                        "head={} refs={}",
+                        intent.head,
+                        intent.recovery.refs.join(",")
+                    )
+                ],
+            )
+            .map_err(database_error)?;
+        changed(
+            transaction.execute(
+                "DELETE FROM removal_intents
+                 WHERE worktree_id=?1 AND path=?2 AND head=?3 AND operation=?4",
+                params![
+                    intent.id.as_str(),
+                    path_text(&intent.path)?,
+                    intent.head,
+                    intent.operation,
+                ],
+            ),
+            "clear-removal-intent",
         )?;
         transaction.commit().map_err(database_error)
     }
@@ -529,6 +767,67 @@ fn path_text(path: &Path) -> Result<&str, Refusal> {
     })
 }
 
+fn canonicalize_future_path(path: &Path) -> Result<PathBuf, Refusal> {
+    if !path.is_absolute() {
+        return Err(Refusal::new(
+            "relative-policy-path",
+            format!("{} is not absolute", path.display()),
+        ));
+    }
+    let mut missing = Vec::new();
+    let mut existing = path;
+    loop {
+        match std::fs::metadata(existing) {
+            Ok(metadata) => {
+                if !metadata.is_dir() {
+                    return Err(Refusal::new(
+                        "worktree-root-ancestor-not-directory",
+                        format!("{} is not a directory", existing.display()),
+                    ));
+                }
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if std::fs::symlink_metadata(existing).is_ok() {
+                    return Err(Refusal::new(
+                        "policy-path-dangling-symlink",
+                        format!("{} is a dangling symlink", existing.display()),
+                    ));
+                }
+                let name = existing.file_name().ok_or_else(|| {
+                    Refusal::new(
+                        "policy-path-invalid",
+                        format!("{} has no existing ancestor", path.display()),
+                    )
+                })?;
+                missing.push(name.to_os_string());
+                existing = existing.parent().ok_or_else(|| {
+                    Refusal::new(
+                        "policy-path-invalid",
+                        format!("{} has no existing ancestor", path.display()),
+                    )
+                })?;
+            }
+            Err(error) => {
+                return Err(Refusal::new(
+                    "policy-path-invalid",
+                    format!("{}: {error}", existing.display()),
+                ));
+            }
+        }
+    }
+    let mut canonical = std::fs::canonicalize(existing).map_err(|error| {
+        Refusal::new(
+            "policy-path-invalid",
+            format!("{}: {error}", existing.display()),
+        )
+    })?;
+    for component in missing.into_iter().rev() {
+        canonical.push(component);
+    }
+    Ok(canonical)
+}
+
 #[allow(clippy::needless_pass_by_value)]
 fn database_error(error: rusqlite::Error) -> Refusal {
     Refusal::new("registry-database-error", error.to_string())
@@ -544,6 +843,7 @@ mod tests {
         let temporary = tempdir().unwrap();
         let workspace = temporary.path().join("workspace");
         let state = temporary.path().join("state");
+        std::fs::create_dir(&workspace).unwrap();
         let profile = ProfileTemplate {
             version: 1,
             name: "test".into(),
@@ -551,8 +851,57 @@ mod tests {
             expire_after_seconds: 60,
             protect_workspace_root: true,
         };
-        let resolved = profile.resolve(workspace, &state).unwrap();
+        let resolved = profile.resolve(&workspace, &state).unwrap();
         assert!(resolved.worktree_root.starts_with(state));
+    }
+
+    #[test]
+    fn profile_name_cannot_replace_the_managed_root() {
+        let temporary = tempdir().unwrap();
+        let workspace = temporary.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let refusal = ProfileTemplate {
+            version: 1,
+            name: "/".into(),
+            worktree_root: None,
+            expire_after_seconds: 60,
+            protect_workspace_root: true,
+        }
+        .resolve(&workspace, &temporary.path().join("state"))
+        .unwrap_err();
+        assert_eq!(refusal.code, "invalid-policy-name");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn profile_resolution_canonicalizes_symlinked_roots() {
+        use std::os::unix::fs::symlink;
+
+        let temporary = tempdir().unwrap();
+        let real_workspace = temporary.path().join("real-workspace");
+        let linked_workspace = temporary.path().join("linked-workspace");
+        let real_state = temporary.path().join("real-state");
+        let linked_state = temporary.path().join("linked-state");
+        std::fs::create_dir(&real_workspace).unwrap();
+        std::fs::create_dir(&real_state).unwrap();
+        symlink(&real_workspace, &linked_workspace).unwrap();
+        symlink(&real_state, &linked_state).unwrap();
+
+        let resolved = ProfileTemplate {
+            version: 1,
+            name: "test".into(),
+            worktree_root: None,
+            expire_after_seconds: 60,
+            protect_workspace_root: true,
+        }
+        .resolve(&linked_workspace, &linked_state)
+        .unwrap();
+
+        assert_eq!(resolved.workspace_root, real_workspace);
+        assert_eq!(
+            resolved.worktree_root,
+            real_state.join("worktree/trees/test")
+        );
     }
 
     #[test]
@@ -592,12 +941,13 @@ mod tests {
             head: Some("abc".into()),
         };
         registry.adopt(&record).unwrap();
+        registry.claim_relocation("legacy-one", 2, 60).unwrap();
         let intent = RelocationIntent {
             id: record.id.clone(),
             from: record.path.clone(),
             to: "/managed/repo/legacy-one".into(),
             head: "abc".into(),
-            planned_at: 2,
+            planned_at: 3,
         };
         registry.begin_relocation(&intent).unwrap();
         assert_eq!(
@@ -611,12 +961,157 @@ mod tests {
             path: intent.to.clone(),
             head: Some("abc".into()),
             recovery: None,
-            recorded_at: 3,
+            recorded_at: 4,
         };
         registry.complete_relocation(&intent, &evidence).unwrap();
         assert!(registry.relocation("legacy-one").unwrap().is_none());
         let migrated = registry.list().unwrap().pop().unwrap();
         assert_eq!(migrated.path, intent.to);
         assert_eq!(migrated.head.as_deref(), Some("abc"));
+    }
+
+    #[test]
+    fn future_registry_versions_are_refused_without_downgrade() {
+        let temporary = tempdir().unwrap();
+        let path = temporary.path().join("registry.sqlite3");
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch("PRAGMA user_version=99;").unwrap();
+        drop(connection);
+
+        let refusal = SqliteRegistry::open(&path).err().unwrap();
+        assert_eq!(refusal.code, "unsupported-registry-version");
+        let connection = Connection::open(path).unwrap();
+        let version: i64 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 99);
+    }
+
+    #[test]
+    fn leases_are_acquired_only_for_active_records() {
+        let temporary = tempdir().unwrap();
+        let registry = SqliteRegistry::open(&temporary.path().join("registry.sqlite3")).unwrap();
+        let mut record = WorktreeRecord {
+            id: WorktreeId::new("one").unwrap(),
+            repository_root: "/repo".into(),
+            path: "/trees/one".into(),
+            purpose: "test".into(),
+            owner: "test".into(),
+            lifecycle: Lifecycle::Finished,
+            created_at: 1,
+            last_seen_at: 1,
+            finished_at: Some(2),
+            head: Some("abc".into()),
+        };
+        registry.adopt(&record).unwrap();
+        assert_eq!(
+            registry
+                .acquire_lease("one", "session", 3)
+                .unwrap_err()
+                .code,
+            "invalid-lifecycle-transition"
+        );
+        assert_eq!(registry.live_lease_count("one", 3, 60).unwrap(), 0);
+
+        record.id = WorktreeId::new("two").unwrap();
+        record.path = "/trees/two".into();
+        record.lifecycle = Lifecycle::Active;
+        record.finished_at = None;
+        registry.adopt(&record).unwrap();
+        registry.acquire_lease("two", "session", 3).unwrap();
+        assert_eq!(registry.live_lease_count("two", 3, 60).unwrap(), 1);
+        assert!(registry.claim_relocation("two", 3, 60).is_err());
+        registry.release_lease("two", "session").unwrap();
+        registry.claim_relocation("two", 4, 60).unwrap();
+        assert_eq!(
+            registry.acquire_lease("two", "later", 4).unwrap_err().code,
+            "invalid-lifecycle-transition"
+        );
+        assert_eq!(registry.list().unwrap()[1].lifecycle, Lifecycle::Relocating);
+    }
+
+    #[test]
+    fn removal_intent_survives_until_atomic_completion() {
+        let temporary = tempdir().unwrap();
+        let registry = SqliteRegistry::open(&temporary.path().join("registry.sqlite3")).unwrap();
+        let record = WorktreeRecord {
+            id: WorktreeId::new("one").unwrap(),
+            repository_root: "/repo".into(),
+            path: "/trees/one".into(),
+            purpose: "test".into(),
+            owner: "test".into(),
+            lifecycle: Lifecycle::Finished,
+            created_at: 1,
+            last_seen_at: 1,
+            finished_at: Some(2),
+            head: Some("abc".into()),
+        };
+        registry.adopt(&record).unwrap();
+        let proof = RecoveryProof {
+            head: "abc".into(),
+            refs: vec!["origin:refs/heads/main".into()],
+            observed_at: 3,
+        };
+        let intent = RemovalIntent {
+            id: record.id.clone(),
+            path: record.path.clone(),
+            head: "abc".into(),
+            recovery: proof.clone(),
+            operation: "remove".into(),
+            planned_at: 3,
+        };
+        registry.begin_removal(&intent).unwrap();
+        assert_eq!(registry.removal("one").unwrap(), Some(intent.clone()));
+        let mut refreshed = intent.clone();
+        refreshed.head = "def".into();
+        refreshed.recovery.head = "def".into();
+        refreshed.recovery.observed_at = 4;
+        refreshed.planned_at = 4;
+        registry.begin_removal(&refreshed).unwrap();
+        assert_eq!(registry.removal("one").unwrap(), Some(refreshed.clone()));
+        let evidence = OperationEvidence {
+            operation: "remove".into(),
+            id: record.id,
+            path: record.path,
+            head: Some("def".into()),
+            recovery: Some(refreshed.recovery.clone()),
+            recorded_at: 5,
+        };
+        registry.complete_removal(&refreshed, &evidence).unwrap();
+        assert!(registry.removal("one").unwrap().is_none());
+        let stored = registry.list().unwrap().pop().unwrap();
+        assert_eq!(stored.lifecycle, Lifecycle::Removed);
+        assert_eq!(stored.head.as_deref(), Some("def"));
+    }
+
+    #[test]
+    fn finish_persists_head_and_is_atomic_with_live_leases() {
+        let temporary = tempdir().unwrap();
+        let registry = SqliteRegistry::open(&temporary.path().join("registry.sqlite3")).unwrap();
+        let record = WorktreeRecord {
+            id: WorktreeId::new("one").unwrap(),
+            repository_root: "/repo".into(),
+            path: "/trees/one".into(),
+            purpose: "test".into(),
+            owner: "test".into(),
+            lifecycle: Lifecycle::Active,
+            created_at: 1,
+            last_seen_at: 1,
+            finished_at: None,
+            head: Some("old".into()),
+        };
+        registry.adopt(&record).unwrap();
+        registry.acquire_lease("one", "session", 10).unwrap();
+        assert!(registry.mark_finished("one", "new", 10, 60).is_err());
+        let active = registry.list().unwrap().pop().unwrap();
+        assert_eq!(active.lifecycle, Lifecycle::Active);
+        assert_eq!(active.head.as_deref(), Some("old"));
+
+        registry.release_lease("one", "session").unwrap();
+        registry.mark_finished("one", "new", 11, 60).unwrap();
+        let finished = registry.list().unwrap().pop().unwrap();
+        assert_eq!(finished.lifecycle, Lifecycle::Finished);
+        assert_eq!(finished.head.as_deref(), Some("new"));
+        assert_eq!(finished.finished_at, Some(11));
     }
 }

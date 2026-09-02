@@ -4,8 +4,20 @@ use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter};
 use std::path::{Path, PathBuf};
 
-/// The immutable version of JSON emitted by the CLI and lifecycle hooks.
+/// Configuration and workspace-policy schema version.
 pub const SURFACE_VERSION: u32 = 1;
+
+/// Reconciliation report version.
+///
+/// Reconciliation version 2 adds the explicit `retire-external` action without changing the
+/// stable version-1 lifecycle, configuration, or hook envelopes.
+pub const RECONCILIATION_VERSION: u32 = 2;
+
+/// Version of non-hook CLI JSON envelopes.
+pub const CLI_PROTOCOL_VERSION: u32 = 2;
+
+/// Immutable hook protocol version.
+pub const HOOK_PROTOCOL_VERSION: u32 = 1;
 
 /// A stable worktree identifier safe to use as one path component.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -102,8 +114,18 @@ impl WorkspacePolicy {
                 format!("policy version {} is not supported", self.version),
             ));
         }
-        if self.name.trim().is_empty() {
-            return Err(Refusal::new("invalid-policy-name", "policy name is empty"));
+        if self.name.is_empty()
+            || self.name.len() > 128
+            || self.name.starts_with('.')
+            || self
+                .name
+                .bytes()
+                .any(|byte| !(byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'))
+        {
+            return Err(Refusal::new(
+                "invalid-policy-name",
+                "policy name must be one lowercase path-safe component",
+            ));
         }
         if !self.workspace_root.is_absolute() || !self.worktree_root.is_absolute() {
             return Err(Refusal::new(
@@ -111,12 +133,20 @@ impl WorkspacePolicy {
                 "workspace and worktree roots must be absolute",
             ));
         }
-        if self.workspace_root == self.worktree_root
+        if has_ambiguous_components(&self.workspace_root)
+            || has_ambiguous_components(&self.worktree_root)
+        {
+            return Err(Refusal::new(
+                "ambiguous-policy-path",
+                "workspace and worktree roots cannot contain dot or parent components",
+            ));
+        }
+        if self.workspace_root.starts_with(&self.worktree_root)
             || self.worktree_root.starts_with(&self.workspace_root)
         {
             return Err(Refusal::new(
-                "worktree-root-inside-workspace",
-                "managed worktrees must not live beneath the primary workspace root",
+                "workspace-roots-overlap",
+                "managed worktrees and primary checkouts must use disjoint roots",
             ));
         }
         if self.expire_after_seconds <= 0 {
@@ -127,6 +157,15 @@ impl WorkspacePolicy {
         }
         Ok(())
     }
+}
+
+fn has_ambiguous_components(path: &Path) -> bool {
+    path.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::CurDir | std::path::Component::ParentDir
+        )
+    })
 }
 
 /// Requested creation of one detached linked worktree.
@@ -208,6 +247,8 @@ pub enum Lifecycle {
     Provisioning,
     /// Available for work.
     Active,
+    /// Atomically claimed for a recoverable relocation; new sessions are blocked.
+    Relocating,
     /// Explicitly finished and awaiting safe cleanup.
     Finished,
     /// Removed after all safety proofs passed.
@@ -223,6 +264,7 @@ impl Lifecycle {
         match self {
             Self::Provisioning => "provisioning",
             Self::Active => "active",
+            Self::Relocating => "relocating",
             Self::Finished => "finished",
             Self::Removed => "removed",
             Self::Failed => "failed",
@@ -234,6 +276,7 @@ impl Lifecycle {
         match value {
             "provisioning" => Ok(Self::Provisioning),
             "active" => Ok(Self::Active),
+            "relocating" => Ok(Self::Relocating),
             "finished" => Ok(Self::Finished),
             "removed" => Ok(Self::Removed),
             "failed" => Ok(Self::Failed),
@@ -275,7 +318,7 @@ pub struct WorktreeRecord {
 pub struct RecoveryProof {
     /// Commit proven reachable.
     pub head: String,
-    /// Fresh remote branches or tags containing it.
+    /// Fresh, advertised remote refs containing it.
     pub refs: Vec<String>,
     /// Observation time.
     pub observed_at: i64,
@@ -315,12 +358,24 @@ pub struct CleanupAssessment {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "kebab-case")]
 pub enum ReconciliationAction {
+    /// Complete a provisioning transition after Git created the linked tree.
+    RecoverProvisioning {
+        /// Exact registered path Git already reports.
+        path: PathBuf,
+    },
     /// Move an adopted linked worktree into the configured managed root.
     Migrate {
         /// Current canonical path.
         from: PathBuf,
         /// Policy-derived destination.
         to: PathBuf,
+    },
+    /// Remove a finished, clean adopted worktree outside the managed root.
+    ///
+    /// This is deliberately available only through exact-id reconciliation, never ordinary GC.
+    RetireExternal {
+        /// Exact registered path to remove without force.
+        path: PathBuf,
     },
     /// Record that a worktree which is already absent is no longer active.
     TombstoneMissing {
@@ -356,6 +411,23 @@ pub struct RelocationIntent {
     /// HEAD observed before the move.
     pub head: String,
     /// Time at which the intent was recorded.
+    pub planned_at: i64,
+}
+
+/// Durable proof recorded before removing a worktree.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemovalIntent {
+    /// Worktree identity.
+    pub id: WorktreeId,
+    /// Exact registered path selected for removal.
+    pub path: PathBuf,
+    /// HEAD revalidated immediately before intent persistence.
+    pub head: String,
+    /// Fresh remote recovery proof captured before mutation.
+    pub recovery: RecoveryProof,
+    /// Evidence operation to record after successful removal.
+    pub operation: String,
+    /// Time at which deletion intent became durable.
     pub planned_at: i64,
 }
 
@@ -427,7 +499,38 @@ mod tests {
         };
         assert_eq!(
             policy.validate().unwrap_err().code,
-            "worktree-root-inside-workspace"
+            "workspace-roots-overlap"
+        );
+    }
+
+    #[test]
+    fn policy_names_cannot_escape_the_state_root() {
+        for invalid in ["/", "../escape", "Two", ".hidden"] {
+            let policy = WorkspacePolicy {
+                version: 1,
+                name: invalid.into(),
+                workspace_root: "/workspace".into(),
+                worktree_root: "/managed".into(),
+                expire_after_seconds: 1,
+                protect_workspace_root: true,
+            };
+            assert_eq!(policy.validate().unwrap_err().code, "invalid-policy-name");
+        }
+    }
+
+    #[test]
+    fn managed_root_cannot_contain_the_workspace() {
+        let policy = WorkspacePolicy {
+            version: 1,
+            name: "bad".into(),
+            workspace_root: "/managed/workspace".into(),
+            worktree_root: "/managed".into(),
+            expire_after_seconds: 1,
+            protect_workspace_root: true,
+        };
+        assert_eq!(
+            policy.validate().unwrap_err().code,
+            "workspace-roots-overlap"
         );
     }
 }

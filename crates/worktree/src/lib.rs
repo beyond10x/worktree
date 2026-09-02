@@ -3,8 +3,8 @@
 use b10x_worktree_domain::{
     CleanupAssessment, CreatePlan, CreateRequest, DiscoveredWorktree, Lifecycle, OperationEvidence,
     ReconciliationAction, ReconciliationAssessment, RecoveryProof, Refusal, RelocationIntent,
-    RepositorySnapshot, WorkspacePolicy, WorktreeId, WorktreeRecord, WorktreeSnapshot,
-    require_child,
+    RemovalIntent, RepositorySnapshot, WorkspacePolicy, WorktreeId, WorktreeRecord,
+    WorktreeSnapshot, require_child,
 };
 use std::path::{Path, PathBuf};
 
@@ -32,6 +32,8 @@ impl Clock for SystemClock {
 pub trait GitPort: Send + Sync {
     /// Resolve a repository path to stable facts.
     fn repository_snapshot(&self, repository: &Path) -> Result<RepositorySnapshot, Refusal>;
+    /// Resolve a caller-supplied revision to one immutable commit id.
+    fn resolve_revision(&self, repository: &Path, revision: &str) -> Result<String, Refusal>;
     /// Inspect one linked worktree.
     fn worktree_snapshot(
         &self,
@@ -40,9 +42,7 @@ pub trait GitPort: Send + Sync {
     ) -> Result<WorktreeSnapshot, Refusal>;
     /// Create a detached linked worktree from a reviewed plan.
     fn create_detached(&self, plan: &CreatePlan) -> Result<(), Refusal>;
-    /// Refresh remote references before proving recoverability.
-    fn fetch(&self, repository: &Path) -> Result<(), Refusal>;
-    /// Return remote branches and tags containing the commit.
+    /// Refresh advertisements and return exact remote refs containing the commit.
     fn recovery_refs(&self, repository: &Path, head: &str) -> Result<Vec<String>, Refusal>;
     /// Remove a linked worktree without forcing Git.
     fn remove(&self, repository: &Path, worktree: &Path) -> Result<(), Refusal>;
@@ -68,8 +68,25 @@ pub trait RegistryPort: Send + Sync {
     fn list(&self) -> Result<Vec<WorktreeRecord>, Refusal>;
     /// Mark activity after an observation or heartbeat.
     fn mark_seen(&self, id: &str, head: Option<&str>, now: i64) -> Result<(), Refusal>;
-    /// Mark explicit completion.
-    fn mark_finished(&self, id: &str, now: i64) -> Result<(), Refusal>;
+    /// Atomically mark explicit completion, persist final HEAD, and refuse live leases.
+    fn mark_finished(
+        &self,
+        id: &str,
+        head: &str,
+        now: i64,
+        lease_timeout: i64,
+    ) -> Result<(), Refusal>;
+    /// Atomically claim an expired active tree for cleanup and block new sessions.
+    fn claim_expired(
+        &self,
+        id: &str,
+        head: &str,
+        now: i64,
+        expire_before: i64,
+        lease_timeout: i64,
+    ) -> Result<(), Refusal>;
+    /// Atomically claim an active legacy tree for relocation and block new sessions.
+    fn claim_relocation(&self, id: &str, now: i64, lease_timeout: i64) -> Result<(), Refusal>;
     /// Record successful removal.
     fn mark_removed(&self, evidence: &OperationEvidence) -> Result<(), Refusal>;
     /// Count leases whose heartbeat remains live.
@@ -88,6 +105,18 @@ pub trait RegistryPort: Send + Sync {
     fn complete_relocation(
         &self,
         intent: &RelocationIntent,
+        evidence: &OperationEvidence,
+    ) -> Result<(), Refusal>;
+    /// Return a pending, proof-bearing removal intent.
+    fn removal(&self, id: &str) -> Result<Option<RemovalIntent>, Refusal>;
+    /// Persist proof before deleting filesystem state.
+    ///
+    /// Repeating this call with the same id/path/head/operation refreshes the proof atomically.
+    fn begin_removal(&self, intent: &RemovalIntent) -> Result<(), Refusal>;
+    /// Atomically mark removal complete and clear its durable intent.
+    fn complete_removal(
+        &self,
+        intent: &RemovalIntent,
         evidence: &OperationEvidence,
     ) -> Result<(), Refusal>;
 }
@@ -127,7 +156,7 @@ where
         policy: &WorkspacePolicy,
         request: CreateRequest,
     ) -> Result<CreatePlan, Refusal> {
-        policy.validate()?;
+        require_canonical_policy(policy)?;
         validate_label("purpose", &request.purpose)?;
         validate_label("owner", &request.owner)?;
         let repository = self.git.repository_snapshot(&request.repository)?;
@@ -145,12 +174,15 @@ where
             .worktree_root
             .join(&repository.name)
             .join(request.id.as_str());
-        require_child(&policy.worktree_root, &path)?;
+        require_canonical_child(&policy.worktree_root, &path)?;
+        let base = self
+            .git
+            .resolve_revision(&repository.root, request.base.as_str())?;
         Ok(CreatePlan {
             id: request.id,
             repository_root: repository.root,
             path,
-            base: request.base,
+            base: b10x_worktree_domain::GitRevision::new(base)?,
             purpose: request.purpose,
             owner: request.owner,
             planned_at: self.clock.now(),
@@ -158,7 +190,41 @@ where
     }
 
     /// Reserve and create one detached worktree.
-    pub fn create(&self, plan: &CreatePlan) -> Result<OperationEvidence, Refusal> {
+    pub fn create(
+        &self,
+        policy: &WorkspacePolicy,
+        plan: &CreatePlan,
+    ) -> Result<OperationEvidence, Refusal> {
+        require_canonical_policy(policy)?;
+        let repository = self.git.repository_snapshot(&plan.repository_root)?;
+        if repository.root != plan.repository_root
+            || !repository.root.starts_with(&policy.workspace_root)
+        {
+            return Err(Refusal::new(
+                "create-plan-repository-changed",
+                "create plan repository no longer matches the selected workspace",
+            ));
+        }
+        let expected_path = policy
+            .worktree_root
+            .join(&repository.name)
+            .join(plan.id.as_str());
+        require_canonical_child(&policy.worktree_root, &expected_path)?;
+        if plan.path != expected_path {
+            return Err(Refusal::new(
+                "create-plan-path-changed",
+                "create plan path does not match current policy",
+            ));
+        }
+        let resolved_base = self
+            .git
+            .resolve_revision(&repository.root, plan.base.as_str())?;
+        if resolved_base != plan.base.as_str() {
+            return Err(Refusal::new(
+                "create-plan-base-not-immutable",
+                "create plan base must be an exact commit id",
+            ));
+        }
         let record = WorktreeRecord {
             id: plan.id.clone(),
             repository_root: plan.repository_root.clone(),
@@ -176,9 +242,7 @@ where
             let _ = self.registry.fail(plan.id.as_str(), self.clock.now());
             return Err(refusal);
         }
-        let snapshot = self
-            .git
-            .worktree_snapshot(&plan.repository_root, &plan.path)?;
+        let snapshot = self.exact_worktree_snapshot(&plan.repository_root, &plan.path)?;
         let now = self.clock.now();
         self.registry
             .activate(plan.id.as_str(), &snapshot.head, now)?;
@@ -203,11 +267,14 @@ where
         }
         let now = self.clock.now();
         self.require_idle(&record, now)?;
-        let snapshot = self
-            .git
-            .worktree_snapshot(&record.repository_root, &record.path)?;
+        let snapshot = self.exact_worktree_snapshot(&record.repository_root, &record.path)?;
         require_clean_unlocked(&snapshot)?;
-        self.registry.mark_finished(record.id.as_str(), now)?;
+        self.registry.mark_finished(
+            record.id.as_str(),
+            &snapshot.head,
+            now,
+            self.lease_timeout_seconds,
+        )?;
         Ok(OperationEvidence {
             operation: "finish".into(),
             id: record.id,
@@ -222,46 +289,87 @@ where
     pub fn gc(
         &self,
         policy: &WorkspacePolicy,
+        selected_ids: &[WorktreeId],
         apply: bool,
     ) -> Result<Vec<CleanupAssessment>, Refusal> {
-        policy.validate()?;
+        require_canonical_policy(policy)?;
+        if apply && selected_ids.is_empty() {
+            return Err(Refusal::new(
+                "explicit-cleanup-selection-required",
+                "cleanup apply requires at least one reviewed worktree id",
+            ));
+        }
         let now = self.clock.now();
-        let mut assessments = Vec::new();
-        for record in self.registry.list()? {
+        let records = self.registry.list()?;
+        validate_selected_records(policy, &records, selected_ids)?;
+        let mut planned = Vec::new();
+        for record in records {
+            if !record.repository_root.starts_with(&policy.workspace_root)
+                || (!selected_ids.is_empty() && !selected_ids.contains(&record.id))
+            {
+                continue;
+            }
             if record.lifecycle != Lifecycle::Finished
                 && !(record.lifecycle == Lifecycle::Active
                     && now.saturating_sub(record.last_seen_at) >= policy.expire_after_seconds)
             {
                 continue;
             }
-            let result = self.assess_cleanup(policy, &record, now);
-            match result {
-                Ok(_) if apply => {
-                    // Re-observe immediately before the only destructive call.
-                    let proof = self.assess_cleanup(policy, &record, self.clock.now())?;
-                    self.git.remove(&record.repository_root, &record.path)?;
-                    let evidence = OperationEvidence {
-                        operation: "remove".into(),
-                        id: record.id.clone(),
-                        path: record.path.clone(),
-                        head: Some(proof.head.clone()),
-                        recovery: Some(proof),
-                        recorded_at: self.clock.now(),
-                    };
-                    self.registry.mark_removed(&evidence)?;
-                    assessments.push(CleanupAssessment {
-                        record,
-                        eligible: true,
-                        refusal: None,
-                        evidence: Some(evidence),
-                    });
+            let assessment = self.assess_cleanup(policy, &record, now);
+            planned.push((record, assessment));
+        }
+        if apply {
+            for id in selected_ids {
+                if !planned.iter().any(|(record, _)| record.id == *id) {
+                    return Err(Refusal::new(
+                        "selected-worktree-not-cleanup-candidate",
+                        format!("{} is no longer a cleanup candidate", id.as_str()),
+                    ));
                 }
-                Ok(_) => assessments.push(CleanupAssessment {
+            }
+        }
+
+        let mut assessments = Vec::with_capacity(planned.len());
+        for (record, assessment) in planned {
+            match assessment {
+                Ok(_) if !apply => assessments.push(CleanupAssessment {
                     record,
                     eligible: true,
                     refusal: None,
                     evidence: None,
                 }),
+                Ok(_) => {
+                    match self.claim_cleanup(policy, record.clone()) {
+                        Err(refusal) => assessments.push(CleanupAssessment {
+                            record,
+                            eligible: false,
+                            refusal: Some(refusal),
+                            evidence: None,
+                        }),
+                        Ok(claimed) => {
+                            // Re-observe immediately before the only destructive call.
+                            let applied = self
+                                .assess_cleanup(policy, &claimed, self.clock.now())
+                                .and_then(|proof| {
+                                    self.apply_removal(&claimed, &claimed.path, "remove", proof)
+                                });
+                            match applied {
+                                Ok(evidence) => assessments.push(CleanupAssessment {
+                                    record: claimed,
+                                    eligible: true,
+                                    refusal: None,
+                                    evidence: Some(evidence),
+                                }),
+                                Err(refusal) => assessments.push(CleanupAssessment {
+                                    record: claimed,
+                                    eligible: false,
+                                    refusal: Some(refusal),
+                                    evidence: None,
+                                }),
+                            }
+                        }
+                    }
+                }
                 Err(refusal) => assessments.push(CleanupAssessment {
                     record,
                     eligible: false,
@@ -282,19 +390,18 @@ where
         policy: &WorkspacePolicy,
         selected_ids: &[WorktreeId],
         apply: bool,
+        allow_external_retirement: bool,
     ) -> Result<Vec<ReconciliationAssessment>, Refusal> {
-        policy.validate()?;
-        let records = self.registry.list()?;
-        for id in selected_ids {
-            if !records.iter().any(|record| record.id == *id) {
-                return Err(Refusal::new(
-                    "unknown-worktree-id",
-                    format!("{} is not registered", id.as_str()),
-                ));
-            }
+        require_canonical_policy(policy)?;
+        if apply && selected_ids.is_empty() {
+            return Err(Refusal::new(
+                "explicit-reconciliation-selection-required",
+                "reconciliation apply requires at least one reviewed worktree id",
+            ));
         }
-
-        let mut assessments = Vec::new();
+        let records = self.registry.list()?;
+        validate_selected_records(policy, &records, selected_ids)?;
+        let mut planned = Vec::new();
         for record in records {
             if record.lifecycle == Lifecycle::Removed
                 || !record.repository_root.starts_with(&policy.workspace_root)
@@ -305,26 +412,65 @@ where
             let Some(action) = self.reconciliation_action(policy, &record)? else {
                 continue;
             };
-            let result = self.assess_reconciliation(&record, &action, self.clock.now());
-            match result {
-                Ok(recovery) if apply => {
-                    let evidence =
-                        self.apply_reconciliation(&record, &action, recovery, self.clock.now())?;
-                    assessments.push(ReconciliationAssessment {
-                        record,
-                        action,
-                        eligible: true,
-                        refusal: None,
-                        evidence: Some(evidence),
-                    });
+            let assessment = self.assess_reconciliation(policy, &record, &action, self.clock.now());
+            planned.push((record, action, assessment));
+        }
+        if apply {
+            for id in selected_ids {
+                if !planned.iter().any(|(record, _, _)| record.id == *id) {
+                    return Err(Refusal::new(
+                        "selected-worktree-not-reconciliation-candidate",
+                        format!("{} is no longer a reconciliation candidate", id.as_str()),
+                    ));
                 }
-                Ok(_) => assessments.push(ReconciliationAssessment {
+            }
+        }
+        if apply
+            && !allow_external_retirement
+            && planned
+                .iter()
+                .any(|(_, action, _)| matches!(action, ReconciliationAction::RetireExternal { .. }))
+        {
+            return Err(Refusal::new(
+                "external-retirement-confirmation-required",
+                "retiring a finished tree outside the managed root requires explicit confirmation",
+            ));
+        }
+
+        let mut assessments = Vec::with_capacity(planned.len());
+        for (record, action, assessment) in planned {
+            match assessment {
+                Ok(_) if !apply => assessments.push(ReconciliationAssessment {
                     record,
                     action,
                     eligible: true,
                     refusal: None,
                     evidence: None,
                 }),
+                Ok(recovery) => {
+                    match self.apply_reconciliation(
+                        policy,
+                        &record,
+                        &action,
+                        recovery,
+                        self.clock.now(),
+                    ) {
+                        Ok(evidence) => assessments.push(ReconciliationAssessment {
+                            record,
+                            action,
+                            eligible: true,
+                            refusal: None,
+                            evidence: Some(evidence),
+                        }),
+                        Err(refusal) => assessments.push(ReconciliationAssessment {
+                            record,
+                            action,
+                            eligible: false,
+                            refusal: Some(refusal),
+                            evidence: None,
+                        }),
+                    }
+                }
                 Err(refusal) => assessments.push(ReconciliationAssessment {
                     record,
                     action,
@@ -341,6 +487,12 @@ where
     pub fn session_start(&self, path: &Path, session: &str) -> Result<(), Refusal> {
         validate_label("session", session)?;
         let record = self.owned_record(path)?;
+        if record.lifecycle != Lifecycle::Active {
+            return Err(Refusal::new(
+                "worktree-not-active",
+                "only an active worktree may acquire or refresh a session lease",
+            ));
+        }
         let now = self.clock.now();
         self.registry
             .acquire_lease(record.id.as_str(), session, now)?;
@@ -356,16 +508,45 @@ where
     /// Adopt an existing linked worktree. This is explicit and never automatic.
     pub fn adopt(
         &self,
+        policy: &WorkspacePolicy,
         repository: &Path,
         path: &Path,
         id: b10x_worktree_domain::WorktreeId,
         purpose: String,
         owner: String,
     ) -> Result<OperationEvidence, Refusal> {
+        require_canonical_policy(policy)?;
         validate_label("purpose", &purpose)?;
         validate_label("owner", &owner)?;
         let repo = self.git.repository_snapshot(repository)?;
+        if !repo.root.starts_with(&policy.workspace_root) {
+            return Err(Refusal::new(
+                "repository-outside-workspace",
+                format!(
+                    "repository {} is not below {}",
+                    repo.root.display(),
+                    policy.workspace_root.display()
+                ),
+            ));
+        }
         let snapshot = self.git.worktree_snapshot(&repo.root, path)?;
+        let linked = self
+            .git
+            .list_worktrees(&repo.root)?
+            .into_iter()
+            .find(|item| item.path == snapshot.path)
+            .ok_or_else(|| {
+                Refusal::new(
+                    "worktree-not-discovered",
+                    "Git does not report the requested linked worktree",
+                )
+            })?;
+        if linked.primary {
+            return Err(Refusal::new(
+                "primary-worktree",
+                "the primary checkout cannot be adopted",
+            ));
+        }
         let now = self.clock.now();
         let record = WorktreeRecord {
             id: id.clone(),
@@ -416,35 +597,52 @@ where
         Ok(())
     }
 
+    fn exact_worktree_snapshot(
+        &self,
+        repository: &Path,
+        path: &Path,
+    ) -> Result<WorktreeSnapshot, Refusal> {
+        let snapshot = self.git.worktree_snapshot(repository, path)?;
+        require_exact_snapshot_path(&snapshot, path)?;
+        Ok(snapshot)
+    }
+
     fn assess_cleanup(
         &self,
         policy: &WorkspacePolicy,
         record: &WorktreeRecord,
         now: i64,
     ) -> Result<RecoveryProof, Refusal> {
-        require_child(&policy.worktree_root, &record.path)?;
+        require_canonical_child(&policy.worktree_root, &record.path)?;
         self.require_idle(record, now)?;
-        let snapshot = self
-            .git
-            .worktree_snapshot(&record.repository_root, &record.path)?;
+        let snapshot = self.exact_worktree_snapshot(&record.repository_root, &record.path)?;
         require_clean_unlocked(&snapshot)?;
-        self.git.fetch(&record.repository_root)?;
-        let refs = self
-            .git
-            .recovery_refs(&record.repository_root, &snapshot.head)?;
-        if refs.is_empty() {
-            return Err(Refusal::new(
-                "no-remote-recovery-proof",
-                format!(
-                    "commit {} is not reachable from a remote branch or tag",
-                    snapshot.head
-                ),
-            ));
+        self.recovery_for_record(record, &snapshot.head, now)
+    }
+
+    fn claim_cleanup(
+        &self,
+        policy: &WorkspacePolicy,
+        record: WorktreeRecord,
+    ) -> Result<WorktreeRecord, Refusal> {
+        if record.lifecycle != Lifecycle::Active {
+            return Ok(record);
         }
-        Ok(RecoveryProof {
-            head: snapshot.head,
-            refs,
-            observed_at: now,
+        let snapshot = self.exact_worktree_snapshot(&record.repository_root, &record.path)?;
+        require_clean_unlocked(&snapshot)?;
+        let now = self.clock.now();
+        self.registry.claim_expired(
+            record.id.as_str(),
+            &snapshot.head,
+            now,
+            now.saturating_sub(policy.expire_after_seconds),
+            self.lease_timeout_seconds,
+        )?;
+        self.registry.find_by_path(&record.path)?.ok_or_else(|| {
+            Refusal::new(
+                "cleanup-claim-missing",
+                "claimed worktree disappeared from the lifecycle registry",
+            )
         })
     }
 
@@ -454,25 +652,45 @@ where
         record: &WorktreeRecord,
     ) -> Result<Option<ReconciliationAction>, Refusal> {
         if let Some(intent) = self.registry.relocation(record.id.as_str())? {
+            if intent.from != record.path {
+                return Err(Refusal::new(
+                    "relocation-source-mismatch",
+                    "pending relocation source differs from the registered worktree path",
+                ));
+            }
+            require_canonical_child(&policy.worktree_root, &intent.to)?;
             return Ok(Some(ReconciliationAction::Migrate {
                 from: intent.from,
                 to: intent.to,
             }));
         }
-        if path_absent(&record.path) {
+        if path_absent(&record.path)? {
             return Ok(Some(ReconciliationAction::TombstoneMissing {
                 path: record.path.clone(),
             }));
         }
         if record.path.starts_with(&policy.worktree_root) {
+            if matches!(
+                record.lifecycle,
+                Lifecycle::Provisioning | Lifecycle::Failed
+            ) {
+                return Ok(Some(ReconciliationAction::RecoverProvisioning {
+                    path: record.path.clone(),
+                }));
+            }
             return Ok(None);
+        }
+        if record.lifecycle == Lifecycle::Finished {
+            return Ok(Some(ReconciliationAction::RetireExternal {
+                path: record.path.clone(),
+            }));
         }
         let repository = self.git.repository_snapshot(&record.repository_root)?;
         let to = policy
             .worktree_root
             .join(repository.name)
             .join(record.id.as_str());
-        require_child(&policy.worktree_root, &to)?;
+        require_canonical_child(&policy.worktree_root, &to)?;
         Ok(Some(ReconciliationAction::Migrate {
             from: record.path.clone(),
             to,
@@ -481,25 +699,88 @@ where
 
     fn assess_reconciliation(
         &self,
+        policy: &WorkspacePolicy,
         record: &WorktreeRecord,
         action: &ReconciliationAction,
         now: i64,
     ) -> Result<Option<RecoveryProof>, Refusal> {
         self.require_idle(record, now)?;
         match action {
-            ReconciliationAction::Migrate { from, to } => self.assess_migration(record, from, to),
+            ReconciliationAction::RecoverProvisioning { path } => {
+                self.assess_provisioning_recovery(record, path)
+            }
+            ReconciliationAction::Migrate { from, to } => {
+                self.assess_migration(policy, record, from, to)
+            }
+            ReconciliationAction::RetireExternal { path } => {
+                self.assess_external_retirement(policy, record, path, now)
+            }
             ReconciliationAction::TombstoneMissing { path } => {
                 self.assess_missing(record, path, now)
             }
         }
     }
 
+    fn assess_provisioning_recovery(
+        &self,
+        record: &WorktreeRecord,
+        path: &Path,
+    ) -> Result<Option<RecoveryProof>, Refusal> {
+        if !matches!(
+            record.lifecycle,
+            Lifecycle::Provisioning | Lifecycle::Failed
+        ) || path != record.path
+        {
+            return Err(Refusal::new(
+                "invalid-provisioning-recovery",
+                "provisioning recovery requires the exact failed or provisioning record",
+            ));
+        }
+        let linked = self
+            .git
+            .list_worktrees(&record.repository_root)?
+            .into_iter()
+            .find(|item| item.path == *path)
+            .ok_or_else(|| {
+                Refusal::new(
+                    "worktree-not-discovered",
+                    "Git does not report the provisioned worktree",
+                )
+            })?;
+        if linked.primary || linked.locked {
+            return Err(Refusal::new(
+                "worktree-locked",
+                "provisioning recovery refuses primary or locked worktrees",
+            ));
+        }
+        let snapshot = self.exact_worktree_snapshot(&record.repository_root, path)?;
+        if record
+            .head
+            .as_deref()
+            .is_some_and(|head| head != snapshot.head)
+        {
+            return Err(Refusal::new(
+                "provisioning-head-changed",
+                "provisioned worktree HEAD differs from the recorded commit",
+            ));
+        }
+        Ok(None)
+    }
+
     fn assess_migration(
         &self,
+        policy: &WorkspacePolicy,
         record: &WorktreeRecord,
         from: &Path,
         to: &Path,
     ) -> Result<Option<RecoveryProof>, Refusal> {
+        if from != record.path {
+            return Err(Refusal::new(
+                "relocation-source-mismatch",
+                "migration source differs from the registered worktree path",
+            ));
+        }
+        require_canonical_child(&policy.worktree_root, to)?;
         let discovered = self.git.list_worktrees(&record.repository_root)?;
         let source = discovered.iter().find(|item| item.path == from);
         let destination = discovered.iter().find(|item| item.path == to);
@@ -517,21 +798,21 @@ where
                         "Git marks the worktree locked",
                     ));
                 }
-                if !path_absent(to) {
+                if !path_absent(to)? {
                     return Err(Refusal::new(
                         "migration-target-exists",
                         format!("{} already exists", to.display()),
                     ));
                 }
                 self.git.validate_move_worktree(from, to)?;
-                let snapshot = self.git.worktree_snapshot(&record.repository_root, from)?;
-                if let Some(intent) = self.registry.relocation(record.id.as_str())?
-                    && snapshot.head != intent.head
-                {
-                    return Err(Refusal::new(
-                        "relocation-head-changed",
-                        "worktree HEAD changed after relocation was planned",
-                    ));
+                let snapshot = self.exact_worktree_snapshot(&record.repository_root, from)?;
+                if let Some(intent) = self.registry.relocation(record.id.as_str())? {
+                    if snapshot.head != intent.head {
+                        return Err(Refusal::new(
+                            "relocation-head-changed",
+                            "worktree HEAD changed after relocation was planned",
+                        ));
+                    }
                 }
             }
             (None, Some(destination)) => {
@@ -550,7 +831,7 @@ where
                         "relocated worktree is primary or locked",
                     ));
                 }
-                let snapshot = self.git.worktree_snapshot(&record.repository_root, to)?;
+                let snapshot = self.exact_worktree_snapshot(&record.repository_root, to)?;
                 if snapshot.head != intent.head {
                     return Err(Refusal::new(
                         "relocation-head-changed",
@@ -574,13 +855,54 @@ where
         Ok(None)
     }
 
+    fn assess_external_retirement(
+        &self,
+        policy: &WorkspacePolicy,
+        record: &WorktreeRecord,
+        path: &Path,
+        now: i64,
+    ) -> Result<Option<RecoveryProof>, Refusal> {
+        if record.lifecycle != Lifecycle::Finished {
+            return Err(Refusal::new(
+                "external-worktree-not-finished",
+                "only a finished legacy worktree may be retired outside the managed root",
+            ));
+        }
+        if path != record.path || path.starts_with(&policy.worktree_root) {
+            return Err(Refusal::new(
+                "invalid-external-retirement-path",
+                "external retirement requires the exact registered path outside the managed root",
+            ));
+        }
+        let discovered = self.git.list_worktrees(&record.repository_root)?;
+        let linked = discovered
+            .iter()
+            .find(|item| item.path == path)
+            .ok_or_else(|| {
+                Refusal::new(
+                    "worktree-not-discovered",
+                    "Git does not report the registered external worktree",
+                )
+            })?;
+        if linked.primary {
+            return Err(Refusal::new(
+                "primary-worktree",
+                "a primary checkout cannot be retired",
+            ));
+        }
+        let snapshot = self.exact_worktree_snapshot(&record.repository_root, path)?;
+        require_clean_unlocked(&snapshot)?;
+        self.recovery_for_record(record, &snapshot.head, now)
+            .map(Some)
+    }
+
     fn assess_missing(
         &self,
         record: &WorktreeRecord,
         path: &Path,
         now: i64,
     ) -> Result<Option<RecoveryProof>, Refusal> {
-        if !path_absent(path) {
+        if !path_absent(path)? {
             return Err(Refusal::new(
                 "worktree-path-exists",
                 format!("{} still exists", path.display()),
@@ -597,8 +919,29 @@ where
                 "Git still reports the missing worktree path",
             ));
         }
+        let removal = self.registry.removal(record.id.as_str())?;
+        if matches!(record.lifecycle, Lifecycle::Active | Lifecycle::Relocating)
+            && removal.is_none()
+        {
+            return Err(Refusal::new(
+                "missing-active-worktree",
+                "an active or relocating worktree disappeared without durable removal intent",
+            ));
+        }
+        if let Some(intent) = removal {
+            if intent.path != *path || intent.head != intent.recovery.head {
+                return Err(Refusal::new(
+                    "removal-intent-mismatch",
+                    "pending removal proof does not match the missing worktree path and HEAD",
+                ));
+            }
+            return Ok(Some(intent.recovery));
+        }
         let Some(head) = record.head.as_deref() else {
-            return if record.lifecycle == Lifecycle::Failed {
+            return if matches!(
+                record.lifecycle,
+                Lifecycle::Failed | Lifecycle::Provisioning
+            ) {
                 Ok(None)
             } else {
                 Err(Refusal::new(
@@ -607,36 +950,52 @@ where
                 ))
             };
         };
-        self.git.fetch(&record.repository_root)?;
-        let refs = self.git.recovery_refs(&record.repository_root, head)?;
-        if refs.is_empty() {
-            return Err(Refusal::new(
-                "no-remote-recovery-proof",
-                format!("commit {head} is not reachable from a remote branch or tag"),
-            ));
-        }
-        Ok(Some(RecoveryProof {
-            head: head.to_owned(),
-            refs,
-            observed_at: now,
-        }))
+        self.recovery_proof(&record.repository_root, head, now)
+            .map(Some)
     }
 
     fn apply_reconciliation(
         &self,
+        policy: &WorkspacePolicy,
         record: &WorktreeRecord,
         action: &ReconciliationAction,
         _recovery: Option<RecoveryProof>,
         now: i64,
     ) -> Result<OperationEvidence, Refusal> {
-        let recovery = self.assess_reconciliation(record, action, now)?;
+        let recovery = self.assess_reconciliation(policy, record, action, now)?;
         match action {
+            ReconciliationAction::RecoverProvisioning { path } => {
+                let snapshot = self.exact_worktree_snapshot(&record.repository_root, path)?;
+                let recorded_at = self.clock.now();
+                self.registry
+                    .activate(record.id.as_str(), &snapshot.head, recorded_at)?;
+                Ok(OperationEvidence {
+                    operation: "recover-provisioning".into(),
+                    id: record.id.clone(),
+                    path: path.clone(),
+                    head: Some(snapshot.head),
+                    recovery: None,
+                    recorded_at,
+                })
+            }
             ReconciliationAction::Migrate { from, to } => {
+                if record.lifecycle == Lifecycle::Active {
+                    self.registry.claim_relocation(
+                        record.id.as_str(),
+                        self.clock.now(),
+                        self.lease_timeout_seconds,
+                    )?;
+                } else if record.lifecycle != Lifecycle::Relocating {
+                    return Err(Refusal::new(
+                        "invalid-relocation-lifecycle",
+                        "only an active or already-relocating worktree may be migrated",
+                    ));
+                }
                 let pending = self.registry.relocation(record.id.as_str())?;
                 let intent = if let Some(intent) = pending {
                     intent
                 } else {
-                    let snapshot = self.git.worktree_snapshot(&record.repository_root, from)?;
+                    let snapshot = self.exact_worktree_snapshot(&record.repository_root, from)?;
                     let intent = RelocationIntent {
                         id: record.id.clone(),
                         from: from.clone(),
@@ -653,7 +1012,7 @@ where
                 if source_exists && !destination_exists {
                     self.git.move_worktree(&record.repository_root, from, to)?;
                 }
-                let snapshot = self.git.worktree_snapshot(&record.repository_root, to)?;
+                let snapshot = self.exact_worktree_snapshot(&record.repository_root, to)?;
                 if snapshot.head != intent.head {
                     return Err(Refusal::new(
                         "relocation-head-changed",
@@ -671,24 +1030,272 @@ where
                 self.registry.complete_relocation(&intent, &evidence)?;
                 Ok(evidence)
             }
+            ReconciliationAction::RetireExternal { path } => {
+                let proof = recovery.ok_or_else(|| {
+                    Refusal::new(
+                        "missing-removal-proof",
+                        "external retirement requires durable recovery proof",
+                    )
+                })?;
+                self.apply_removal(record, path, "retire-external", proof)
+            }
             ReconciliationAction::TombstoneMissing { path } => {
+                let pending = self.registry.removal(record.id.as_str())?;
+                let head = pending
+                    .as_ref()
+                    .map(|intent| intent.head.clone())
+                    .or_else(|| recovery.as_ref().map(|proof| proof.head.clone()))
+                    .or_else(|| record.head.clone());
                 let evidence = OperationEvidence {
                     operation: "reconcile-missing".into(),
                     id: record.id.clone(),
                     path: path.clone(),
-                    head: record.head.clone(),
+                    head,
                     recovery,
                     recorded_at: self.clock.now(),
                 };
-                self.registry.mark_removed(&evidence)?;
+                if let Some(intent) = pending {
+                    self.registry.complete_removal(&intent, &evidence)?;
+                } else {
+                    self.registry.mark_removed(&evidence)?;
+                }
                 Ok(evidence)
             }
         }
     }
+
+    fn recovery_proof(
+        &self,
+        repository: &Path,
+        head: &str,
+        now: i64,
+    ) -> Result<RecoveryProof, Refusal> {
+        let refs = self.git.recovery_refs(repository, head)?;
+        if refs.is_empty() {
+            return Err(Refusal::new(
+                "no-remote-recovery-proof",
+                format!("commit {head} is not reachable from an advertised remote ref"),
+            ));
+        }
+        Ok(RecoveryProof {
+            head: head.to_owned(),
+            refs,
+            observed_at: now,
+        })
+    }
+
+    fn recovery_for_record(
+        &self,
+        record: &WorktreeRecord,
+        head: &str,
+        now: i64,
+    ) -> Result<RecoveryProof, Refusal> {
+        if let Some(intent) = self.registry.removal(record.id.as_str())? {
+            if intent.path != record.path {
+                return Err(Refusal::new(
+                    "removal-intent-mismatch",
+                    "pending removal proof does not match the current worktree path",
+                ));
+            }
+        }
+        self.recovery_proof(&record.repository_root, head, now)
+    }
+
+    fn apply_removal(
+        &self,
+        record: &WorktreeRecord,
+        path: &Path,
+        operation: &str,
+        proof: RecoveryProof,
+    ) -> Result<OperationEvidence, Refusal> {
+        let before_intent = self.exact_worktree_snapshot(&record.repository_root, path)?;
+        require_clean_unlocked(&before_intent)?;
+        if before_intent.head != proof.head {
+            return Err(Refusal::new(
+                "worktree-head-changed-during-proof",
+                "worktree HEAD changed while remote recovery proof was collected",
+            ));
+        }
+        if let Some(intent) = self.registry.removal(record.id.as_str())? {
+            if intent.path != path || intent.operation != operation {
+                return Err(Refusal::new(
+                    "removal-intent-mismatch",
+                    "pending removal intent differs from the revalidated operation",
+                ));
+            }
+        }
+        let intent = RemovalIntent {
+            id: record.id.clone(),
+            path: path.to_path_buf(),
+            head: proof.head.clone(),
+            recovery: proof,
+            operation: operation.to_owned(),
+            planned_at: self.clock.now(),
+        };
+        self.registry.begin_removal(&intent)?;
+        let before_remove = self.exact_worktree_snapshot(&record.repository_root, path)?;
+        require_clean_unlocked(&before_remove)?;
+        if before_remove.head != intent.head {
+            return Err(Refusal::new(
+                "worktree-head-changed-after-intent",
+                "worktree HEAD changed after removal intent became durable",
+            ));
+        }
+        self.git.remove(&record.repository_root, path)?;
+        if !path_absent(path)?
+            || self
+                .git
+                .list_worktrees(&record.repository_root)?
+                .iter()
+                .any(|item| item.path == path)
+        {
+            return Err(Refusal::new(
+                "worktree-removal-incomplete",
+                "Git returned success but the worktree still exists",
+            ));
+        }
+        let evidence = OperationEvidence {
+            operation: intent.operation.clone(),
+            id: record.id.clone(),
+            path: path.to_path_buf(),
+            head: Some(intent.head.clone()),
+            recovery: Some(intent.recovery.clone()),
+            recorded_at: self.clock.now(),
+        };
+        self.registry.complete_removal(&intent, &evidence)?;
+        Ok(evidence)
+    }
 }
 
-fn path_absent(path: &Path) -> bool {
-    std::fs::symlink_metadata(path).is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+fn path_absent(path: &Path) -> Result<bool, Refusal> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(Refusal::new(
+            "worktree-path-inspection-failed",
+            format!("{}: {error}", path.display()),
+        )),
+    }
+}
+
+fn validate_selected_records(
+    policy: &WorkspacePolicy,
+    records: &[WorktreeRecord],
+    selected_ids: &[WorktreeId],
+) -> Result<(), Refusal> {
+    for id in selected_ids {
+        let record = records
+            .iter()
+            .find(|record| record.id == *id)
+            .ok_or_else(|| {
+                Refusal::new(
+                    "unknown-worktree-id",
+                    format!("{} is not registered", id.as_str()),
+                )
+            })?;
+        if !record.repository_root.starts_with(&policy.workspace_root) {
+            return Err(Refusal::new(
+                "selected-worktree-outside-policy",
+                format!(
+                    "{} belongs to repository {} outside workspace {}",
+                    id.as_str(),
+                    record.repository_root.display(),
+                    policy.workspace_root.display()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn require_canonical_policy(policy: &WorkspacePolicy) -> Result<(), Refusal> {
+    policy.validate()?;
+    let workspace = std::fs::canonicalize(&policy.workspace_root).map_err(|error| {
+        Refusal::new(
+            "workspace-root-invalid",
+            format!("{}: {error}", policy.workspace_root.display()),
+        )
+    })?;
+    let worktrees = canonicalize_future_path(&policy.worktree_root)?;
+    if workspace != policy.workspace_root || worktrees != policy.worktree_root {
+        return Err(Refusal::new(
+            "non-canonical-policy-path",
+            "workspace and managed worktree roots must be canonical",
+        ));
+    }
+    Ok(())
+}
+
+fn require_canonical_child(root: &Path, candidate: &Path) -> Result<(), Refusal> {
+    require_child(root, candidate)?;
+    let canonical = canonicalize_future_path(candidate)?;
+    if canonical != candidate || !canonical.starts_with(root) {
+        return Err(Refusal::new(
+            "non-canonical-worktree-path",
+            format!(
+                "managed path {} resolves to {} instead of remaining below {}",
+                candidate.display(),
+                canonical.display(),
+                root.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn canonicalize_future_path(path: &Path) -> Result<PathBuf, Refusal> {
+    let mut suffix = Vec::new();
+    let mut existing = path;
+    loop {
+        match std::fs::metadata(existing) {
+            Ok(metadata) => {
+                if !metadata.is_dir() {
+                    return Err(Refusal::new(
+                        "worktree-root-ancestor-not-directory",
+                        format!("{} is not a directory", existing.display()),
+                    ));
+                }
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if std::fs::symlink_metadata(existing).is_ok() {
+                    return Err(Refusal::new(
+                        "policy-path-dangling-symlink",
+                        format!("{} is a dangling symlink", existing.display()),
+                    ));
+                }
+                let component = existing.file_name().ok_or_else(|| {
+                    Refusal::new(
+                        "policy-path-invalid",
+                        format!("{} has no existing ancestor", path.display()),
+                    )
+                })?;
+                suffix.push(component.to_os_string());
+                existing = existing.parent().ok_or_else(|| {
+                    Refusal::new(
+                        "policy-path-invalid",
+                        format!("{} has no existing ancestor", path.display()),
+                    )
+                })?;
+            }
+            Err(error) => {
+                return Err(Refusal::new(
+                    "policy-path-invalid",
+                    format!("{}: {error}", existing.display()),
+                ));
+            }
+        }
+    }
+    let mut canonical = std::fs::canonicalize(existing).map_err(|error| {
+        Refusal::new(
+            "policy-path-invalid",
+            format!("{}: {error}", existing.display()),
+        )
+    })?;
+    for component in suffix.into_iter().rev() {
+        canonical.push(component);
+    }
+    Ok(canonical)
 }
 
 fn validate_label(name: &str, value: &str) -> Result<(), Refusal> {
@@ -711,7 +1318,24 @@ fn require_clean_unlocked(snapshot: &WorktreeSnapshot) -> Result<(), Refusal> {
     if snapshot.dirty {
         return Err(Refusal::new(
             "worktree-dirty",
-            "tracked or untracked changes make cleanup unsafe",
+            "tracked, untracked, or ignored files make cleanup unsafe",
+        ));
+    }
+    Ok(())
+}
+
+fn require_exact_snapshot_path(
+    snapshot: &WorktreeSnapshot,
+    expected: &Path,
+) -> Result<(), Refusal> {
+    if snapshot.path != expected {
+        return Err(Refusal::new(
+            "worktree-path-changed",
+            format!(
+                "registered path {} resolves to linked worktree {}",
+                expected.display(),
+                snapshot.path.display()
+            ),
         ));
     }
     Ok(())
@@ -726,7 +1350,7 @@ pub fn default_worktree_root(state_home: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, VecDeque};
     use std::sync::Mutex;
     use tempfile::tempdir;
 
@@ -743,6 +1367,9 @@ mod tests {
         snapshots: Mutex<BTreeMap<PathBuf, WorktreeSnapshot>>,
         discovered: Mutex<Vec<DiscoveredWorktree>>,
         recoverable: bool,
+        resolved_revision: Mutex<Option<String>>,
+        fail_remove: bool,
+        snapshot_sequence: Mutex<VecDeque<String>>,
     }
 
     impl GitPort for FakeGit {
@@ -754,24 +1381,36 @@ mod tests {
             })
         }
 
+        fn resolve_revision(&self, _repository: &Path, revision: &str) -> Result<String, Refusal> {
+            Ok(self
+                .resolved_revision
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(|| revision.to_owned()))
+        }
+
         fn worktree_snapshot(
             &self,
             _repository: &Path,
             worktree: &Path,
         ) -> Result<WorktreeSnapshot, Refusal> {
-            self.snapshots
+            let mut snapshot = self
+                .snapshots
                 .lock()
                 .unwrap()
                 .get(worktree)
                 .cloned()
-                .ok_or_else(|| Refusal::new("worktree-not-found", worktree.display().to_string()))
+                .ok_or_else(|| {
+                    Refusal::new("worktree-not-found", worktree.display().to_string())
+                })?;
+            if let Some(head) = self.snapshot_sequence.lock().unwrap().pop_front() {
+                snapshot.head = head;
+            }
+            Ok(snapshot)
         }
 
         fn create_detached(&self, _plan: &CreatePlan) -> Result<(), Refusal> {
-            Ok(())
-        }
-
-        fn fetch(&self, _repository: &Path) -> Result<(), Refusal> {
             Ok(())
         }
 
@@ -783,7 +1422,18 @@ mod tests {
             })
         }
 
-        fn remove(&self, _repository: &Path, _worktree: &Path) -> Result<(), Refusal> {
+        fn remove(&self, _repository: &Path, worktree: &Path) -> Result<(), Refusal> {
+            if self.fail_remove {
+                return Err(Refusal::new("remove-failed", "injected removal failure"));
+            }
+            if worktree.exists() {
+                std::fs::remove_dir(worktree).unwrap();
+            }
+            self.snapshots.lock().unwrap().remove(worktree);
+            self.discovered
+                .lock()
+                .unwrap()
+                .retain(|item| item.path != worktree);
             Ok(())
         }
 
@@ -815,6 +1465,7 @@ mod tests {
     struct FakeRegistry {
         records: Mutex<Vec<WorktreeRecord>>,
         relocations: Mutex<BTreeMap<String, RelocationIntent>>,
+        removals: Mutex<BTreeMap<String, RemovalIntent>>,
         live_leases: u64,
     }
 
@@ -824,7 +1475,15 @@ mod tests {
             Ok(())
         }
 
-        fn activate(&self, _id: &str, _head: &str, _now: i64) -> Result<(), Refusal> {
+        fn activate(&self, id: &str, head: &str, now: i64) -> Result<(), Refusal> {
+            let mut records = self.records.lock().unwrap();
+            let record = records
+                .iter_mut()
+                .find(|record| record.id.as_str() == id)
+                .unwrap();
+            record.lifecycle = Lifecycle::Active;
+            record.head = Some(head.to_owned());
+            record.last_seen_at = now;
             Ok(())
         }
 
@@ -850,7 +1509,76 @@ mod tests {
             Ok(())
         }
 
-        fn mark_finished(&self, _id: &str, _now: i64) -> Result<(), Refusal> {
+        fn mark_finished(
+            &self,
+            id: &str,
+            head: &str,
+            now: i64,
+            _lease_timeout: i64,
+        ) -> Result<(), Refusal> {
+            if self.live_leases > 0 {
+                return Err(Refusal::new("live-session", "test lease is live"));
+            }
+            let mut records = self.records.lock().unwrap();
+            let record = records
+                .iter_mut()
+                .find(|record| record.id.as_str() == id)
+                .unwrap();
+            record.lifecycle = Lifecycle::Finished;
+            record.head = Some(head.to_owned());
+            record.finished_at = Some(now);
+            Ok(())
+        }
+
+        fn claim_expired(
+            &self,
+            id: &str,
+            head: &str,
+            now: i64,
+            expire_before: i64,
+            _lease_timeout: i64,
+        ) -> Result<(), Refusal> {
+            if self.live_leases > 0 {
+                return Err(Refusal::new("live-session", "test lease is live"));
+            }
+            let mut records = self.records.lock().unwrap();
+            let record = records
+                .iter_mut()
+                .find(|record| record.id.as_str() == id)
+                .unwrap();
+            if record.lifecycle != Lifecycle::Active || record.last_seen_at > expire_before {
+                return Err(Refusal::new(
+                    "invalid-lifecycle-transition",
+                    "record is not expired",
+                ));
+            }
+            record.lifecycle = Lifecycle::Finished;
+            record.head = Some(head.to_owned());
+            record.finished_at = Some(now);
+            Ok(())
+        }
+
+        fn claim_relocation(
+            &self,
+            id: &str,
+            _now: i64,
+            _lease_timeout: i64,
+        ) -> Result<(), Refusal> {
+            if self.live_leases > 0 {
+                return Err(Refusal::new("live-session", "test lease is live"));
+            }
+            let mut records = self.records.lock().unwrap();
+            let record = records
+                .iter_mut()
+                .find(|record| record.id.as_str() == id)
+                .unwrap();
+            if record.lifecycle != Lifecycle::Active {
+                return Err(Refusal::new(
+                    "invalid-lifecycle-transition",
+                    "record is not active",
+                ));
+            }
+            record.lifecycle = Lifecycle::Relocating;
             Ok(())
         }
 
@@ -898,22 +1626,81 @@ mod tests {
             intent: &RelocationIntent,
             _evidence: &OperationEvidence,
         ) -> Result<(), Refusal> {
-            self.records
-                .lock()
-                .unwrap()
+            let mut records = self.records.lock().unwrap();
+            let record = records
                 .iter_mut()
                 .find(|record| record.id == intent.id)
-                .unwrap()
-                .path = intent.to.clone();
+                .unwrap();
+            record.path = intent.to.clone();
+            record.lifecycle = Lifecycle::Active;
             self.relocations.lock().unwrap().remove(intent.id.as_str());
+            Ok(())
+        }
+
+        fn removal(&self, id: &str) -> Result<Option<RemovalIntent>, Refusal> {
+            Ok(self.removals.lock().unwrap().get(id).cloned())
+        }
+
+        fn begin_removal(&self, intent: &RemovalIntent) -> Result<(), Refusal> {
+            self.removals
+                .lock()
+                .unwrap()
+                .insert(intent.id.to_string(), intent.clone());
+            Ok(())
+        }
+
+        fn complete_removal(
+            &self,
+            intent: &RemovalIntent,
+            evidence: &OperationEvidence,
+        ) -> Result<(), Refusal> {
+            self.mark_removed(evidence)?;
+            self.removals.lock().unwrap().remove(intent.id.as_str());
             Ok(())
         }
     }
 
-    fn record(path: PathBuf, lifecycle: Lifecycle) -> WorktreeRecord {
+    fn fake_git(repository: PathBuf) -> FakeGit {
+        FakeGit {
+            repository,
+            snapshots: Mutex::new(BTreeMap::new()),
+            discovered: Mutex::new(Vec::new()),
+            recoverable: true,
+            resolved_revision: Mutex::new(None),
+            fail_remove: false,
+            snapshot_sequence: Mutex::new(VecDeque::new()),
+        }
+    }
+
+    fn fake_registry(records: Vec<WorktreeRecord>) -> FakeRegistry {
+        FakeRegistry {
+            records: Mutex::new(records),
+            relocations: Mutex::new(BTreeMap::new()),
+            removals: Mutex::new(BTreeMap::new()),
+            live_leases: 0,
+        }
+    }
+
+    fn policy(workspace_root: PathBuf, worktree_root: PathBuf) -> WorkspacePolicy {
+        WorkspacePolicy {
+            version: 1,
+            name: "test".into(),
+            workspace_root,
+            worktree_root,
+            expire_after_seconds: 60,
+            protect_workspace_root: true,
+        }
+    }
+
+    fn named_record(
+        id: &str,
+        repository_root: PathBuf,
+        path: PathBuf,
+        lifecycle: Lifecycle,
+    ) -> WorktreeRecord {
         WorktreeRecord {
-            id: WorktreeId::new("legacy-one").unwrap(),
-            repository_root: path.parent().unwrap().join("repo"),
+            id: WorktreeId::new(id).unwrap(),
+            repository_root,
             path,
             purpose: "test".into(),
             owner: "test".into(),
@@ -923,6 +1710,11 @@ mod tests {
             finished_at: None,
             head: Some("abc".into()),
         }
+    }
+
+    fn record(path: PathBuf, lifecycle: Lifecycle) -> WorktreeRecord {
+        let repository = path.parent().unwrap().join("repo");
+        named_record("legacy-one", repository, path, lifecycle)
     }
 
     #[test]
@@ -953,10 +1745,14 @@ mod tests {
                     primary: false,
                 }]),
                 recoverable: true,
+                resolved_revision: Mutex::new(None),
+                fail_remove: false,
+                snapshot_sequence: Mutex::new(VecDeque::new()),
             },
             FakeRegistry {
                 records: Mutex::new(vec![registered.clone()]),
                 relocations: Mutex::new(BTreeMap::new()),
+                removals: Mutex::new(BTreeMap::new()),
                 live_leases: 0,
             },
             FixedClock,
@@ -971,7 +1767,7 @@ mod tests {
         };
 
         let assessments = manager
-            .reconcile(&policy, std::slice::from_ref(&registered.id), true)
+            .reconcile(&policy, std::slice::from_ref(&registered.id), true, false)
             .unwrap();
         assert!(assessments[0].eligible);
         assert!(assessments[0].evidence.is_some());
@@ -1004,17 +1800,21 @@ mod tests {
                 snapshots: Mutex::new(BTreeMap::new()),
                 discovered: Mutex::new(Vec::new()),
                 recoverable: true,
+                resolved_revision: Mutex::new(None),
+                fail_remove: false,
+                snapshot_sequence: Mutex::new(VecDeque::new()),
             },
             FakeRegistry {
                 records: Mutex::new(vec![registered.clone()]),
                 relocations: Mutex::new(BTreeMap::new()),
+                removals: Mutex::new(BTreeMap::new()),
                 live_leases: 0,
             },
             FixedClock,
         );
 
         let assessments = manager
-            .reconcile(&policy, std::slice::from_ref(&registered.id), true)
+            .reconcile(&policy, std::slice::from_ref(&registered.id), true, false)
             .unwrap();
         assert_eq!(
             assessments[0].evidence.as_ref().unwrap().operation,
@@ -1024,5 +1824,809 @@ mod tests {
             manager.registry().list().unwrap()[0].lifecycle,
             Lifecycle::Removed
         );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn gc_apply_requires_exact_ids_and_only_touches_selected_workspace_records() {
+        let temporary = tempdir().unwrap();
+        let workspace = temporary.path().join("workspace");
+        let repository = workspace.join("repo");
+        let outside_repository = temporary.path().join("outside-repo");
+        let managed_root = temporary.path().join("managed");
+        std::fs::create_dir_all(&repository).unwrap();
+        std::fs::create_dir_all(&outside_repository).unwrap();
+        std::fs::create_dir_all(&managed_root).unwrap();
+
+        let selected_path = managed_root.join("repo/selected");
+        let unselected_path = managed_root.join("repo/unselected");
+        let outside_path = managed_root.join("outside/outside");
+        for path in [&selected_path, &unselected_path, &outside_path] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        let mut selected = named_record(
+            "selected",
+            repository.clone(),
+            selected_path.clone(),
+            Lifecycle::Finished,
+        );
+        // Version 0.2 persisted the creation/adoption HEAD rather than the HEAD observed at finish.
+        // An extant clean tree is assessed from its current HEAD so those records remain recoverable.
+        selected.head = Some("legacy-stale-head".into());
+        let unselected = named_record(
+            "unselected",
+            repository.clone(),
+            unselected_path.clone(),
+            Lifecycle::Finished,
+        );
+        let outside = named_record(
+            "outside",
+            outside_repository,
+            outside_path.clone(),
+            Lifecycle::Finished,
+        );
+        let git = FakeGit {
+            snapshots: Mutex::new(BTreeMap::from([
+                (
+                    selected_path.clone(),
+                    WorktreeSnapshot {
+                        path: selected_path.clone(),
+                        head: "abc".into(),
+                        dirty: false,
+                        locked: false,
+                    },
+                ),
+                (
+                    unselected_path.clone(),
+                    WorktreeSnapshot {
+                        path: unselected_path.clone(),
+                        head: "abc".into(),
+                        dirty: false,
+                        locked: false,
+                    },
+                ),
+                (
+                    outside_path.clone(),
+                    WorktreeSnapshot {
+                        path: outside_path.clone(),
+                        head: "abc".into(),
+                        dirty: false,
+                        locked: false,
+                    },
+                ),
+            ])),
+            discovered: Mutex::new(vec![
+                DiscoveredWorktree {
+                    path: selected_path.clone(),
+                    head: Some("abc".into()),
+                    locked: false,
+                    primary: false,
+                },
+                DiscoveredWorktree {
+                    path: unselected_path.clone(),
+                    head: Some("abc".into()),
+                    locked: false,
+                    primary: false,
+                },
+                DiscoveredWorktree {
+                    path: outside_path.clone(),
+                    head: Some("abc".into()),
+                    locked: false,
+                    primary: false,
+                },
+            ]),
+            ..fake_git(repository)
+        };
+        let manager = WorktreeManager::new(
+            git,
+            fake_registry(vec![selected.clone(), unselected.clone(), outside]),
+            FixedClock,
+        );
+        let policy = policy(workspace, managed_root);
+
+        assert_eq!(
+            manager.gc(&policy, &[], true).unwrap_err().code,
+            "explicit-cleanup-selection-required"
+        );
+        assert_eq!(
+            manager
+                .gc(&policy, &[WorktreeId::new("unknown").unwrap()], true)
+                .unwrap_err()
+                .code,
+            "unknown-worktree-id"
+        );
+
+        let dry_run = manager.gc(&policy, &[], false).unwrap();
+        assert_eq!(dry_run.len(), 2);
+        assert!(dry_run.iter().any(|item| item.record.id == selected.id));
+        assert!(dry_run.iter().any(|item| item.record.id == unselected.id));
+
+        let applied = manager
+            .gc(&policy, std::slice::from_ref(&selected.id), true)
+            .unwrap();
+        assert_eq!(applied.len(), 1);
+        assert_eq!(applied[0].record.id, selected.id);
+        assert!(applied[0].evidence.is_some());
+        assert!(!selected_path.exists());
+        assert!(unselected_path.exists());
+        assert!(outside_path.exists());
+        let records = manager.registry().list().unwrap();
+        assert_eq!(
+            records
+                .iter()
+                .find(|record| record.id == selected.id)
+                .unwrap()
+                .lifecycle,
+            Lifecycle::Removed
+        );
+        assert_eq!(
+            records
+                .iter()
+                .find(|record| record.id == unselected.id)
+                .unwrap()
+                .lifecycle,
+            Lifecycle::Finished
+        );
+    }
+
+    #[test]
+    fn missing_active_record_without_durable_removal_intent_is_refused() {
+        let temporary = tempdir().unwrap();
+        let workspace = temporary.path().join("workspace");
+        let repository = workspace.join("repo");
+        let managed_root = temporary.path().join("managed");
+        std::fs::create_dir_all(&repository).unwrap();
+        let missing = managed_root.join("repo/missing-active");
+        let registered = named_record(
+            "missing-active",
+            repository.clone(),
+            missing,
+            Lifecycle::Active,
+        );
+        let manager = WorktreeManager::new(
+            fake_git(repository),
+            fake_registry(vec![registered.clone()]),
+            FixedClock,
+        );
+
+        let assessments = manager
+            .reconcile(
+                &policy(workspace, managed_root),
+                std::slice::from_ref(&registered.id),
+                false,
+                false,
+            )
+            .unwrap();
+        assert_eq!(assessments.len(), 1);
+        assert!(!assessments[0].eligible);
+        assert_eq!(
+            assessments[0].refusal.as_ref().unwrap().code,
+            "missing-active-worktree"
+        );
+    }
+
+    #[test]
+    fn durable_removal_intent_allows_missing_active_record_to_complete() {
+        let temporary = tempdir().unwrap();
+        let workspace = temporary.path().join("workspace");
+        let repository = workspace.join("repo");
+        let managed_root = temporary.path().join("managed");
+        std::fs::create_dir_all(&repository).unwrap();
+        let missing = managed_root.join("repo/missing-after-remove");
+        let mut registered = named_record(
+            "missing-after-remove",
+            repository.clone(),
+            missing.clone(),
+            Lifecycle::Active,
+        );
+        registered.head = Some("legacy-stale-head".into());
+        let removal = RemovalIntent {
+            id: registered.id.clone(),
+            path: missing,
+            head: "abc".into(),
+            recovery: RecoveryProof {
+                head: "abc".into(),
+                refs: vec!["refs/remotes/origin/main".into()],
+                observed_at: 900,
+            },
+            operation: "remove".into(),
+            planned_at: 900,
+        };
+        let registry = fake_registry(vec![registered.clone()]);
+        registry
+            .removals
+            .lock()
+            .unwrap()
+            .insert(registered.id.to_string(), removal);
+        let manager = WorktreeManager::new(fake_git(repository), registry, FixedClock);
+
+        let assessments = manager
+            .reconcile(
+                &policy(workspace, managed_root),
+                std::slice::from_ref(&registered.id),
+                true,
+                false,
+            )
+            .unwrap();
+        assert!(assessments[0].eligible);
+        assert_eq!(
+            assessments[0].evidence.as_ref().unwrap().operation,
+            "reconcile-missing"
+        );
+        assert_eq!(
+            manager.registry().list().unwrap()[0].lifecycle,
+            Lifecycle::Removed
+        );
+        assert!(
+            manager
+                .registry()
+                .removal(registered.id.as_str())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn reconcile_recovers_interrupted_provisioning_and_failed_linked_trees() {
+        let temporary = tempdir().unwrap();
+        let workspace = temporary.path().join("workspace");
+        let repository = workspace.join("repo");
+        let managed_root = temporary.path().join("managed");
+        std::fs::create_dir_all(&repository).unwrap();
+        let provisioning_path = managed_root.join("repo/provisioning");
+        let failed_path = managed_root.join("repo/failed");
+        std::fs::create_dir_all(&provisioning_path).unwrap();
+        std::fs::create_dir_all(&failed_path).unwrap();
+        let mut provisioning = named_record(
+            "provisioning",
+            repository.clone(),
+            provisioning_path.clone(),
+            Lifecycle::Provisioning,
+        );
+        let mut failed = named_record(
+            "failed",
+            repository.clone(),
+            failed_path.clone(),
+            Lifecycle::Failed,
+        );
+        provisioning.head = None;
+        failed.head = None;
+        let git = FakeGit {
+            snapshots: Mutex::new(BTreeMap::from([
+                (
+                    provisioning_path.clone(),
+                    WorktreeSnapshot {
+                        path: provisioning_path.clone(),
+                        head: "provisioned-head".into(),
+                        dirty: false,
+                        locked: false,
+                    },
+                ),
+                (
+                    failed_path.clone(),
+                    WorktreeSnapshot {
+                        path: failed_path.clone(),
+                        head: "failed-head".into(),
+                        dirty: false,
+                        locked: false,
+                    },
+                ),
+            ])),
+            discovered: Mutex::new(vec![
+                DiscoveredWorktree {
+                    path: provisioning_path,
+                    head: Some("provisioned-head".into()),
+                    locked: false,
+                    primary: false,
+                },
+                DiscoveredWorktree {
+                    path: failed_path,
+                    head: Some("failed-head".into()),
+                    locked: false,
+                    primary: false,
+                },
+            ]),
+            ..fake_git(repository)
+        };
+        let ids = [provisioning.id.clone(), failed.id.clone()];
+        let manager =
+            WorktreeManager::new(git, fake_registry(vec![provisioning, failed]), FixedClock);
+
+        let assessments = manager
+            .reconcile(&policy(workspace, managed_root), &ids, true, false)
+            .unwrap();
+        assert_eq!(assessments.len(), 2);
+        assert!(assessments.iter().all(|assessment| {
+            assessment.eligible
+                && assessment
+                    .evidence
+                    .as_ref()
+                    .is_some_and(|evidence| evidence.operation == "recover-provisioning")
+        }));
+        let records = manager.registry().list().unwrap();
+        assert!(
+            records
+                .iter()
+                .all(|record| record.lifecycle == Lifecycle::Active)
+        );
+        assert!(records.iter().any(|record| {
+            record.id.as_str() == "provisioning"
+                && record.head.as_deref() == Some("provisioned-head")
+        }));
+        assert!(records.iter().any(|record| {
+            record.id.as_str() == "failed" && record.head.as_deref() == Some("failed-head")
+        }));
+    }
+
+    #[test]
+    fn finish_persists_the_observed_head() {
+        let temporary = tempdir().unwrap();
+        let workspace = temporary.path().join("workspace");
+        let repository = workspace.join("repo");
+        let path = temporary.path().join("managed/repo/finish-head");
+        std::fs::create_dir_all(&repository).unwrap();
+        std::fs::create_dir_all(&path).unwrap();
+        let mut registered = named_record(
+            "finish-head",
+            repository.clone(),
+            path.clone(),
+            Lifecycle::Active,
+        );
+        registered.head = Some("old-head".into());
+        let git = FakeGit {
+            snapshots: Mutex::new(BTreeMap::from([(
+                path.clone(),
+                WorktreeSnapshot {
+                    path: path.clone(),
+                    head: "observed-head".into(),
+                    dirty: false,
+                    locked: false,
+                },
+            )])),
+            ..fake_git(repository)
+        };
+        let manager = WorktreeManager::new(git, fake_registry(vec![registered]), FixedClock);
+
+        let evidence = manager.finish(&path).unwrap();
+        assert_eq!(evidence.head.as_deref(), Some("observed-head"));
+        let finished = &manager.registry().list().unwrap()[0];
+        assert_eq!(finished.lifecycle, Lifecycle::Finished);
+        assert_eq!(finished.head.as_deref(), Some("observed-head"));
+        assert_eq!(finished.finished_at, Some(1_000));
+    }
+
+    #[test]
+    fn finish_refuses_a_live_lease_without_changing_the_record() {
+        let temporary = tempdir().unwrap();
+        let workspace = temporary.path().join("workspace");
+        let repository = workspace.join("repo");
+        let path = temporary.path().join("managed/repo/live-lease");
+        std::fs::create_dir_all(&repository).unwrap();
+        std::fs::create_dir_all(&path).unwrap();
+        let registered = named_record(
+            "live-lease",
+            repository.clone(),
+            path.clone(),
+            Lifecycle::Active,
+        );
+        let mut registry = fake_registry(vec![registered.clone()]);
+        registry.live_leases = 1;
+        let manager = WorktreeManager::new(fake_git(repository), registry, FixedClock);
+
+        assert_eq!(manager.finish(&path).unwrap_err().code, "live-session");
+        assert_eq!(manager.registry().list().unwrap()[0], registered);
+    }
+
+    #[test]
+    fn adopt_refuses_the_primary_checkout() {
+        let temporary = tempdir().unwrap();
+        let workspace = temporary.path().join("workspace");
+        let repository = workspace.join("repo");
+        let managed_root = temporary.path().join("managed");
+        std::fs::create_dir_all(&repository).unwrap();
+        let git = FakeGit {
+            snapshots: Mutex::new(BTreeMap::from([(
+                repository.clone(),
+                WorktreeSnapshot {
+                    path: repository.clone(),
+                    head: "abc".into(),
+                    dirty: false,
+                    locked: false,
+                },
+            )])),
+            discovered: Mutex::new(vec![DiscoveredWorktree {
+                path: repository.clone(),
+                head: Some("abc".into()),
+                locked: false,
+                primary: true,
+            }]),
+            ..fake_git(repository.clone())
+        };
+        let manager = WorktreeManager::new(git, fake_registry(Vec::new()), FixedClock);
+
+        let refusal = manager
+            .adopt(
+                &policy(workspace, managed_root),
+                &repository,
+                &repository,
+                WorktreeId::new("primary").unwrap(),
+                "test".into(),
+                "test".into(),
+            )
+            .unwrap_err();
+        assert_eq!(refusal.code, "primary-worktree");
+        assert!(manager.registry().list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn create_revalidates_the_reviewed_path_and_base() {
+        let temporary = tempdir().unwrap();
+        let workspace = temporary.path().join("workspace");
+        let repository = workspace.join("repo");
+        let managed_root = temporary.path().join("managed");
+        std::fs::create_dir_all(&repository).unwrap();
+        let manager = WorktreeManager::new(
+            fake_git(repository.clone()),
+            fake_registry(Vec::new()),
+            FixedClock,
+        );
+        let policy = policy(workspace, managed_root);
+        let plan = manager
+            .plan_create(
+                &policy,
+                CreateRequest {
+                    id: WorktreeId::new("create-drift").unwrap(),
+                    repository,
+                    purpose: "test".into(),
+                    base: b10x_worktree_domain::GitRevision::new("reviewed-base").unwrap(),
+                    owner: "test".into(),
+                },
+            )
+            .unwrap();
+
+        let mut path_drift = plan.clone();
+        path_drift.path.push("changed");
+        assert_eq!(
+            manager.create(&policy, &path_drift).unwrap_err().code,
+            "create-plan-path-changed"
+        );
+
+        *manager.git.resolved_revision.lock().unwrap() = Some("changed-base".into());
+        assert_eq!(
+            manager.create(&policy, &plan).unwrap_err().code,
+            "create-plan-base-not-immutable"
+        );
+        assert!(manager.registry().list().unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_refuses_a_symlinked_parent_introduced_after_planning() {
+        use std::os::unix::fs::symlink;
+
+        let temporary = tempdir().unwrap();
+        let workspace = temporary.path().join("workspace");
+        let repository = workspace.join("repo");
+        let managed_root = temporary.path().join("managed");
+        let external = temporary.path().join("external");
+        std::fs::create_dir_all(&repository).unwrap();
+        let manager = WorktreeManager::new(
+            fake_git(repository.clone()),
+            fake_registry(Vec::new()),
+            FixedClock,
+        );
+        let policy = policy(workspace, managed_root.clone());
+        let plan = manager
+            .plan_create(
+                &policy,
+                CreateRequest {
+                    id: WorktreeId::new("symlink-escape").unwrap(),
+                    repository,
+                    purpose: "test".into(),
+                    base: b10x_worktree_domain::GitRevision::new("immutable-base").unwrap(),
+                    owner: "test".into(),
+                },
+            )
+            .unwrap();
+
+        std::fs::create_dir(&managed_root).unwrap();
+        std::fs::create_dir(&external).unwrap();
+        symlink(&external, managed_root.join("repo")).unwrap();
+
+        assert_eq!(
+            manager.create(&policy, &plan).unwrap_err().code,
+            "non-canonical-worktree-path"
+        );
+        assert!(!external.join("symlink-escape").exists());
+        assert!(manager.registry().list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn gc_refuses_when_the_observed_path_differs_from_the_registered_path() {
+        let temporary = tempdir().unwrap();
+        let workspace = temporary.path().join("workspace");
+        let repository = workspace.join("repo");
+        let managed_root = temporary.path().join("managed");
+        let path = managed_root.join("repo/path-drift");
+        let observed = temporary.path().join("elsewhere/path-drift");
+        std::fs::create_dir_all(&repository).unwrap();
+        std::fs::create_dir_all(&path).unwrap();
+        let registered = named_record(
+            "path-drift",
+            repository.clone(),
+            path.clone(),
+            Lifecycle::Finished,
+        );
+        let git = FakeGit {
+            snapshots: Mutex::new(BTreeMap::from([(
+                path.clone(),
+                WorktreeSnapshot {
+                    path: observed,
+                    head: "abc".into(),
+                    dirty: false,
+                    locked: false,
+                },
+            )])),
+            ..fake_git(repository)
+        };
+        let manager = WorktreeManager::new(git, fake_registry(vec![registered]), FixedClock);
+
+        let assessment = manager
+            .gc(&policy(workspace, managed_root), &[], false)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(assessment.refusal.unwrap().code, "worktree-path-changed");
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn gc_persists_removal_intent_before_a_failed_delete() {
+        let temporary = tempdir().unwrap();
+        let workspace = temporary.path().join("workspace");
+        let repository = workspace.join("repo");
+        let managed_root = temporary.path().join("managed");
+        let path = managed_root.join("repo/failing-remove");
+        std::fs::create_dir_all(&repository).unwrap();
+        std::fs::create_dir_all(&path).unwrap();
+        let registered = named_record(
+            "failing-remove",
+            repository.clone(),
+            path.clone(),
+            Lifecycle::Finished,
+        );
+        let git = FakeGit {
+            snapshots: Mutex::new(BTreeMap::from([(
+                path.clone(),
+                WorktreeSnapshot {
+                    path: path.clone(),
+                    head: "abc".into(),
+                    dirty: false,
+                    locked: false,
+                },
+            )])),
+            discovered: Mutex::new(vec![DiscoveredWorktree {
+                path: path.clone(),
+                head: Some("abc".into()),
+                locked: false,
+                primary: false,
+            }]),
+            fail_remove: true,
+            ..fake_git(repository)
+        };
+        let manager =
+            WorktreeManager::new(git, fake_registry(vec![registered.clone()]), FixedClock);
+
+        let assessments = manager
+            .gc(
+                &policy(workspace, managed_root),
+                std::slice::from_ref(&registered.id),
+                true,
+            )
+            .unwrap();
+        assert_eq!(assessments.len(), 1);
+        assert!(!assessments[0].eligible);
+        assert_eq!(
+            assessments[0].refusal.as_ref().unwrap().code,
+            "remove-failed"
+        );
+        let intent = manager
+            .registry()
+            .removal(registered.id.as_str())
+            .unwrap()
+            .unwrap();
+        assert_eq!(intent.path, path);
+        assert_eq!(intent.head, "abc");
+        assert!(
+            intent
+                .recovery
+                .refs
+                .contains(&"refs/remotes/origin/main".into())
+        );
+        assert!(path.exists());
+        assert_eq!(
+            manager.registry().list().unwrap()[0].lifecycle,
+            Lifecycle::Finished
+        );
+    }
+
+    #[test]
+    fn gc_refuses_when_head_changes_while_remote_proof_is_collected() {
+        let temporary = tempdir().unwrap();
+        let workspace = temporary.path().join("workspace");
+        let repository = workspace.join("repo");
+        let managed_root = temporary.path().join("managed");
+        let path = managed_root.join("repo/head-race");
+        std::fs::create_dir_all(&repository).unwrap();
+        std::fs::create_dir_all(&path).unwrap();
+        let registered = named_record(
+            "head-race",
+            repository.clone(),
+            path.clone(),
+            Lifecycle::Finished,
+        );
+        let git = FakeGit {
+            snapshots: Mutex::new(BTreeMap::from([(
+                path.clone(),
+                WorktreeSnapshot {
+                    path: path.clone(),
+                    head: "proof-head".into(),
+                    dirty: false,
+                    locked: false,
+                },
+            )])),
+            discovered: Mutex::new(vec![DiscoveredWorktree {
+                path: path.clone(),
+                head: Some("proof-head".into()),
+                locked: false,
+                primary: false,
+            }]),
+            snapshot_sequence: Mutex::new(VecDeque::from([
+                "proof-head".into(),
+                "proof-head".into(),
+                "unpublished-head".into(),
+            ])),
+            ..fake_git(repository)
+        };
+        let manager =
+            WorktreeManager::new(git, fake_registry(vec![registered.clone()]), FixedClock);
+
+        let assessments = manager
+            .gc(
+                &policy(workspace, managed_root),
+                std::slice::from_ref(&registered.id),
+                true,
+            )
+            .unwrap();
+        assert_eq!(
+            assessments[0].refusal.as_ref().unwrap().code,
+            "worktree-head-changed-during-proof"
+        );
+        assert!(path.exists());
+        assert!(
+            manager
+                .registry()
+                .removal(registered.id.as_str())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn gc_refuses_when_head_changes_after_removal_intent_is_durable() {
+        let temporary = tempdir().unwrap();
+        let workspace = temporary.path().join("workspace");
+        let repository = workspace.join("repo");
+        let managed_root = temporary.path().join("managed");
+        let path = managed_root.join("repo/head-race-after-intent");
+        std::fs::create_dir_all(&repository).unwrap();
+        std::fs::create_dir_all(&path).unwrap();
+        let registered = named_record(
+            "head-race-after-intent",
+            repository.clone(),
+            path.clone(),
+            Lifecycle::Finished,
+        );
+        let git = FakeGit {
+            snapshots: Mutex::new(BTreeMap::from([(
+                path.clone(),
+                WorktreeSnapshot {
+                    path: path.clone(),
+                    head: "proof-head".into(),
+                    dirty: false,
+                    locked: false,
+                },
+            )])),
+            discovered: Mutex::new(vec![DiscoveredWorktree {
+                path: path.clone(),
+                head: Some("proof-head".into()),
+                locked: false,
+                primary: false,
+            }]),
+            snapshot_sequence: Mutex::new(VecDeque::from([
+                "proof-head".into(),
+                "proof-head".into(),
+                "proof-head".into(),
+                "unpublished-head".into(),
+            ])),
+            ..fake_git(repository)
+        };
+        let manager =
+            WorktreeManager::new(git, fake_registry(vec![registered.clone()]), FixedClock);
+
+        let assessments = manager
+            .gc(
+                &policy(workspace, managed_root),
+                std::slice::from_ref(&registered.id),
+                true,
+            )
+            .unwrap();
+        assert_eq!(
+            assessments[0].refusal.as_ref().unwrap().code,
+            "worktree-head-changed-after-intent"
+        );
+        assert!(path.exists());
+        let intent = manager
+            .registry()
+            .removal(registered.id.as_str())
+            .unwrap()
+            .unwrap();
+        assert_eq!(intent.head, "proof-head");
+    }
+
+    #[test]
+    fn external_retirement_requires_separate_explicit_confirmation() {
+        let temporary = tempdir().unwrap();
+        let workspace = temporary.path().join("workspace");
+        let repository = workspace.join("repo");
+        let managed_root = temporary.path().join("managed");
+        let external = temporary.path().join("legacy-external");
+        std::fs::create_dir_all(&repository).unwrap();
+        std::fs::create_dir(&external).unwrap();
+        let registered = named_record(
+            "legacy-external",
+            repository.clone(),
+            external.clone(),
+            Lifecycle::Finished,
+        );
+        let git = FakeGit {
+            snapshots: Mutex::new(BTreeMap::from([(
+                external.clone(),
+                WorktreeSnapshot {
+                    path: external.clone(),
+                    head: "abc".into(),
+                    dirty: false,
+                    locked: false,
+                },
+            )])),
+            discovered: Mutex::new(vec![DiscoveredWorktree {
+                path: external.clone(),
+                head: Some("abc".into()),
+                locked: false,
+                primary: false,
+            }]),
+            ..fake_git(repository)
+        };
+        let manager =
+            WorktreeManager::new(git, fake_registry(vec![registered.clone()]), FixedClock);
+        let policy = policy(workspace, managed_root);
+
+        assert_eq!(
+            manager
+                .reconcile(&policy, std::slice::from_ref(&registered.id), true, false,)
+                .unwrap_err()
+                .code,
+            "external-retirement-confirmation-required"
+        );
+        assert!(external.exists());
+
+        let assessments = manager
+            .reconcile(&policy, std::slice::from_ref(&registered.id), true, true)
+            .unwrap();
+        assert_eq!(
+            assessments[0].evidence.as_ref().unwrap().operation,
+            "retire-external"
+        );
+        assert!(!external.exists());
     }
 }

@@ -21,12 +21,24 @@ independent policy: every decision must come from the public façade.
 
 - Never invoke a command through a shell. Git arguments are discrete argv values.
 - Never remove a worktree with `--force`.
-- A cleanup requires a clean tree, no live lease or Git lock, fresh remote evidence, and canonical
-  containment below the configured worktree root.
+- Every removal requires an exact linked-worktree member whose HEAD remains stable across the final
+  proof and intent observations, no tracked, untracked, or ignored state, no live lease or Git
+  operational/worktree lock or in-progress Git operation, and fresh proof from exact refs currently
+  advertised by a configured remote.
+- Ordinary GC requires canonical containment below the configured worktree root. Only exact-id
+  reconciliation with separate external-retirement confirmation may retire a finished external
+  legacy tree after the same removal gates pass.
 - Offline or ambiguous recovery evidence is a refusal, never permission to delete.
-- Plans are revalidated immediately before mutation.
-- JSON and hook protocol version 1 are immutable after release. Cut a new protocol version for a
-  wire change.
+- Local replacement refs, graft files, and inherited graft configuration must never influence
+  remote recovery proof.
+- Create plans use immutable commits and canonical policy-derived paths; plans and exact repository
+  membership are revalidated immediately before mutation.
+- Apply operations for GC and reconciliation require exact reviewed worktree ids. Cleanup and
+  relocation lifecycle claims, final HEAD updates, and lease exclusions are atomic, and
+  proof-bearing removal intent is durable.
+- CLI JSON protocol version 2, reconciliation version 2, hook protocol version 1, and
+  configuration/workspace-policy version 1 are immutable after release. Cut a new surface version
+  for a wire change.
 - Generated skill content comes from `worktree skill`; do not edit it by hand.
 - A public API belongs in a library crate. The binary is an adapter, not the product boundary.
 

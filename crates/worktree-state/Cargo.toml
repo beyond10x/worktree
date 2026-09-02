@@ -14,6 +14,7 @@ b10x-worktree-domain.workspace = true
 b10x-worktree.workspace = true
 rusqlite.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 toml.workspace = true
 
 [dev-dependencies]
@@ -21,4 +22,3 @@ tempfile.workspace = true
 
 [lints]
 workspace = true
-
