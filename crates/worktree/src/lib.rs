@@ -112,8 +112,9 @@ pub trait RegistryPort: Send + Sync {
     /// Persist proof before deleting filesystem state.
     ///
     /// Repeating this call with the same id/path/head/operation refreshes the proof atomically.
+    /// A matching stale relocation remains durable until removal completion commits.
     fn begin_removal(&self, intent: &RemovalIntent) -> Result<(), Refusal>;
-    /// Atomically mark removal complete and clear its durable intent.
+    /// Atomically mark removal complete and clear its durable removal and relocation intents.
     fn complete_removal(
         &self,
         intent: &RemovalIntent,
@@ -351,7 +352,13 @@ where
                             let applied = self
                                 .assess_cleanup(policy, &claimed, self.clock.now())
                                 .and_then(|proof| {
-                                    self.apply_removal(&claimed, &claimed.path, "remove", proof)
+                                    self.apply_removal(
+                                        &claimed,
+                                        &claimed.path,
+                                        "remove",
+                                        proof,
+                                        None,
+                                    )
                                 });
                             match applied {
                                 Ok(evidence) => assessments.push(CleanupAssessment {
@@ -659,6 +666,23 @@ where
                 ));
             }
             require_canonical_child(&policy.worktree_root, &intent.to)?;
+            if record.lifecycle == Lifecycle::Finished
+                && !record.path.starts_with(&policy.worktree_root)
+            {
+                let discovered = self.git.list_worktrees(&record.repository_root)?;
+                let source_exists = discovered.iter().any(|item| item.path == intent.from);
+                let destination_exists = discovered.iter().any(|item| item.path == intent.to);
+                if source_exists && !destination_exists {
+                    return Ok(Some(ReconciliationAction::RetireExternal {
+                        path: record.path.clone(),
+                    }));
+                }
+                if !source_exists && self.registry.removal(record.id.as_str())?.is_some() {
+                    return Ok(Some(ReconciliationAction::TombstoneMissing {
+                        path: record.path.clone(),
+                    }));
+                }
+            }
             return Ok(Some(ReconciliationAction::Migrate {
                 from: intent.from,
                 to: intent.to,
@@ -716,7 +740,7 @@ where
                 self.assess_external_retirement(policy, record, path, now)
             }
             ReconciliationAction::TombstoneMissing { path } => {
-                self.assess_missing(record, path, now)
+                self.assess_missing(policy, record, path, now)
             }
         }
     }
@@ -784,6 +808,18 @@ where
         let discovered = self.git.list_worktrees(&record.repository_root)?;
         let source = discovered.iter().find(|item| item.path == from);
         let destination = discovered.iter().find(|item| item.path == to);
+        if source.is_some() && destination.is_some() {
+            return Err(Refusal::new(
+                "ambiguous-relocation",
+                "Git reports both relocation source and destination",
+            ));
+        }
+        if !matches!(record.lifecycle, Lifecycle::Active | Lifecycle::Relocating) {
+            return Err(Refusal::new(
+                "invalid-relocation-lifecycle",
+                "only an active or already-relocating worktree may be migrated",
+            ));
+        }
         match (source, destination) {
             (Some(source), None) => {
                 if source.primary {
@@ -839,12 +875,7 @@ where
                     ));
                 }
             }
-            (Some(_), Some(_)) => {
-                return Err(Refusal::new(
-                    "ambiguous-relocation",
-                    "Git reports both relocation source and destination",
-                ));
-            }
+            (Some(_), Some(_)) => unreachable!("ambiguous topology was refused above"),
             (None, None) => {
                 return Err(Refusal::new(
                     "worktree-not-discovered",
@@ -884,6 +915,34 @@ where
                     "Git does not report the registered external worktree",
                 )
             })?;
+        let relocation = self.registry.relocation(record.id.as_str())?;
+        if let Some(intent) = relocation.as_ref() {
+            if intent.from != *path {
+                return Err(Refusal::new(
+                    "relocation-source-mismatch",
+                    "pending relocation source differs from the registered worktree path",
+                ));
+            }
+            require_canonical_child(&policy.worktree_root, &intent.to)?;
+            if discovered.iter().any(|item| item.path == intent.to) {
+                return Err(Refusal::new(
+                    "ambiguous-relocation",
+                    "Git reports both relocation source and destination",
+                ));
+            }
+            if !path_absent(&intent.to)? {
+                return Err(Refusal::new(
+                    "relocation-destination-exists",
+                    "pending relocation destination exists outside Git's worktree inventory",
+                ));
+            }
+            if record.head.as_deref() != Some(intent.head.as_str()) {
+                return Err(Refusal::new(
+                    "relocation-head-changed",
+                    "pending relocation HEAD differs from the finished worktree record",
+                ));
+            }
+        }
         if linked.primary {
             return Err(Refusal::new(
                 "primary-worktree",
@@ -891,6 +950,15 @@ where
             ));
         }
         let snapshot = self.exact_worktree_snapshot(&record.repository_root, path)?;
+        if relocation
+            .as_ref()
+            .is_some_and(|intent| intent.head != snapshot.head)
+        {
+            return Err(Refusal::new(
+                "relocation-head-changed",
+                "external worktree HEAD differs from the pending relocation intent",
+            ));
+        }
         require_clean_unlocked(&snapshot)?;
         self.recovery_for_record(record, &snapshot.head, now)
             .map(Some)
@@ -898,6 +966,7 @@ where
 
     fn assess_missing(
         &self,
+        policy: &WorkspacePolicy,
         record: &WorktreeRecord,
         path: &Path,
         now: i64,
@@ -908,18 +977,57 @@ where
                 format!("{} still exists", path.display()),
             ));
         }
-        if self
-            .git
-            .list_worktrees(&record.repository_root)?
-            .iter()
-            .any(|item| item.path == path)
-        {
+        let discovered = self.git.list_worktrees(&record.repository_root)?;
+        if discovered.iter().any(|item| item.path == path) {
             return Err(Refusal::new(
                 "worktree-still-registered-by-git",
                 "Git still reports the missing worktree path",
             ));
         }
         let removal = self.registry.removal(record.id.as_str())?;
+        if let Some(relocation) = self.registry.relocation(record.id.as_str())? {
+            if record.lifecycle != Lifecycle::Finished
+                || path != record.path
+                || path.starts_with(&policy.worktree_root)
+                || relocation.from != *path
+            {
+                return Err(Refusal::new(
+                    "invalid-external-retirement-recovery",
+                    "stale relocation recovery requires its exact finished external source",
+                ));
+            }
+            require_canonical_child(&policy.worktree_root, &relocation.to)?;
+            if discovered.iter().any(|item| item.path == relocation.to) {
+                return Err(Refusal::new(
+                    "relocation-destination-exists",
+                    "pending relocation destination is still registered by Git",
+                ));
+            }
+            if !path_absent(&relocation.to)? {
+                return Err(Refusal::new(
+                    "relocation-destination-exists",
+                    "pending relocation destination still exists on disk",
+                ));
+            }
+            let intent = removal.ok_or_else(|| {
+                Refusal::new(
+                    "missing-retirement-intent",
+                    "an absent external relocation source requires durable removal proof",
+                )
+            })?;
+            if intent.operation != "retire-external"
+                || intent.path != *path
+                || intent.head != intent.recovery.head
+                || intent.head != relocation.head
+                || record.head.as_deref() != Some(relocation.head.as_str())
+            {
+                return Err(Refusal::new(
+                    "removal-relocation-mismatch",
+                    "external removal proof must match the relocation source and every recorded HEAD",
+                ));
+            }
+            return Ok(Some(intent.recovery));
+        }
         if matches!(record.lifecycle, Lifecycle::Active | Lifecycle::Relocating)
             && removal.is_none()
         {
@@ -979,56 +1087,7 @@ where
                 })
             }
             ReconciliationAction::Migrate { from, to } => {
-                if record.lifecycle == Lifecycle::Active {
-                    self.registry.claim_relocation(
-                        record.id.as_str(),
-                        self.clock.now(),
-                        self.lease_timeout_seconds,
-                    )?;
-                } else if record.lifecycle != Lifecycle::Relocating {
-                    return Err(Refusal::new(
-                        "invalid-relocation-lifecycle",
-                        "only an active or already-relocating worktree may be migrated",
-                    ));
-                }
-                let pending = self.registry.relocation(record.id.as_str())?;
-                let intent = if let Some(intent) = pending {
-                    intent
-                } else {
-                    let snapshot = self.exact_worktree_snapshot(&record.repository_root, from)?;
-                    let intent = RelocationIntent {
-                        id: record.id.clone(),
-                        from: from.clone(),
-                        to: to.clone(),
-                        head: snapshot.head,
-                        planned_at: now,
-                    };
-                    self.registry.begin_relocation(&intent)?;
-                    intent
-                };
-                let discovered = self.git.list_worktrees(&record.repository_root)?;
-                let source_exists = discovered.iter().any(|item| item.path == *from);
-                let destination_exists = discovered.iter().any(|item| item.path == *to);
-                if source_exists && !destination_exists {
-                    self.git.move_worktree(&record.repository_root, from, to)?;
-                }
-                let snapshot = self.exact_worktree_snapshot(&record.repository_root, to)?;
-                if snapshot.head != intent.head {
-                    return Err(Refusal::new(
-                        "relocation-head-changed",
-                        "relocated worktree HEAD differs from durable intent",
-                    ));
-                }
-                let evidence = OperationEvidence {
-                    operation: "migrate".into(),
-                    id: record.id.clone(),
-                    path: to.clone(),
-                    head: Some(snapshot.head),
-                    recovery: None,
-                    recorded_at: self.clock.now(),
-                };
-                self.registry.complete_relocation(&intent, &evidence)?;
-                Ok(evidence)
+                self.apply_migration(record, from, to, now)
             }
             ReconciliationAction::RetireExternal { path } => {
                 let proof = recovery.ok_or_else(|| {
@@ -1037,7 +1096,14 @@ where
                         "external retirement requires durable recovery proof",
                     )
                 })?;
-                self.apply_removal(record, path, "retire-external", proof)
+                let relocation = self.registry.relocation(record.id.as_str())?;
+                self.apply_removal(
+                    record,
+                    path,
+                    "retire-external",
+                    proof,
+                    Some((policy, relocation.as_ref())),
+                )
             }
             ReconciliationAction::TombstoneMissing { path } => {
                 let pending = self.registry.removal(record.id.as_str())?;
@@ -1062,6 +1128,65 @@ where
                 Ok(evidence)
             }
         }
+    }
+
+    fn apply_migration(
+        &self,
+        record: &WorktreeRecord,
+        from: &Path,
+        to: &Path,
+        now: i64,
+    ) -> Result<OperationEvidence, Refusal> {
+        if record.lifecycle == Lifecycle::Active {
+            self.registry.claim_relocation(
+                record.id.as_str(),
+                self.clock.now(),
+                self.lease_timeout_seconds,
+            )?;
+        } else if record.lifecycle != Lifecycle::Relocating {
+            return Err(Refusal::new(
+                "invalid-relocation-lifecycle",
+                "only an active or already-relocating worktree may be migrated",
+            ));
+        }
+        let pending = self.registry.relocation(record.id.as_str())?;
+        let intent = if let Some(intent) = pending {
+            intent
+        } else {
+            let snapshot = self.exact_worktree_snapshot(&record.repository_root, from)?;
+            let intent = RelocationIntent {
+                id: record.id.clone(),
+                from: from.to_path_buf(),
+                to: to.to_path_buf(),
+                head: snapshot.head,
+                planned_at: now,
+            };
+            self.registry.begin_relocation(&intent)?;
+            intent
+        };
+        let discovered = self.git.list_worktrees(&record.repository_root)?;
+        let source_exists = discovered.iter().any(|item| item.path == from);
+        let destination_exists = discovered.iter().any(|item| item.path == to);
+        if source_exists && !destination_exists {
+            self.git.move_worktree(&record.repository_root, from, to)?;
+        }
+        let snapshot = self.exact_worktree_snapshot(&record.repository_root, to)?;
+        if snapshot.head != intent.head {
+            return Err(Refusal::new(
+                "relocation-head-changed",
+                "relocated worktree HEAD differs from durable intent",
+            ));
+        }
+        let evidence = OperationEvidence {
+            operation: "migrate".into(),
+            id: record.id.clone(),
+            path: to.to_path_buf(),
+            head: Some(snapshot.head),
+            recovery: None,
+            recorded_at: self.clock.now(),
+        };
+        self.registry.complete_relocation(&intent, &evidence)?;
+        Ok(evidence)
     }
 
     fn recovery_proof(
@@ -1101,13 +1226,82 @@ where
         self.recovery_proof(&record.repository_root, head, now)
     }
 
+    fn require_retirement_topology(
+        &self,
+        policy: &WorkspacePolicy,
+        record: &WorktreeRecord,
+        path: &Path,
+        expected: &RelocationIntent,
+        source_should_exist: bool,
+    ) -> Result<(), Refusal> {
+        let current = self
+            .registry
+            .relocation(record.id.as_str())?
+            .ok_or_else(|| {
+                Refusal::new(
+                    "relocation-intent-missing",
+                    "stale relocation evidence disappeared during external retirement",
+                )
+            })?;
+        if current != *expected {
+            return Err(Refusal::new(
+                "relocation-intent-changed",
+                "stale relocation evidence changed during external retirement",
+            ));
+        }
+        if record.lifecycle != Lifecycle::Finished
+            || path != record.path
+            || path.starts_with(&policy.worktree_root)
+            || expected.from != *path
+            || record.head.as_deref() != Some(expected.head.as_str())
+        {
+            return Err(Refusal::new(
+                "invalid-external-retirement-recovery",
+                "external retirement requires the exact finished source and recorded HEAD",
+            ));
+        }
+        require_canonical_child(&policy.worktree_root, &expected.to)?;
+        let discovered = self.git.list_worktrees(&record.repository_root)?;
+        let source_exists = discovered.iter().any(|item| item.path == expected.from);
+        if discovered.iter().any(|item| item.path == expected.to) {
+            return Err(Refusal::new(
+                "relocation-destination-exists",
+                "pending relocation destination is registered by Git",
+            ));
+        }
+        if !path_absent(&expected.to)? {
+            return Err(Refusal::new(
+                "relocation-destination-exists",
+                "pending relocation destination exists on disk",
+            ));
+        }
+        if source_should_exist {
+            if !source_exists {
+                return Err(Refusal::new(
+                    "relocation-source-missing",
+                    "external retirement source disappeared before removal",
+                ));
+            }
+        } else if source_exists || !path_absent(path)? {
+            return Err(Refusal::new(
+                "worktree-removal-incomplete",
+                "external retirement source still exists after removal",
+            ));
+        }
+        Ok(())
+    }
+
     fn apply_removal(
         &self,
         record: &WorktreeRecord,
         path: &Path,
         operation: &str,
         proof: RecoveryProof,
+        retirement: Option<(&WorkspacePolicy, Option<&RelocationIntent>)>,
     ) -> Result<OperationEvidence, Refusal> {
+        if let Some((policy, Some(relocation))) = retirement {
+            self.require_retirement_topology(policy, record, path, relocation, true)?;
+        }
         let before_intent = self.exact_worktree_snapshot(&record.repository_root, path)?;
         require_clean_unlocked(&before_intent)?;
         if before_intent.head != proof.head {
@@ -1141,7 +1335,13 @@ where
                 "worktree HEAD changed after removal intent became durable",
             ));
         }
+        if let Some((policy, Some(relocation))) = retirement {
+            self.require_retirement_topology(policy, record, path, relocation, true)?;
+        }
         self.git.remove(&record.repository_root, path)?;
+        if let Some((policy, Some(relocation))) = retirement {
+            self.require_retirement_topology(policy, record, path, relocation, false)?;
+        }
         if !path_absent(path)?
             || self
                 .git
@@ -1366,6 +1566,7 @@ mod tests {
         repository: PathBuf,
         snapshots: Mutex<BTreeMap<PathBuf, WorktreeSnapshot>>,
         discovered: Mutex<Vec<DiscoveredWorktree>>,
+        discovered_sequence: Mutex<VecDeque<Vec<DiscoveredWorktree>>>,
         recoverable: bool,
         resolved_revision: Mutex<Option<String>>,
         fail_remove: bool,
@@ -1458,6 +1659,9 @@ mod tests {
         }
 
         fn list_worktrees(&self, _repository: &Path) -> Result<Vec<DiscoveredWorktree>, Refusal> {
+            if let Some(discovered) = self.discovered_sequence.lock().unwrap().pop_front() {
+                return Ok(discovered);
+            }
             Ok(self.discovered.lock().unwrap().clone())
         }
     }
@@ -1642,6 +1846,23 @@ mod tests {
         }
 
         fn begin_removal(&self, intent: &RemovalIntent) -> Result<(), Refusal> {
+            let relocation = self
+                .relocations
+                .lock()
+                .unwrap()
+                .get(intent.id.as_str())
+                .cloned();
+            if let Some(relocation) = relocation {
+                if intent.operation != "retire-external"
+                    || relocation.from != intent.path
+                    || relocation.head != intent.head
+                {
+                    return Err(Refusal::new(
+                        "removal-relocation-mismatch",
+                        "pending relocation can only be superseded by retirement of its exact source and HEAD",
+                    ));
+                }
+            }
             self.removals
                 .lock()
                 .unwrap()
@@ -1654,8 +1875,26 @@ mod tests {
             intent: &RemovalIntent,
             evidence: &OperationEvidence,
         ) -> Result<(), Refusal> {
+            if let Some(relocation) = self
+                .relocations
+                .lock()
+                .unwrap()
+                .get(intent.id.as_str())
+                .cloned()
+            {
+                if intent.operation != "retire-external"
+                    || relocation.from != intent.path
+                    || relocation.head != intent.head
+                {
+                    return Err(Refusal::new(
+                        "removal-relocation-mismatch",
+                        "pending relocation can only be completed by retirement of its exact source and HEAD",
+                    ));
+                }
+            }
             self.mark_removed(evidence)?;
             self.removals.lock().unwrap().remove(intent.id.as_str());
+            self.relocations.lock().unwrap().remove(intent.id.as_str());
             Ok(())
         }
     }
@@ -1665,6 +1904,7 @@ mod tests {
             repository,
             snapshots: Mutex::new(BTreeMap::new()),
             discovered: Mutex::new(Vec::new()),
+            discovered_sequence: Mutex::new(VecDeque::new()),
             recoverable: true,
             resolved_revision: Mutex::new(None),
             fail_remove: false,
@@ -1717,6 +1957,50 @@ mod tests {
         named_record("legacy-one", repository, path, lifecycle)
     }
 
+    fn discovered_worktree(path: &Path, head: &str) -> DiscoveredWorktree {
+        DiscoveredWorktree {
+            path: path.to_path_buf(),
+            head: Some(head.into()),
+            locked: false,
+            primary: false,
+        }
+    }
+
+    fn clean_snapshot(path: &Path, head: &str) -> WorktreeSnapshot {
+        WorktreeSnapshot {
+            path: path.to_path_buf(),
+            head: head.into(),
+            dirty: false,
+            locked: false,
+        }
+    }
+
+    fn stale_relocation(record: &WorktreeRecord, destination: &Path) -> RelocationIntent {
+        RelocationIntent {
+            id: record.id.clone(),
+            from: record.path.clone(),
+            to: destination.to_path_buf(),
+            head: record.head.clone().unwrap(),
+            planned_at: 2,
+        }
+    }
+
+    fn retirement_removal(record: &WorktreeRecord) -> RemovalIntent {
+        let head = record.head.clone().unwrap();
+        RemovalIntent {
+            id: record.id.clone(),
+            path: record.path.clone(),
+            head: head.clone(),
+            recovery: RecoveryProof {
+                head,
+                refs: vec!["origin:refs/heads/main".into()],
+                observed_at: 3,
+            },
+            operation: "retire-external".into(),
+            planned_at: 3,
+        }
+    }
+
     #[test]
     fn migrates_dirty_legacy_tree_into_managed_root() {
         let temporary = tempdir().unwrap();
@@ -1748,6 +2032,7 @@ mod tests {
                 resolved_revision: Mutex::new(None),
                 fail_remove: false,
                 snapshot_sequence: Mutex::new(VecDeque::new()),
+                discovered_sequence: Mutex::new(VecDeque::new()),
             },
             FakeRegistry {
                 records: Mutex::new(vec![registered.clone()]),
@@ -1803,6 +2088,7 @@ mod tests {
                 resolved_revision: Mutex::new(None),
                 fail_remove: false,
                 snapshot_sequence: Mutex::new(VecDeque::new()),
+                discovered_sequence: Mutex::new(VecDeque::new()),
             },
             FakeRegistry {
                 records: Mutex::new(vec![registered.clone()]),
@@ -2628,5 +2914,532 @@ mod tests {
             "retire-external"
         );
         assert!(!external.exists());
+    }
+
+    #[test]
+    fn finished_external_source_supersedes_stale_relocation_on_retirement() {
+        let temporary = tempdir().unwrap();
+        let workspace = temporary.path().join("workspace");
+        let repository = workspace.join("repo");
+        let managed_root = temporary.path().join("managed");
+        let external = temporary.path().join("legacy-external");
+        let destination = managed_root.join("repo/legacy-external");
+        std::fs::create_dir_all(&repository).unwrap();
+        std::fs::create_dir(&external).unwrap();
+        let registered = named_record(
+            "legacy-external",
+            repository.clone(),
+            external.clone(),
+            Lifecycle::Finished,
+        );
+        let relocation = RelocationIntent {
+            id: registered.id.clone(),
+            from: external.clone(),
+            to: destination,
+            head: "abc".into(),
+            planned_at: 2,
+        };
+        let git = FakeGit {
+            snapshots: Mutex::new(BTreeMap::from([(
+                external.clone(),
+                WorktreeSnapshot {
+                    path: external.clone(),
+                    head: "abc".into(),
+                    dirty: false,
+                    locked: false,
+                },
+            )])),
+            discovered: Mutex::new(vec![DiscoveredWorktree {
+                path: external.clone(),
+                head: Some("abc".into()),
+                locked: false,
+                primary: false,
+            }]),
+            ..fake_git(repository)
+        };
+        let registry = FakeRegistry {
+            records: Mutex::new(vec![registered.clone()]),
+            relocations: Mutex::new(BTreeMap::from([(registered.id.to_string(), relocation)])),
+            removals: Mutex::new(BTreeMap::new()),
+            live_leases: 0,
+        };
+        let manager = WorktreeManager::new(git, registry, FixedClock);
+        let policy = policy(workspace, managed_root);
+
+        let dry_run = manager
+            .reconcile(&policy, std::slice::from_ref(&registered.id), false, false)
+            .unwrap();
+        assert!(matches!(
+            dry_run[0].action,
+            ReconciliationAction::RetireExternal { .. }
+        ));
+        assert!(dry_run[0].eligible);
+
+        assert_eq!(
+            manager
+                .reconcile(&policy, std::slice::from_ref(&registered.id), true, false,)
+                .unwrap_err()
+                .code,
+            "external-retirement-confirmation-required"
+        );
+        assert!(external.exists());
+        assert!(
+            manager
+                .registry()
+                .relocation(registered.id.as_str())
+                .unwrap()
+                .is_some()
+        );
+
+        let applied = manager
+            .reconcile(&policy, std::slice::from_ref(&registered.id), true, true)
+            .unwrap();
+        assert_eq!(
+            applied[0].evidence.as_ref().unwrap().operation,
+            "retire-external"
+        );
+        assert!(!external.exists());
+        assert!(
+            manager
+                .registry()
+                .relocation(registered.id.as_str())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn finished_stale_relocation_refuses_ambiguous_or_destination_only_topology() {
+        for (source_exists, expected_refusal) in [
+            (true, "ambiguous-relocation"),
+            (false, "invalid-relocation-lifecycle"),
+        ] {
+            let temporary = tempdir().unwrap();
+            let workspace = temporary.path().join("workspace");
+            let repository = workspace.join("repo");
+            let managed_root = temporary.path().join("managed");
+            let external = temporary.path().join("legacy-external");
+            let destination = managed_root.join("repo/legacy-external");
+            std::fs::create_dir_all(&repository).unwrap();
+            let registered = named_record(
+                "legacy-external",
+                repository.clone(),
+                external.clone(),
+                Lifecycle::Finished,
+            );
+            let relocation = RelocationIntent {
+                id: registered.id.clone(),
+                from: external.clone(),
+                to: destination.clone(),
+                head: "abc".into(),
+                planned_at: 2,
+            };
+            let mut discovered = vec![DiscoveredWorktree {
+                path: destination,
+                head: Some("abc".into()),
+                locked: false,
+                primary: false,
+            }];
+            if source_exists {
+                std::fs::create_dir(&external).unwrap();
+                discovered.push(DiscoveredWorktree {
+                    path: external,
+                    head: Some("abc".into()),
+                    locked: false,
+                    primary: false,
+                });
+            }
+            let git = FakeGit {
+                discovered: Mutex::new(discovered),
+                ..fake_git(repository)
+            };
+            let registry = FakeRegistry {
+                records: Mutex::new(vec![registered.clone()]),
+                relocations: Mutex::new(BTreeMap::from([(registered.id.to_string(), relocation)])),
+                removals: Mutex::new(BTreeMap::new()),
+                live_leases: 0,
+            };
+            let manager = WorktreeManager::new(git, registry, FixedClock);
+
+            let assessments = manager
+                .reconcile(
+                    &policy(workspace, managed_root),
+                    std::slice::from_ref(&registered.id),
+                    false,
+                    false,
+                )
+                .unwrap();
+            assert!(!assessments[0].eligible);
+            assert_eq!(
+                assessments[0].refusal.as_ref().unwrap().code,
+                expected_refusal
+            );
+        }
+    }
+
+    #[test]
+    fn finished_stale_relocation_refuses_an_unlisted_destination_path() {
+        let temporary = tempdir().unwrap();
+        let workspace = temporary.path().join("workspace");
+        let repository = workspace.join("repo");
+        let managed_root = temporary.path().join("managed");
+        let external = temporary.path().join("legacy-external");
+        let destination = managed_root.join("repo/legacy-external");
+        std::fs::create_dir_all(&repository).unwrap();
+        std::fs::create_dir(&external).unwrap();
+        std::fs::create_dir_all(&destination).unwrap();
+        let registered = named_record(
+            "legacy-external",
+            repository.clone(),
+            external.clone(),
+            Lifecycle::Finished,
+        );
+        let relocation = RelocationIntent {
+            id: registered.id.clone(),
+            from: external.clone(),
+            to: destination,
+            head: "abc".into(),
+            planned_at: 2,
+        };
+        let git = FakeGit {
+            snapshots: Mutex::new(BTreeMap::from([(
+                external.clone(),
+                WorktreeSnapshot {
+                    path: external.clone(),
+                    head: "abc".into(),
+                    dirty: false,
+                    locked: false,
+                },
+            )])),
+            discovered: Mutex::new(vec![DiscoveredWorktree {
+                path: external,
+                head: Some("abc".into()),
+                locked: false,
+                primary: false,
+            }]),
+            ..fake_git(repository)
+        };
+        let registry = FakeRegistry {
+            records: Mutex::new(vec![registered.clone()]),
+            relocations: Mutex::new(BTreeMap::from([(registered.id.to_string(), relocation)])),
+            removals: Mutex::new(BTreeMap::new()),
+            live_leases: 0,
+        };
+        let manager = WorktreeManager::new(git, registry, FixedClock);
+
+        let assessments = manager
+            .reconcile(
+                &policy(workspace, managed_root),
+                std::slice::from_ref(&registered.id),
+                false,
+                false,
+            )
+            .unwrap();
+        assert!(matches!(
+            assessments[0].action,
+            ReconciliationAction::RetireExternal { .. }
+        ));
+        assert!(!assessments[0].eligible);
+        assert_eq!(
+            assessments[0].refusal.as_ref().unwrap().code,
+            "relocation-destination-exists"
+        );
+    }
+
+    #[test]
+    fn finished_stale_relocation_requires_matching_record_intent_and_source_heads() {
+        for (record_head, intent_head, source_head) in [
+            ("different", "abc", "abc"),
+            ("abc", "different", "abc"),
+            ("abc", "abc", "different"),
+        ] {
+            let temporary = tempdir().unwrap();
+            let workspace = temporary.path().join("workspace");
+            let repository = workspace.join("repo");
+            let managed_root = temporary.path().join("managed");
+            let external = temporary.path().join("legacy-external");
+            let destination = managed_root.join("repo/legacy-external");
+            std::fs::create_dir_all(&repository).unwrap();
+            std::fs::create_dir(&external).unwrap();
+            let mut registered = named_record(
+                "legacy-external",
+                repository.clone(),
+                external.clone(),
+                Lifecycle::Finished,
+            );
+            registered.head = Some(record_head.into());
+            let relocation = RelocationIntent {
+                id: registered.id.clone(),
+                from: external.clone(),
+                to: destination,
+                head: intent_head.into(),
+                planned_at: 2,
+            };
+            let git = FakeGit {
+                snapshots: Mutex::new(BTreeMap::from([(
+                    external.clone(),
+                    WorktreeSnapshot {
+                        path: external.clone(),
+                        head: source_head.into(),
+                        dirty: false,
+                        locked: false,
+                    },
+                )])),
+                discovered: Mutex::new(vec![DiscoveredWorktree {
+                    path: external,
+                    head: Some(source_head.into()),
+                    locked: false,
+                    primary: false,
+                }]),
+                ..fake_git(repository)
+            };
+            let registry = FakeRegistry {
+                records: Mutex::new(vec![registered.clone()]),
+                relocations: Mutex::new(BTreeMap::from([(registered.id.to_string(), relocation)])),
+                removals: Mutex::new(BTreeMap::new()),
+                live_leases: 0,
+            };
+            let manager = WorktreeManager::new(git, registry, FixedClock);
+
+            let assessments = manager
+                .reconcile(
+                    &policy(workspace, managed_root),
+                    std::slice::from_ref(&registered.id),
+                    false,
+                    false,
+                )
+                .unwrap();
+            assert!(!assessments[0].eligible);
+            assert_eq!(
+                assessments[0].refusal.as_ref().unwrap().code,
+                "relocation-head-changed"
+            );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn late_relocation_destination_refuses_removal_and_preserves_both_intents() {
+        let temporary = tempdir().unwrap();
+        let workspace = temporary.path().join("workspace");
+        let repository = workspace.join("repo");
+        let managed_root = temporary.path().join("managed");
+        let external = temporary.path().join("legacy-external");
+        let destination = managed_root.join("repo/legacy-external");
+        std::fs::create_dir_all(&repository).unwrap();
+        std::fs::create_dir(&external).unwrap();
+        let registered = named_record(
+            "legacy-external",
+            repository.clone(),
+            external.clone(),
+            Lifecycle::Finished,
+        );
+        let relocation = stale_relocation(&registered, &destination);
+        let source = discovered_worktree(&external, "abc");
+        let target = discovered_worktree(&destination, "abc");
+        let source_only = vec![source.clone()];
+        let git = FakeGit {
+            snapshots: Mutex::new(BTreeMap::from([(
+                external.clone(),
+                clean_snapshot(&external, "abc"),
+            )])),
+            discovered: Mutex::new(source_only.clone()),
+            discovered_sequence: Mutex::new(VecDeque::from([
+                source_only.clone(),
+                source_only.clone(),
+                source_only.clone(),
+                source_only.clone(),
+                vec![source, target.clone()],
+            ])),
+            ..fake_git(repository)
+        };
+        let registry = FakeRegistry {
+            records: Mutex::new(vec![registered.clone()]),
+            relocations: Mutex::new(BTreeMap::from([(
+                registered.id.to_string(),
+                relocation.clone(),
+            )])),
+            removals: Mutex::new(BTreeMap::new()),
+            live_leases: 0,
+        };
+        let manager = WorktreeManager::new(git, registry, FixedClock);
+        let policy = policy(workspace, managed_root);
+
+        let applied = manager
+            .reconcile(&policy, std::slice::from_ref(&registered.id), true, true)
+            .unwrap();
+        assert!(!applied[0].eligible);
+        assert_eq!(
+            applied[0].refusal.as_ref().unwrap().code,
+            "relocation-destination-exists"
+        );
+        assert!(external.exists());
+        assert_eq!(
+            manager
+                .registry()
+                .relocation(registered.id.as_str())
+                .unwrap(),
+            Some(relocation.clone())
+        );
+        assert!(
+            manager
+                .registry()
+                .removal(registered.id.as_str())
+                .unwrap()
+                .is_some()
+        );
+
+        std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        std::fs::rename(&external, &destination).unwrap();
+        let mut snapshots = manager.git.snapshots.lock().unwrap();
+        let mut moved = snapshots.remove(&external).unwrap();
+        moved.path.clone_from(&destination);
+        snapshots.insert(destination.clone(), moved);
+        drop(snapshots);
+        *manager.git.discovered.lock().unwrap() = vec![target];
+
+        let retry = manager
+            .reconcile(&policy, std::slice::from_ref(&registered.id), false, false)
+            .unwrap();
+        assert!(!retry[0].eligible);
+        assert_eq!(
+            retry[0].refusal.as_ref().unwrap().code,
+            "relocation-destination-exists"
+        );
+        assert_eq!(
+            manager.registry().list().unwrap()[0].lifecycle,
+            Lifecycle::Finished
+        );
+        assert!(
+            manager
+                .registry()
+                .relocation(registered.id.as_str())
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            manager
+                .registry()
+                .removal(registered.id.as_str())
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn interrupted_external_removal_completes_only_when_both_paths_are_absent() {
+        let temporary = tempdir().unwrap();
+        let workspace = temporary.path().join("workspace");
+        let repository = workspace.join("repo");
+        let managed_root = temporary.path().join("managed");
+        let external = temporary.path().join("legacy-external");
+        let destination = managed_root.join("repo/legacy-external");
+        std::fs::create_dir_all(&repository).unwrap();
+        let registered = named_record(
+            "legacy-external",
+            repository.clone(),
+            external,
+            Lifecycle::Finished,
+        );
+        let relocation = stale_relocation(&registered, &destination);
+        let removal = retirement_removal(&registered);
+        let registry = FakeRegistry {
+            records: Mutex::new(vec![registered.clone()]),
+            relocations: Mutex::new(BTreeMap::from([(registered.id.to_string(), relocation)])),
+            removals: Mutex::new(BTreeMap::from([(registered.id.to_string(), removal)])),
+            live_leases: 0,
+        };
+        let manager = WorktreeManager::new(fake_git(repository), registry, FixedClock);
+
+        let assessments = manager
+            .reconcile(
+                &policy(workspace, managed_root),
+                std::slice::from_ref(&registered.id),
+                true,
+                false,
+            )
+            .unwrap();
+        assert!(assessments[0].eligible);
+        assert_eq!(
+            assessments[0].evidence.as_ref().unwrap().operation,
+            "reconcile-missing"
+        );
+        assert_eq!(
+            manager.registry().list().unwrap()[0].lifecycle,
+            Lifecycle::Removed
+        );
+        assert!(
+            manager
+                .registry()
+                .relocation(registered.id.as_str())
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            manager
+                .registry()
+                .removal(registered.id.as_str())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn interrupted_external_removal_refuses_an_unlisted_destination_on_disk() {
+        let temporary = tempdir().unwrap();
+        let workspace = temporary.path().join("workspace");
+        let repository = workspace.join("repo");
+        let managed_root = temporary.path().join("managed");
+        let external = temporary.path().join("legacy-external");
+        let destination = managed_root.join("repo/legacy-external");
+        std::fs::create_dir_all(&repository).unwrap();
+        std::fs::create_dir_all(&destination).unwrap();
+        let registered = named_record(
+            "legacy-external",
+            repository.clone(),
+            external,
+            Lifecycle::Finished,
+        );
+        let relocation = stale_relocation(&registered, &destination);
+        let removal = retirement_removal(&registered);
+        let registry = FakeRegistry {
+            records: Mutex::new(vec![registered.clone()]),
+            relocations: Mutex::new(BTreeMap::from([(registered.id.to_string(), relocation)])),
+            removals: Mutex::new(BTreeMap::from([(registered.id.to_string(), removal)])),
+            live_leases: 0,
+        };
+        let manager = WorktreeManager::new(fake_git(repository), registry, FixedClock);
+
+        let assessments = manager
+            .reconcile(
+                &policy(workspace, managed_root),
+                std::slice::from_ref(&registered.id),
+                false,
+                false,
+            )
+            .unwrap();
+        assert!(!assessments[0].eligible);
+        assert_eq!(
+            assessments[0].refusal.as_ref().unwrap().code,
+            "relocation-destination-exists"
+        );
+        assert_eq!(
+            manager.registry().list().unwrap()[0].lifecycle,
+            Lifecycle::Finished
+        );
+        assert!(
+            manager
+                .registry()
+                .relocation(registered.id.as_str())
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            manager
+                .registry()
+                .removal(registered.id.as_str())
+                .unwrap()
+                .is_some()
+        );
     }
 }

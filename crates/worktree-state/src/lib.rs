@@ -613,15 +613,26 @@ impl RegistryPort for SqliteRegistry {
     fn begin_removal(&self, intent: &RemovalIntent) -> Result<(), Refusal> {
         let recovery_json = serde_json::to_string(&intent.recovery)
             .map_err(|error| Refusal::new("recovery-proof-encode-failed", error.to_string()))?;
-        if let Some(existing) = self.removal(intent.id.as_str())? {
-            if existing.path != intent.path || existing.operation != intent.operation {
+        let path = path_text(&intent.path)?;
+        let connection = self.connection()?;
+        let transaction = connection.unchecked_transaction().map_err(database_error)?;
+        let existing = transaction
+            .query_row(
+                "SELECT path,operation FROM removal_intents WHERE worktree_id=?1",
+                [intent.id.as_str()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(database_error)?;
+        if let Some((existing_path, existing_operation)) = existing {
+            if existing_path != path || existing_operation != intent.operation {
                 return Err(Refusal::new(
                     "removal-already-planned",
                     "a different removal intent already exists",
                 ));
             }
-            return changed(
-                self.connection()?.execute(
+            changed(
+                transaction.execute(
                     "UPDATE removal_intents SET head=?2,recovery_json=?3,planned_at=?4
                      WHERE worktree_id=?1 AND path=?5 AND operation=?6",
                     params![
@@ -629,28 +640,48 @@ impl RegistryPort for SqliteRegistry {
                         intent.head,
                         recovery_json,
                         intent.planned_at,
-                        path_text(&intent.path)?,
+                        path,
                         intent.operation,
                     ],
                 ),
                 "refresh-removal-intent",
-            );
+            )?;
+        } else {
+            transaction
+                .execute(
+                    "INSERT INTO removal_intents(worktree_id,path,head,recovery_json,operation,planned_at)
+                     VALUES(?1,?2,?3,?4,?5,?6)",
+                    params![
+                        intent.id.as_str(),
+                        path,
+                        intent.head,
+                        recovery_json,
+                        intent.operation,
+                        intent.planned_at,
+                    ],
+                )
+                .map_err(database_error)?;
         }
-        self.connection()?
-            .execute(
-                "INSERT INTO removal_intents(worktree_id,path,head,recovery_json,operation,planned_at)
-                 VALUES(?1,?2,?3,?4,?5,?6)",
-                params![
-                    intent.id.as_str(),
-                    path_text(&intent.path)?,
-                    intent.head,
-                    recovery_json,
-                    intent.operation,
-                    intent.planned_at,
-                ],
+        let relocation = transaction
+            .query_row(
+                "SELECT from_path,head FROM relocations WHERE worktree_id=?1",
+                [intent.id.as_str()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
             )
-            .map(|_| ())
-            .map_err(database_error)
+            .optional()
+            .map_err(database_error)?;
+        if let Some((relocation_source, relocation_head)) = relocation {
+            if intent.operation != "retire-external"
+                || relocation_source != path
+                || relocation_head != intent.head
+            {
+                return Err(Refusal::new(
+                    "removal-relocation-mismatch",
+                    "pending relocation can only be superseded by retirement of its exact source and HEAD",
+                ));
+            }
+        }
+        transaction.commit().map_err(database_error)
     }
 
     fn complete_removal(
@@ -660,6 +691,31 @@ impl RegistryPort for SqliteRegistry {
     ) -> Result<(), Refusal> {
         let connection = self.connection()?;
         let transaction = connection.unchecked_transaction().map_err(database_error)?;
+        let relocation = transaction
+            .query_row(
+                "SELECT from_path,to_path,head FROM relocations WHERE worktree_id=?1",
+                [intent.id.as_str()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(database_error)?;
+        if let Some((relocation_source, _, relocation_head)) = relocation.as_ref() {
+            if intent.operation != "retire-external"
+                || relocation_source != path_text(&intent.path)?
+                || relocation_head != &intent.head
+            {
+                return Err(Refusal::new(
+                    "removal-relocation-mismatch",
+                    "pending relocation can only be completed by retirement of its exact source and HEAD",
+                ));
+            }
+        }
         changed(
             transaction.execute(
                 "UPDATE worktrees SET lifecycle='removed',head=?2,last_seen_at=?3
@@ -701,6 +757,21 @@ impl RegistryPort for SqliteRegistry {
             ),
             "clear-removal-intent",
         )?;
+        if let Some((relocation_source, relocation_destination, relocation_head)) = relocation {
+            changed(
+                transaction.execute(
+                    "DELETE FROM relocations
+                     WHERE worktree_id=?1 AND from_path=?2 AND to_path=?3 AND head=?4",
+                    params![
+                        intent.id.as_str(),
+                        relocation_source,
+                        relocation_destination,
+                        relocation_head,
+                    ],
+                ),
+                "complete-retirement-relocation",
+            )?;
+        }
         transaction.commit().map_err(database_error)
     }
 }
@@ -968,6 +1039,174 @@ mod tests {
         let migrated = registry.list().unwrap().pop().unwrap();
         assert_eq!(migrated.path, intent.to);
         assert_eq!(migrated.head.as_deref(), Some("abc"));
+    }
+
+    #[test]
+    fn external_retirement_retains_stale_relocation_until_atomic_completion() {
+        let temporary = tempdir().unwrap();
+        let registry = SqliteRegistry::open(&temporary.path().join("registry.sqlite3")).unwrap();
+        let record = WorktreeRecord {
+            id: WorktreeId::new("legacy-one").unwrap(),
+            repository_root: "/repo".into(),
+            path: "/legacy/one".into(),
+            purpose: "migration test".into(),
+            owner: "test".into(),
+            lifecycle: Lifecycle::Finished,
+            created_at: 1,
+            last_seen_at: 2,
+            finished_at: Some(2),
+            head: Some("abc".into()),
+        };
+        registry.adopt(&record).unwrap();
+        let relocation = RelocationIntent {
+            id: record.id.clone(),
+            from: record.path.clone(),
+            to: "/managed/repo/legacy-one".into(),
+            head: "abc".into(),
+            planned_at: 1,
+        };
+        registry.begin_relocation(&relocation).unwrap();
+        let recovery = RecoveryProof {
+            head: "abc".into(),
+            refs: vec!["refs/heads/main".into()],
+            observed_at: 3,
+        };
+        let mut removal = RemovalIntent {
+            id: record.id,
+            path: record.path,
+            head: "abc".into(),
+            recovery,
+            operation: "gc".into(),
+            planned_at: 3,
+        };
+
+        assert_eq!(
+            registry.begin_removal(&removal).unwrap_err().code,
+            "removal-relocation-mismatch"
+        );
+        assert_eq!(
+            registry.relocation("legacy-one").unwrap(),
+            Some(relocation.clone())
+        );
+        assert!(registry.removal("legacy-one").unwrap().is_none());
+
+        removal.operation = "retire-external".into();
+        removal.head = "different".into();
+        removal.recovery.head = "different".into();
+        assert_eq!(
+            registry.begin_removal(&removal).unwrap_err().code,
+            "removal-relocation-mismatch"
+        );
+        assert!(registry.relocation("legacy-one").unwrap().is_some());
+        assert!(registry.removal("legacy-one").unwrap().is_none());
+
+        removal.head = "abc".into();
+        removal.recovery.head = "abc".into();
+        registry.begin_removal(&removal).unwrap();
+        assert_eq!(registry.relocation("legacy-one").unwrap(), Some(relocation));
+        assert_eq!(
+            registry.removal("legacy-one").unwrap(),
+            Some(removal.clone())
+        );
+
+        let evidence = OperationEvidence {
+            operation: "retire-external".into(),
+            id: removal.id.clone(),
+            path: removal.path.clone(),
+            head: Some(removal.head.clone()),
+            recovery: Some(removal.recovery.clone()),
+            recorded_at: 4,
+        };
+        registry.complete_removal(&removal, &evidence).unwrap();
+        assert!(registry.relocation("legacy-one").unwrap().is_none());
+        assert!(registry.removal("legacy-one").unwrap().is_none());
+        assert_eq!(
+            registry.list().unwrap().pop().unwrap().lifecycle,
+            Lifecycle::Removed
+        );
+    }
+
+    #[test]
+    fn failed_retirement_completion_rolls_back_lifecycle_event_and_both_intents() {
+        let temporary = tempdir().unwrap();
+        let registry = SqliteRegistry::open(&temporary.path().join("registry.sqlite3")).unwrap();
+        let record = WorktreeRecord {
+            id: WorktreeId::new("legacy-one").unwrap(),
+            repository_root: "/repo".into(),
+            path: "/legacy/one".into(),
+            purpose: "migration test".into(),
+            owner: "test".into(),
+            lifecycle: Lifecycle::Finished,
+            created_at: 1,
+            last_seen_at: 2,
+            finished_at: Some(2),
+            head: Some("abc".into()),
+        };
+        registry.adopt(&record).unwrap();
+        let relocation = RelocationIntent {
+            id: record.id.clone(),
+            from: record.path.clone(),
+            to: "/managed/repo/legacy-one".into(),
+            head: "abc".into(),
+            planned_at: 2,
+        };
+        registry.begin_relocation(&relocation).unwrap();
+        let removal = RemovalIntent {
+            id: record.id.clone(),
+            path: record.path.clone(),
+            head: "abc".into(),
+            recovery: RecoveryProof {
+                head: "abc".into(),
+                refs: vec!["refs/heads/main".into()],
+                observed_at: 3,
+            },
+            operation: "retire-external".into(),
+            planned_at: 3,
+        };
+        registry.begin_removal(&removal).unwrap();
+        registry
+            .connection()
+            .unwrap()
+            .execute(
+                "UPDATE removal_intents SET operation='corrupt' WHERE worktree_id=?1",
+                [record.id.as_str()],
+            )
+            .unwrap();
+        let stored_removal = registry.removal(record.id.as_str()).unwrap().unwrap();
+        let evidence = OperationEvidence {
+            operation: "retire-external".into(),
+            id: record.id.clone(),
+            path: record.path.clone(),
+            head: Some("abc".into()),
+            recovery: Some(removal.recovery.clone()),
+            recorded_at: 4,
+        };
+
+        assert_eq!(
+            registry
+                .complete_removal(&removal, &evidence)
+                .unwrap_err()
+                .code,
+            "invalid-lifecycle-transition"
+        );
+        assert_eq!(
+            registry.list().unwrap().pop().unwrap().lifecycle,
+            Lifecycle::Finished
+        );
+        assert_eq!(
+            registry.relocation(record.id.as_str()).unwrap(),
+            Some(relocation)
+        );
+        assert_eq!(
+            registry.removal(record.id.as_str()).unwrap(),
+            Some(stored_removal)
+        );
+        let event_count: i64 = registry
+            .connection()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(event_count, 0);
     }
 
     #[test]

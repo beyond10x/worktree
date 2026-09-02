@@ -11,7 +11,7 @@ XDG-state SQLite registry.
 ## Install
 
 ```bash
-cargo install --git https://github.com/beyond10x/worktree --tag 0.3.0 b10x-worktree-cli
+cargo install --git https://github.com/beyond10x/worktree --tag 0.3.1 b10x-worktree-cli
 ```
 
 ## Use
@@ -74,6 +74,12 @@ a legacy tree that cannot be moved across filesystems; it still requires an idle
 tree, a HEAD stable across final proof/removal observations, and fresh advertised-remote proof.
 Applying that action additionally requires `--allow-external-retirement`, so an id reviewed for
 migration cannot silently drift into an external deletion.
+
+For legacy state created before 0.3, a finished external tree may still carry a stale relocation
+intent. Reconciliation proposes `retire-external` only when that intent names the exact source and
+HEAD, Git reports no destination worktree, and the destination path is absent. Durable removal
+proof retains the stale intent until successful removal, then completion clears both atomically;
+ambiguous or partially moved state is refused.
 
 Relocation and removal intents are durable. Recovery proof is stored before `git worktree remove`,
 and registry lifecycle, evidence, and intent completion are committed atomically afterward. If an
