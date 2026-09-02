@@ -28,6 +28,9 @@ independent policy: every decision must come from the public façade.
 - Ordinary GC requires canonical containment below the configured worktree root. Only exact-id
   reconciliation with separate external-retirement confirmation may retire a finished external
   legacy tree after the same removal gates pass.
+- Never clear stale relocation state by hand. A finished external legacy tree may supersede a
+  pre-0.3 relocation intent only when the exact source and all recorded HEADs agree and the
+  destination is absent from both Git and the filesystem; ambiguous state remains a refusal.
 - Offline or ambiguous recovery evidence is a refusal, never permission to delete.
 - Local replacement refs, graft files, and inherited graft configuration must never influence
   remote recovery proof.

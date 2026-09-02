@@ -89,6 +89,10 @@ intended for clean legacy trees on another filesystem. The same membership, leas
 state, HEAD-stability, live remote-proof, durable-intent, and non-forced-removal gates still apply.
 Apply also requires the separate `--allow-external-retirement` confirmation, preventing a reviewed
 migration id from becoming an external deletion when lifecycle state changes before execution.
+Finished legacy records stranded by a pre-0.3 relocation intent can take this path only when the
+intent's source and HEAD still match and its destination is absent from both Git and the filesystem;
+the proof-bearing removal intent retains that topology evidence until successful removal, when
+completion clears both intents atomically.
 
 When a registered path is already absent, reconciliation changes registry state only after Git no
 longer reports the worktree and either a matching removal intent exists or the stored final HEAD is

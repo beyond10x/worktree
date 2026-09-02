@@ -1,0 +1,15 @@
+schema: b10x-change/v1
+id: worktree/external-retirement-recovery-0.3.1
+repository: worktree
+publishedAt: 2026-09-02T02:22:14Z
+title: Worktree safely recovers stale external relocation state
+summary: Worktree 0.3.1 lets exact-id reconciliation retire a finished external legacy tree stranded by a stale pre-0.3 relocation intent, while preserving source, destination, HEAD, proof, and confirmation gates.
+kind: release
+impact: significant
+source:
+  url: https://github.com/beyond10x/worktree/releases/tag/0.3.1
+  version: 0.3.1
+journeys: [build-agents, operate-services]
+affectedSurfaces: [worktree/docs]
+relations:
+  - {target: change:agentplugins/workspace-hygiene-0.3.3, kind: enables, label: Updates the generated worktree recovery guide}

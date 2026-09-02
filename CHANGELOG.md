@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## 0.3.1 — 2026-09-02
+
+- Retire finished external legacy trees that were stranded by a stale pre-0.3 relocation intent,
+  but only when the exact source and HEAD still agree and the intended destination is absent.
+- Retain that stale relocation alongside durable removal proof until successful non-forced
+  removal, then clear both intents atomically, while refusing ambiguous or partially moved state.
+- Teach the generated Worktree skill how to handle this reviewed recovery path without converting
+  cross-device migration refusals by hand.
+
 ## 0.3.0 — 2026-09-02
 
 - Prove recovery from exact refs currently advertised by configured remotes, including branches,

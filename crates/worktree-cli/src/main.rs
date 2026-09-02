@@ -865,6 +865,7 @@ Hook integrations should run `worktree hook session-start --session <id>` on ent
 - Run `worktree reconcile --repo <path> --dry-run` to assess interrupted provisioning, adopted legacy paths, finished external trees, and missing records.
 - Apply reconciliation only to ids copied from that immediately preceding dry-run with `worktree reconcile --repo <path> --apply --id <reviewed-id>` and repeated `--id` arguments when needed.
 - If that dry-run explicitly proposes `retire-external`, confirm that destructive action separately by adding `--allow-external-retirement`; never add it for an unrelated migration or missing-record repair.
+- A finished external legacy tree may supersede a stale migration intent only when the dry-run itself proposes `retire-external`; never reinterpret or bypass a cross-device or ambiguous-relocation refusal.
 - If removal is interrupted while the path still exists, rerun GC dry-run and exact-id apply. If the path is already absent, use reconciliation dry-run and exact-id apply; its durable removal intent can safely finish the recorded transition.
 - A missing Active record without matching durable removal intent must remain refused. Preserve and investigate its registry evidence; never manually tombstone it, delete related state, or fabricate recovery proof.
 - Run `worktree doctor --check` for prerequisites and configuration.
