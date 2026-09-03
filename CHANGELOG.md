@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 0.3.3 — 2026-09-04
+
+- Adopt the governed planning store (`.engineering/`): `aep reverse init` against the pinned
+  protocol source, and the first story, `worktree-diff` — one read-only verb showing the commits,
+  per-file stat and patch a managed worktree adds over the revision it was created from, with a
+  path filter and a JSON form. Filed, not implemented.
+
 ## 0.3.2 — 2026-09-02
 
 - Say in the generated skill that `gc --repo` selects the activated workspace profile rather than
