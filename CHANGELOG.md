@@ -2,12 +2,18 @@
 
 ## Unreleased
 
+## 0.3.4 — 2026-09-04
+
+- File `story:worktree-diff` in the planning store this repository already had: one read-only verb
+  showing the commits, per-file stat and patch a managed worktree adds over the revision it was
+  created from, with a path filter and a JSON form. Filed, not implemented.
+- Remove the nested duplicate store `.engineering/.engineering/` that 0.3.3 added by mistake;
+  0.3.3's changelog line claiming to adopt the store was wrong — the store predates it.
+
 ## 0.3.3 — 2026-09-04
 
-- Adopt the governed planning store (`.engineering/`): `aep reverse init` against the pinned
-  protocol source, and the first story, `worktree-diff` — one read-only verb showing the commits,
-  per-file stat and patch a managed worktree adds over the revision it was created from, with a
-  path filter and a JSON form. Filed, not implemented.
+- Added a nested duplicate planning store by mistake (`.engineering/.engineering/`); corrected in
+  0.3.4. No code change.
 
 ## 0.3.2 — 2026-09-02
 
