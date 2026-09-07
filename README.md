@@ -11,16 +11,21 @@ XDG-state SQLite registry.
 ## Install
 
 ```bash
-cargo install --git https://github.com/beyond10x/worktree --tag 0.3.2 b10x-worktree-cli
+cargo install --git https://github.com/beyond10x/worktree --tag 0.4.0 b10x-worktree-cli
 ```
 
 ## Use
 
 ```bash
 worktree create --purpose dependency-refresh
+worktree hook session-start --path <tree> --session <session-id>
+worktree inspect --repo /path/to/repository
 worktree status
-worktree finish
-worktree gc --repo /path/to/repository --dry-run
+worktree hook heartbeat --path <tree> --session <session-id>
+# Publish wanted changes and remove this task's disposable build output.
+worktree hook session-end --path <tree> --session <session-id>
+worktree finish <tree>
+worktree gc --repo /path/to/repository --dry-run --id <reviewed-id>
 worktree gc --repo /path/to/repository --apply --id <reviewed-id>
 worktree reconcile --repo /path/to/repository --dry-run
 worktree reconcile --repo /path/to/repository --apply --id <reviewed-id>
@@ -60,7 +65,16 @@ repository graft files cause refusal. Offline, changed, or ambiguous advertiseme
 Use `worktree repo list --repo <path>` to inventory linked trees without adopting or deleting them.
 Existing trees only become manager-owned through the explicit `repo adopt` command. Hook integrations
 can maintain cleanup-blocking leases with `hook session-start`, `hook heartbeat`, and
-`hook session-end`.
+`hook session-end`. When hooks are absent, run them explicitly and renew the lease before expiry.
+Release your own lease before finishing. Build output and ignored files remain on disk until their
+owner preserves useful evidence and removes the exact disposable directories.
+
+`worktree inspect --repo <path>` reports actual Git state, ignored files, storage, live leases,
+recorded activity and retention blockers for that repository, including active trees. Add
+`--workspace` to expand the scope, repeat `--id` to narrow it, and use `--refresh` for fresh
+remote recovery evidence. Storage scans are bounded and flag incomplete results; reported bytes
+are observations, not guaranteed reclaimable space. Inspection does not change lifecycle or infer
+story completion or abandonment. Cleanup still requires a reviewed GC assessment.
 
 Dry-runs may assess all candidates or selected ids. Both `gc --apply` and `reconcile --apply`
 require one or more exact, reviewed `--id` values; repeat the option to apply more than one result.

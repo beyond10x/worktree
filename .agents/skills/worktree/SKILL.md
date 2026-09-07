@@ -18,14 +18,25 @@ Use the `worktree` CLI as the sole owner of linked-worktree lifecycle. It keeps 
 
 ## Maintain the lease
 
-Hook integrations should run `worktree hook session-start --session <id>` on entry, `worktree hook heartbeat --session <id>` during long work, and `worktree hook session-end --session <id>` on exit. A live lease blocks cleanup.
+Acquire a lease before changing the tree: run `worktree hook session-start --path <tree> --session <session-id>`. Use a stable id unique to this session. If the host does not demonstrably run lifecycle hooks, run these commands yourself; loading this skill does not install hooks.
+
+Run `worktree hook heartbeat --path <tree> --session <session-id>` periodically during long work, before the configured lease expiry, including while builds or external checks are running. Check each result. A live lease blocks cleanup; a missing or expired lease does not prove that another session has stopped.
+
+Release only your own lease with `worktree hook session-end --path <tree> --session <session-id>` when leaving or immediately before finish. Never clear another session's lease to make cleanup pass.
+
+## Bound disposable storage
+
+Before a large build, inspect free space and `worktree inspect --repo <primary> --id <id>`. Keep compiler caches and dependencies separate from source and retained evidence. Prefer a repository-supported cache location and bounded build settings; do not force a shared target directory across incompatible build configurations.
+
+After verification, preserve the small logs, reports, or deliverables needed for review in their intended durable location. Remove only exact build or dependency directories known to be reproducible, owned by this task, and unused by any running process. Ignored files can contain valuable work: never blanket-delete them or use `git clean -fdx`. A worktree saves duplicate Git history; its build output still consumes disk and is not automatically reclaimed.
 
 ## Finish and clean up
 
 1. Commit and publish every wanted change. A local-only commit is deliberately not cleanup-safe.
-2. In the managed tree, run `worktree finish`. It refuses dirty, locked, unmanaged, live, or mid-operation Git worktrees.
-3. Run `worktree gc --repo <primary> --dry-run` and inspect every result. `--repo` selects the activated workspace profile, not the repository: the assessment covers every record under that profile's `workspace_root`, so it lists trees belonging to other repositories. There is no per-repository filter, and an unreviewed `--apply` would remove another repository's work.
-4. Run `worktree gc --repo <primary> --apply --id <reviewed-id>` with repeated `--id` values only for the exact results intended for removal. The command refreshes remote advertisements, fetches required objects, and revalidates immediately before non-forced removal.
+2. Preserve required evidence and remove this task's disposable output as described above. Release your own lease, then run `worktree finish <tree>`. It refuses dirty, locked, unmanaged, live, or mid-operation Git worktrees.
+3. Run `worktree gc --repo <primary> --dry-run --id <id>` and inspect every result. Without exact ids, `--repo` selects the activated workspace profile, not just the repository: the assessment covers records under that profile's `workspace_root`, including other repositories.
+4. Run `worktree gc --repo <primary> --apply --id <reviewed-id>` with repeated `--id` values only for the exact results intended for removal. The command refreshes remote advertisements, fetches required objects, and revalidates immediately before non-forced removal. Check the result before reporting storage reclaimed.
+5. End with either verified cleanup or an explicit handoff: tree id and path, published branch/commit, related work-item references, retained evidence, remaining blockers, next owner and next action. Never leave a tree silently active or label work complete merely from its age or Git state.
 
 ## Audit and recovery
 

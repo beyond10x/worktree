@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+## 0.4.0 — 2026-09-07
+
+- Add native `worktree inspect` with repository scope by default, explicit workspace expansion,
+  bounded storage accounting, actual Git state, leases, retention blockers and optional fresh
+  remote recovery evidence. Its versioned report does not authorize removal or infer work completion.
+- Ignore a leftover `REBASE_HEAD` after a completed rebase while preserving real operation,
+  dirty-file, lease, lock and remote recovery checks.
+- Generate explicit lease acquisition, heartbeat, lease release before finish, bounded build
+  storage, evidence retention and cleanup or handoff guidance.
+- Authenticate the CI Task installer to avoid anonymous GitHub API rate limits.
+
 ## 0.3.4 — 2026-09-04
 
 - File `story:worktree-diff` in the planning store this repository already had: one read-only verb
