@@ -4,6 +4,9 @@ use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter};
 use std::path::{Path, PathBuf};
 
+mod inspection;
+pub use inspection::*;
+
 /// Configuration and workspace-policy schema version.
 pub const SURFACE_VERSION: u32 = 1;
 

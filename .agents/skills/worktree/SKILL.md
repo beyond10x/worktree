@@ -29,6 +29,7 @@ Hook integrations should run `worktree hook session-start --session <id>` on ent
 
 ## Audit and recovery
 
+- Run `worktree inspect --repo <path>` for actual Git state, separate ignored-file counts, storage, leases, and retention blockers. It defaults to that repository; add `--workspace` to expand to its profile and repeat `--id` to narrow the selection. Sizes are bounded observations, not promised reclaimable bytes. Add `--refresh` for fresh remote recovery evidence (which may fetch objects). Inspection never changes lifecycle or infers owner abandonment or story completion; review GC separately before removal.
 - Run `worktree status` for durable lifecycle state. It accepts no filter and reports every record in every profile, so read `repository_root` on each one before acting.
 - Run `worktree repo list --repo <path>` to distinguish managed, unmanaged, primary, and linked checkouts.
 - Run `worktree reconcile --repo <path> --dry-run` to assess interrupted provisioning, adopted legacy paths, finished external trees, and missing records.

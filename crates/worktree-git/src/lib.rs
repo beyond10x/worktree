@@ -10,6 +10,8 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+mod inspection;
+
 /// Process-backed Git port.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ProcessGit;
@@ -384,6 +386,14 @@ impl ProcessGit {
         // Git can report a perfectly clean index while a sequencer operation is paused. These
         // per-worktree markers are therefore as removal-blocking as an actual lock file: deleting
         // the linked tree would also delete the only state needed to continue or abort it.
+        //
+        // `REBASE_HEAD` is **not** among them, and that is the whole of this list's subtlety. Git
+        // writes it during a rebase and leaves it behind when one finishes; a rebase is in progress
+        // if and only if `rebase-merge` or `rebase-apply` exists. Counting the leftover marker made
+        // `finish` refuse a clean, idle worktree with `worktree-locked: Git marks the worktree
+        // locked`, for a lock Git does not report — measured 2026-09-04 on two managed worktrees
+        // whose rebases had completed, where `git worktree list --porcelain` showed no lock and
+        // neither rebase directory existed.
         for relative in [
             "rebase-merge",
             "rebase-apply",
@@ -391,7 +401,6 @@ impl ProcessGit {
             "MERGE_HEAD",
             "CHERRY_PICK_HEAD",
             "REVERT_HEAD",
-            "REBASE_HEAD",
             "BISECT_LOG",
             "BISECT_START",
         ] {
@@ -1011,6 +1020,50 @@ mod tests {
                 .locked
         );
         git(&linked, &[OsStr::new("rebase"), OsStr::new("--abort")]);
+    }
+
+    #[test]
+    fn a_stale_rebase_head_leaves_the_worktree_unlocked() {
+        // Git writes `REBASE_HEAD` while applying a commit and leaves it behind once the rebase
+        // finishes. Counting it made `finish` refuse a clean, idle worktree with
+        // `worktree-locked: Git marks the worktree locked`, for a lock Git does not report —
+        // observed 2026-09-04 on two managed worktrees whose conflicted rebases had been resolved
+        // and continued to the end.
+        //
+        // The marker is written here rather than produced by a real rebase on purpose: which
+        // rebase paths leave it is a Git implementation detail that varies by version, and a test
+        // that depends on it tests Git. What this repository decides is what the marker *means*.
+        let temporary = tempdir().unwrap();
+        let repository = temporary.path().join("repo");
+        init_repository(&repository);
+        let linked = temporary.path().join("linked");
+        add_linked(&repository, &linked);
+
+        let git_dir = ProcessGit::absolute_git_path(&linked, "--git-dir").unwrap();
+        let head = git(&linked, &[OsStr::new("rev-parse"), OsStr::new("HEAD")]);
+        std::fs::write(git_dir.join("REBASE_HEAD"), &head).unwrap();
+        assert!(
+            !git_dir.join("rebase-merge").exists() && !git_dir.join("rebase-apply").exists(),
+            "no rebase is in progress: those two directories are what say one is"
+        );
+
+        assert!(
+            !ProcessGit
+                .worktree_snapshot(&repository, &linked)
+                .unwrap()
+                .locked,
+            "a finished rebase is not a paused one"
+        );
+
+        // And the two that do mean a paused rebase still do.
+        std::fs::create_dir(git_dir.join("rebase-merge")).unwrap();
+        assert!(
+            ProcessGit
+                .worktree_snapshot(&repository, &linked)
+                .unwrap()
+                .locked,
+            "rebase-merge is what a paused rebase looks like"
+        );
     }
 
     #[cfg(unix)]

@@ -1,0 +1,6 @@
+format: ess/1
+system: worktree
+version: v1
+
+domains:
+  - worktree.inspection

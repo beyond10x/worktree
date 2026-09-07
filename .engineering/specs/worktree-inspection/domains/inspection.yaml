@@ -1,0 +1,30 @@
+domain: worktree.inspection
+
+# A report observation, not a new persisted worktree lifecycle or cleanup authority.
+# Worktree identity and purpose already exist in crates/worktree-domain/src/lib.rs.
+entities:
+  - name: worktree.inspection.WorktreeInspection
+    identity:
+      name: worktree_id
+      type: String
+    fields:
+      - name: observed_at
+        type: Integer
+      - name: recorded_head
+        type: Optional<String>
+      - name: actual_head
+        type: Optional<String>
+      - name: logical_bytes
+        type: Optional<Integer>
+      - name: allocated_bytes
+        type: Optional<Integer>
+      - name: live_leases
+        type: Integer
+      - name: cleanup_candidate
+        type: Boolean
+    lifecycle:
+      initial: Observed
+      states: [Observed]
+      terminal: [Observed]
+    # UNMAPPED: current registry has no work-item identity or ownership relation.
+    # Purposes, changed artifact paths and issue-like tokens cannot supply one.

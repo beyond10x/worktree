@@ -35,6 +35,8 @@ enum Command {
     Create(CreateArgs),
     /// Show registered worktree lifecycle state.
     Status,
+    /// Inspect actual Git state, storage, leases, and reasons a checkout is retained.
+    Inspect(InspectArgs),
     /// Mark a clean, idle worktree finished.
     Finish {
         /// Managed worktree path; defaults to the current directory.
@@ -111,6 +113,25 @@ struct GcArgs {
     /// Explicitly document dry-run intent.
     #[arg(long)]
     dry_run: bool,
+}
+
+#[derive(Debug, Args)]
+struct InspectArgs {
+    /// Inspect only this repository by default (unlike gc's profile-wide scope).
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Explicitly include every repository in the selected activated workspace.
+    #[arg(long)]
+    workspace: bool,
+    /// Limit inspection to exact registered ids; repeat for multiple records.
+    #[arg(long = "id")]
+    ids: Vec<String>,
+    /// Refresh remote-ref evidence; may fetch missing objects, never updates lifecycle.
+    #[arg(long)]
+    refresh: bool,
+    /// Maximum filesystem entries examined per tree; partial sizes are reported explicitly.
+    #[arg(long, default_value_t = 250_000, value_parser = clap::value_parser!(u64).range(1..))]
+    max_entries: u64,
 }
 
 #[derive(Debug, Args)]
@@ -280,6 +301,7 @@ fn run(cli: &Cli) -> Result<()> {
         Command::Activate(args) => activate(args, cli.json),
         Command::Create(args) => create(args, cli.json),
         Command::Status => status(cli.json),
+        Command::Inspect(args) => inspect(args, cli.json),
         Command::Finish { path } => {
             let evidence = manager()?.finish(path).map_err(anyhow::Error::new)?;
             emit_success(
@@ -304,6 +326,85 @@ fn manager() -> Result<Manager> {
     let registry = SqliteRegistry::open(&registry_path().map_err(anyhow::Error::new)?)
         .map_err(anyhow::Error::new)?;
     Ok(WorktreeManager::new(ProcessGit, registry, SystemClock))
+}
+
+fn inspect(args: &InspectArgs, json: bool) -> Result<()> {
+    let service = manager()?;
+    let repository = ProcessGit
+        .repository_snapshot(&args.repo)
+        .map_err(anyhow::Error::new)?;
+    let config =
+        load_config(&config_path().map_err(anyhow::Error::new)?).map_err(anyhow::Error::new)?;
+    let policy = resolve_policy(&config, &repository.root).map_err(anyhow::Error::new)?;
+    let ids = args
+        .ids
+        .iter()
+        .map(|id| WorktreeId::new(id.clone()))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(anyhow::Error::new)?;
+    let report = service
+        .inspect(
+            policy,
+            &repository.root,
+            args.workspace,
+            &ids,
+            args.refresh,
+            args.max_entries,
+        )
+        .map_err(anyhow::Error::new)?;
+    emit_success(json, CLI_PROTOCOL_VERSION, &report, || {
+        let mut lines = vec![format!("Inspection: {} ({})", repository.root.display(), if args.workspace { "workspace" } else { "repository" }),
+            "Storage is observed allocation, not guaranteed reclaimable space. No lease does not prove abandonment. Work-item ownership/completion is unknown in the current registry.".into()];
+        for item in &report.inspections {
+            let size = item.details.as_ref().map_or_else(
+                || "unknown bytes".into(),
+                |details| {
+                    format!(
+                        "{} bytes{}",
+                        details
+                            .storage
+                            .allocated_bytes
+                            .unwrap_or(details.storage.logical_bytes),
+                        if details.storage.complete {
+                            ""
+                        } else {
+                            " (partial)"
+                        }
+                    )
+                },
+            );
+            lines.push(format!(
+                "{}\t{}\t{:?}\t{}",
+                item.record.id,
+                size,
+                item.record.lifecycle,
+                item.record.path.display()
+            ));
+            lines.push(format!(
+                "  owner={} purpose={}",
+                item.record.owner, item.record.purpose
+            ));
+            if let Some(details) = &item.details {
+                lines.push(format!("  HEAD={} branch={} recorded-head-differs={:?} tracked={} untracked={} ignored={} live-leases={:?}", details.snapshot.head, if details.branch.is_empty() { "(detached)" } else { &details.branch }, item.recorded_head_differs, details.tracked_changes, details.untracked_entries, details.ignored_entries, item.live_leases));
+                for child in details.storage.children.iter().take(5) {
+                    lines.push(format!(
+                        "  storage {}: {} bytes",
+                        child.path.display(),
+                        child.allocated_bytes.unwrap_or(child.logical_bytes)
+                    ));
+                }
+            }
+            for blocker in &item.blockers {
+                lines.push(format!("  retained: {blocker}"));
+            }
+            if item.blockers.is_empty() {
+                lines.push(
+                    "  no observed blocker; review gc --dry-run before exact-id apply".into(),
+                );
+            }
+        }
+        lines.join("\n")
+    })
 }
 
 fn activate(args: &ActivateArgs, json: bool) -> Result<()> {
@@ -860,6 +961,7 @@ Hook integrations should run `worktree hook session-start --session <id>` on ent
 
 ## Audit and recovery
 
+- Run `worktree inspect --repo <path>` for actual Git state, separate ignored-file counts, storage, leases, and retention blockers. It defaults to that repository; add `--workspace` to expand to its profile and repeat `--id` to narrow the selection. Sizes are bounded observations, not promised reclaimable bytes. Add `--refresh` for fresh remote recovery evidence (which may fetch objects). Inspection never changes lifecycle or infers owner abandonment or story completion; review GC separately before removal.
 - Run `worktree status` for durable lifecycle state. It accepts no filter and reports every record in every profile, so read `repository_root` on each one before acting.
 - Run `worktree repo list --repo <path>` to distinguish managed, unmanaged, primary, and linked checkouts.
 - Run `worktree reconcile --repo <path> --dry-run` to assess interrupted provisioning, adopted legacy paths, finished external trees, and missing records.

@@ -8,6 +8,9 @@ use b10x_worktree_domain::{
 };
 use std::path::{Path, PathBuf};
 
+mod inspection;
+pub use inspection::InspectionPort;
+
 /// Time source used by lifecycle decisions.
 pub trait Clock: Send + Sync {
     /// Seconds since the Unix epoch.
