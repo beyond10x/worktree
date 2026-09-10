@@ -11,7 +11,7 @@ XDG-state SQLite registry.
 ## Install
 
 ```bash
-cargo install --git https://github.com/beyond10x/worktree --tag 0.4.0 b10x-worktree-cli
+cargo install --git https://github.com/beyond10x/worktree --tag 0.4.1 b10x-worktree-cli
 ```
 
 ## Use

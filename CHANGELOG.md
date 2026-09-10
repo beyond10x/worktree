@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## 0.4.1 — 2026-09-10
+
+- Record the organization release-completion boundary in `AGENTS.md`: an ordinary source release
+  completes on this repository's own tag, required checks, published release and required
+  artifacts, while Atlas reconciliation and public documentation publication stay asynchronous
+  and are reported as pending rather than waited on.
+- No library, CLI, wire-protocol, schema or behavior change; every declared surface version is
+  unchanged.
+
 ## 0.4.0 — 2026-09-07
 
 - Add native `worktree inspect` with repository scope by default, explicit workspace expansion,
