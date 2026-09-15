@@ -5,7 +5,7 @@ kind: story
 status: draft
 title: Scope reporting and cleanup subcommands to the repository by default
 summary: gc and status report every record in the whole workspace profile, so add a --scope flag with repo, profile and global, and default to repo.
-revision: 1
+revision: 2
 ---
 ## Problem
 
@@ -20,11 +20,11 @@ assesses every record under that profile's `workspace_root`. Observed on 2026-09
 - `worktree gc --repo /home/timo/beyond10x/agentplugins --dry-run` returned 31 assessments, 28 of
   them eligible, spanning atlas, connectors, aep, ess, harness, todo, website, service-sdk and
   devcenter. One belonged to agentplugins.
-- `worktree gc --repo /home/timo/babelforce/projects/sbf/acd --dry-run` returned 1 assessment, and
-  that record's `repository_root` was `/home/timo/babelforce/projects/devcenter` — a different
-  repository inside the same `babelforce` profile.
+- `worktree gc --repo /home/timo/acme/projects/tenant-one/acd --dry-run` returned 1 assessment, and
+  that record's `repository_root` was `/home/timo/acme/projects/devcenter` — a different
+  repository inside the same `acme` profile, an adopter's internal collection of repositories.
 - `worktree status --help` lists one option, `--json`. It returned all 297 records across the
-  `b10x`, `babelforce` and `default` tree roots.
+  `b10x`, `acme` and `default` tree roots.
 
 An agent following the generated skill's own step — run the dry-run and inspect every result —
 therefore reads a list dominated by other repositories' trees. An `--apply` issued without exact
