@@ -32,6 +32,9 @@ independent policy: every decision must come from the public façade.
   pre-0.3 relocation intent only when the exact source and all recorded HEADs agree and the
   destination is absent from both Git and the filesystem; ambiguous state remains a refusal.
 - Offline or ambiguous recovery evidence is a refusal, never permission to delete.
+- Forgetting a record is not recovering its work. A missing record whose commit no ref holds may be
+  abandoned only through a reviewed exact-id apply in which the operator names that exact commit,
+  and only while Git still confirms nothing points at it.
 - Local replacement refs, graft files, and inherited graft configuration must never influence
   remote recovery proof.
 - Create plans use immutable commits and canonical policy-derived paths; plans and exact repository

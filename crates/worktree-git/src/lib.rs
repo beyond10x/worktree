@@ -284,6 +284,47 @@ impl ProcessGit {
         Ok(output.status.success())
     }
 
+    /// Run one ancestry query with replacement objects and graft ancestry disabled.
+    fn containment_output<I, S>(repository: &Path, args: I) -> Result<String, Refusal>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        let disabled_grafts = tempfile::NamedTempFile::new()
+            .map_err(|error| Refusal::new("graft-isolation-failed", error.to_string()))?;
+        let output = Command::new("git")
+            .arg("--no-replace-objects")
+            .arg("-C")
+            .arg(repository)
+            .args(args)
+            .env("GIT_GRAFT_FILE", disabled_grafts.path())
+            .output()
+            .map_err(|error| Refusal::new("git-unavailable", error.to_string()))?;
+        if !output.status.success() {
+            return Err(Refusal::new(
+                "git-command-failed",
+                String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+            ));
+        }
+        String::from_utf8(output.stdout)
+            .map_err(|error| Refusal::new("git-output-not-utf8", error.to_string()))
+    }
+
+    /// Refuse ancestry questions while a graft file can rewrite the answer.
+    fn require_no_grafts(repository: &Path) -> Result<(), Refusal> {
+        let grafts = Self::absolute_git_path(repository, "--git-common-dir")?.join("info/grafts");
+        if Self::path_exists(&grafts)? {
+            return Err(Refusal::new(
+                "git-grafts-present",
+                format!(
+                    "{} can rewrite ancestry and must be removed before recovery proof",
+                    grafts.display()
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     fn validate_object_id(object: &str) -> Result<(), Refusal> {
         if !matches!(object.len(), 40 | 64) || !object.bytes().all(|byte| byte.is_ascii_hexdigit())
         {
@@ -564,16 +605,7 @@ impl GitPort for ProcessGit {
 
     fn recovery_refs(&self, repository: &Path, head: &str) -> Result<Vec<String>, Refusal> {
         Self::validate_object_id(head)?;
-        let grafts = Self::absolute_git_path(repository, "--git-common-dir")?.join("info/grafts");
-        if Self::path_exists(&grafts)? {
-            return Err(Refusal::new(
-                "git-grafts-present",
-                format!(
-                    "{} can rewrite ancestry and must be removed before recovery proof",
-                    grafts.display()
-                ),
-            ));
-        }
+        Self::require_no_grafts(repository)?;
         if !Self::commitish_exists(repository, head)? {
             return Err(Refusal::new(
                 "invalid-recovery-head",
@@ -610,6 +642,30 @@ impl GitPort for ProcessGit {
         refs.sort();
         refs.dedup();
         Ok(refs)
+    }
+
+    fn containing_refs(
+        &self,
+        repository: &Path,
+        head: &str,
+    ) -> Result<Option<Vec<String>>, Refusal> {
+        Self::validate_object_id(head)?;
+        Self::require_no_grafts(repository)?;
+        if !Self::commitish_exists(repository, head)? {
+            return Ok(None);
+        }
+        let mut refs = Self::containment_output(
+            repository,
+            ["for-each-ref", "--format=%(refname)", "--contains", head],
+        )?
+        .lines()
+        .map(str::trim)
+        .filter(|reference| !reference.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+        refs.sort();
+        refs.dedup();
+        Ok(Some(refs))
     }
 
     fn remove(&self, repository: &Path, worktree: &Path) -> Result<(), Refusal> {
@@ -1217,6 +1273,87 @@ mod tests {
             head
         );
         assert!(recovery_refs.is_empty());
+    }
+
+    #[test]
+    fn containing_refs_separates_a_held_commit_from_an_unreferenced_one() {
+        let (_temporary, repository, _remote) = repository_with_remote();
+        let head = commit_change(&repository, "local work\n", "local work");
+        git(
+            &repository,
+            &[
+                OsStr::new("branch"),
+                OsStr::new("wave/hardening"),
+                OsStr::new(head.as_str()),
+            ],
+        );
+
+        // Local branches still hold it, even though no remote advertises it.
+        assert!(
+            ProcessGit
+                .recovery_refs(&repository, &head)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            ProcessGit.containing_refs(&repository, &head).unwrap(),
+            Some(vec![
+                "refs/heads/main".to_owned(),
+                "refs/heads/wave/hardening".to_owned(),
+            ])
+        );
+
+        // Detach and drop every ref: the object survives with nothing pointing at it.
+        git(
+            &repository,
+            &[
+                OsStr::new("checkout"),
+                OsStr::new("--detach"),
+                OsStr::new("origin/main"),
+            ],
+        );
+        git(
+            &repository,
+            &[
+                OsStr::new("branch"),
+                OsStr::new("-D"),
+                OsStr::new("wave/hardening"),
+            ],
+        );
+        git(
+            &repository,
+            &[OsStr::new("branch"), OsStr::new("-D"), OsStr::new("main")],
+        );
+        assert_eq!(
+            ProcessGit.containing_refs(&repository, &head).unwrap(),
+            Some(Vec::new())
+        );
+
+        // An id Git holds no object for is reported as absent rather than as an error.
+        assert_eq!(
+            ProcessGit
+                .containing_refs(&repository, &"0".repeat(head.len()))
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn containing_refs_refuses_while_grafts_can_rewrite_ancestry() {
+        let (_temporary, repository, _remote) = repository_with_remote();
+        let head = commit_change(&repository, "grafted\n", "grafted");
+        let common_dir = ProcessGit::absolute_git_path(&repository, "--git-common-dir").unwrap();
+        let grafts = common_dir.join("info/grafts");
+        std::fs::create_dir_all(grafts.parent().unwrap()).unwrap();
+        std::fs::write(&grafts, format!("{head} {head}\n")).unwrap();
+
+        assert_eq!(
+            ProcessGit
+                .containing_refs(&repository, &head)
+                .unwrap_err()
+                .code,
+            "git-grafts-present"
+        );
     }
 
     #[test]

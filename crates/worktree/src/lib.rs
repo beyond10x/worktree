@@ -1,10 +1,10 @@
 //! Embeddable lifecycle service. The policy engine depends only on injected ports.
 
 use b10x_worktree_domain::{
-    CleanupAssessment, CreatePlan, CreateRequest, DiscoveredWorktree, Lifecycle, OperationEvidence,
-    ReconciliationAction, ReconciliationAssessment, RecoveryProof, Refusal, RelocationIntent,
-    RemovalIntent, RepositorySnapshot, WorkspacePolicy, WorktreeId, WorktreeRecord,
-    WorktreeSnapshot, require_child,
+    CleanupAssessment, CreatePlan, CreateRequest, DiscoveredWorktree, GitRevision, Lifecycle,
+    OperationEvidence, ReconciliationAction, ReconciliationAssessment, RecoveryProof, Refusal,
+    RelocationIntent, RemovalIntent, RepositorySnapshot, WorkspacePolicy, WorktreeId,
+    WorktreeRecord, WorktreeSnapshot, require_child,
 };
 use std::path::{Path, PathBuf};
 
@@ -47,6 +47,16 @@ pub trait GitPort: Send + Sync {
     fn create_detached(&self, plan: &CreatePlan) -> Result<(), Refusal>;
     /// Refresh advertisements and return exact remote refs containing the commit.
     fn recovery_refs(&self, repository: &Path, head: &str) -> Result<Vec<String>, Refusal>;
+    /// Return every local ref - branch, tag, or remote-tracking - that contains the commit.
+    ///
+    /// Reports `None` when this repository holds no such commit object at all. It reads only
+    /// local state, so it answers "is anything still pointing at this?" rather than proving
+    /// recovery; pair it with [`GitPort::recovery_refs`] when fresh remote evidence is required.
+    fn containing_refs(
+        &self,
+        repository: &Path,
+        head: &str,
+    ) -> Result<Option<Vec<String>>, Refusal>;
     /// Remove a linked worktree without forcing Git.
     fn remove(&self, repository: &Path, worktree: &Path) -> Result<(), Refusal>;
     /// Move a linked worktree without forcing Git.
@@ -395,12 +405,19 @@ where
     ///
     /// An empty selection assesses every candidate in the activated workspace. Apply callers
     /// should pass the exact ids reviewed in a preceding dry-run.
+    ///
+    /// `unrecoverable` carries one acknowledgement per commit an operator asserts is gone for
+    /// good, which is the only way a missing record with no durable removal intent and no remote
+    /// recovery proof can be tombstoned. Each acknowledgement is still checked against Git and is
+    /// refused while any ref contains the commit; it grants no deletion, because a record reached
+    /// this way has no tree left to delete.
     pub fn reconcile(
         &self,
         policy: &WorkspacePolicy,
         selected_ids: &[WorktreeId],
         apply: bool,
         allow_external_retirement: bool,
+        unrecoverable: &[GitRevision],
     ) -> Result<Vec<ReconciliationAssessment>, Refusal> {
         require_canonical_policy(policy)?;
         if apply && selected_ids.is_empty() {
@@ -422,7 +439,13 @@ where
             let Some(action) = self.reconciliation_action(policy, &record)? else {
                 continue;
             };
-            let assessment = self.assess_reconciliation(policy, &record, &action, self.clock.now());
+            let assessment = self.assess_reconciliation(
+                policy,
+                &record,
+                &action,
+                unrecoverable,
+                self.clock.now(),
+            );
             planned.push((record, action, assessment));
         }
         if apply {
@@ -446,6 +469,7 @@ where
                 "retiring a finished tree outside the managed root requires explicit confirmation",
             ));
         }
+        require_matched_acknowledgements(&planned, unrecoverable)?;
 
         let mut assessments = Vec::with_capacity(planned.len());
         for (record, action, assessment) in planned {
@@ -463,6 +487,7 @@ where
                         &record,
                         &action,
                         recovery,
+                        unrecoverable,
                         self.clock.now(),
                     ) {
                         Ok(evidence) => assessments.push(ReconciliationAssessment {
@@ -729,6 +754,7 @@ where
         policy: &WorkspacePolicy,
         record: &WorktreeRecord,
         action: &ReconciliationAction,
+        unrecoverable: &[GitRevision],
         now: i64,
     ) -> Result<Option<RecoveryProof>, Refusal> {
         self.require_idle(record, now)?;
@@ -743,7 +769,7 @@ where
                 self.assess_external_retirement(policy, record, path, now)
             }
             ReconciliationAction::TombstoneMissing { path } => {
-                self.assess_missing(policy, record, path, now)
+                self.assess_missing(policy, record, path, unrecoverable, now)
             }
         }
     }
@@ -972,6 +998,7 @@ where
         policy: &WorkspacePolicy,
         record: &WorktreeRecord,
         path: &Path,
+        unrecoverable: &[GitRevision],
         now: i64,
     ) -> Result<Option<RecoveryProof>, Refusal> {
         if !path_absent(path)? {
@@ -989,55 +1016,39 @@ where
         }
         let removal = self.registry.removal(record.id.as_str())?;
         if let Some(relocation) = self.registry.relocation(record.id.as_str())? {
-            if record.lifecycle != Lifecycle::Finished
-                || path != record.path
-                || path.starts_with(&policy.worktree_root)
-                || relocation.from != *path
-            {
-                return Err(Refusal::new(
-                    "invalid-external-retirement-recovery",
-                    "stale relocation recovery requires its exact finished external source",
-                ));
-            }
-            require_canonical_child(&policy.worktree_root, &relocation.to)?;
-            if discovered.iter().any(|item| item.path == relocation.to) {
-                return Err(Refusal::new(
-                    "relocation-destination-exists",
-                    "pending relocation destination is still registered by Git",
-                ));
-            }
-            if !path_absent(&relocation.to)? {
-                return Err(Refusal::new(
-                    "relocation-destination-exists",
-                    "pending relocation destination still exists on disk",
-                ));
-            }
-            let intent = removal.ok_or_else(|| {
-                Refusal::new(
-                    "missing-retirement-intent",
-                    "an absent external relocation source requires durable removal proof",
-                )
-            })?;
-            if intent.operation != "retire-external"
-                || intent.path != *path
-                || intent.head != intent.recovery.head
-                || intent.head != relocation.head
-                || record.head.as_deref() != Some(relocation.head.as_str())
-            {
-                return Err(Refusal::new(
-                    "removal-relocation-mismatch",
-                    "external removal proof must match the relocation source and every recorded HEAD",
-                ));
-            }
-            return Ok(Some(intent.recovery));
+            return assess_stale_external_relocation(
+                policy,
+                record,
+                path,
+                &discovered,
+                &relocation,
+                removal,
+            )
+            .map(Some);
         }
         if matches!(record.lifecycle, Lifecycle::Active | Lifecycle::Relocating)
             && removal.is_none()
         {
-            return Err(Refusal::new(
-                "missing-active-worktree",
-                "an active or relocating worktree disappeared without durable removal intent",
-            ));
+            let Some(head) = record.head.as_deref() else {
+                return Err(Refusal::new(
+                    "missing-active-worktree",
+                    "an active or relocating worktree disappeared without durable removal intent, \
+                     and its record holds no commit that could be assessed",
+                ));
+            };
+            if !acknowledges(unrecoverable, head) {
+                return Err(Refusal::new(
+                    "missing-active-worktree",
+                    abandonment_guidance(
+                        "an active or relocating worktree disappeared without durable removal \
+                         intent",
+                        record,
+                        head,
+                    ),
+                ));
+            }
+            self.assess_abandonment(record, head)?;
+            return Ok(None);
         }
         if let Some(intent) = removal {
             if intent.path != *path || intent.head != intent.recovery.head {
@@ -1061,8 +1072,39 @@ where
                 ))
             };
         };
+        if acknowledges(unrecoverable, head) {
+            self.assess_abandonment(record, head)?;
+            return Ok(None);
+        }
         self.recovery_proof(&record.repository_root, head, now)
             .map(Some)
+            .map_err(|refusal| {
+                if refusal.code == "no-remote-recovery-proof" {
+                    Refusal::new(
+                        refusal.code,
+                        abandonment_guidance(&refusal.message, record, head),
+                    )
+                } else {
+                    refusal
+                }
+            })
+    }
+
+    /// Assess an operator's assertion that a missing record's recorded commit is gone for good.
+    ///
+    /// This produces no [`RecoveryProof`], because there is nothing recoverable to prove, and it
+    /// deletes nothing: the tree is already absent and every ref is left exactly as it is. It
+    /// succeeds only while this repository can still corroborate the assertion - Git holds no
+    /// such object at all, or holds it with no local branch, tag or remote-tracking ref pointing
+    /// at it and no remote advertising it. Any surviving ref, and any observation that is offline
+    /// or otherwise ambiguous, is a refusal.
+    fn assess_abandonment(&self, record: &WorktreeRecord, head: &str) -> Result<(), Refusal> {
+        let Some(local) = self.git.containing_refs(&record.repository_root, head)? else {
+            return Ok(());
+        };
+        require_no_containing_refs(head, &local)?;
+        let advertised = self.git.recovery_refs(&record.repository_root, head)?;
+        require_no_containing_refs(head, &advertised)
     }
 
     fn apply_reconciliation(
@@ -1071,9 +1113,10 @@ where
         record: &WorktreeRecord,
         action: &ReconciliationAction,
         _recovery: Option<RecoveryProof>,
+        unrecoverable: &[GitRevision],
         now: i64,
     ) -> Result<OperationEvidence, Refusal> {
-        let recovery = self.assess_reconciliation(policy, record, action, now)?;
+        let recovery = self.assess_reconciliation(policy, record, action, unrecoverable, now)?;
         match action {
             ReconciliationAction::RecoverProvisioning { path } => {
                 let snapshot = self.exact_worktree_snapshot(&record.repository_root, path)?;
@@ -1115,8 +1158,19 @@ where
                     .map(|intent| intent.head.clone())
                     .or_else(|| recovery.as_ref().map(|proof| proof.head.clone()))
                     .or_else(|| record.head.clone());
+                // An abandonment carries no recovery proof by construction, so it is recorded
+                // under its own operation rather than being filed as an ordinary reconciliation.
+                let abandoned = pending.is_none()
+                    && recovery.is_none()
+                    && head
+                        .as_deref()
+                        .is_some_and(|head| acknowledges(unrecoverable, head));
                 let evidence = OperationEvidence {
-                    operation: "reconcile-missing".into(),
+                    operation: if abandoned {
+                        "reconcile-abandoned".into()
+                    } else {
+                        "reconcile-missing".into()
+                    },
                     id: record.id.clone(),
                     path: path.clone(),
                     head,
@@ -1381,6 +1435,121 @@ fn path_absent(path: &Path) -> Result<bool, Refusal> {
     }
 }
 
+/// Finish a pre-0.3 relocation whose finished external source is already absent.
+fn assess_stale_external_relocation(
+    policy: &WorkspacePolicy,
+    record: &WorktreeRecord,
+    path: &Path,
+    discovered: &[DiscoveredWorktree],
+    relocation: &RelocationIntent,
+    removal: Option<RemovalIntent>,
+) -> Result<RecoveryProof, Refusal> {
+    if record.lifecycle != Lifecycle::Finished
+        || path != record.path
+        || path.starts_with(&policy.worktree_root)
+        || relocation.from != *path
+    {
+        return Err(Refusal::new(
+            "invalid-external-retirement-recovery",
+            "stale relocation recovery requires its exact finished external source",
+        ));
+    }
+    require_canonical_child(&policy.worktree_root, &relocation.to)?;
+    if discovered.iter().any(|item| item.path == relocation.to) {
+        return Err(Refusal::new(
+            "relocation-destination-exists",
+            "pending relocation destination is still registered by Git",
+        ));
+    }
+    if !path_absent(&relocation.to)? {
+        return Err(Refusal::new(
+            "relocation-destination-exists",
+            "pending relocation destination still exists on disk",
+        ));
+    }
+    let intent = removal.ok_or_else(|| {
+        Refusal::new(
+            "missing-retirement-intent",
+            "an absent external relocation source requires durable removal proof",
+        )
+    })?;
+    if intent.operation != "retire-external"
+        || intent.path != *path
+        || intent.head != intent.recovery.head
+        || intent.head != relocation.head
+        || record.head.as_deref() != Some(relocation.head.as_str())
+    {
+        return Err(Refusal::new(
+            "removal-relocation-mismatch",
+            "external removal proof must match the relocation source and every recorded HEAD",
+        ));
+    }
+    Ok(intent.recovery)
+}
+
+/// One planned reconciliation: the record, the proposed action, and its current assessment.
+type PlannedReconciliation = (
+    WorktreeRecord,
+    ReconciliationAction,
+    Result<Option<RecoveryProof>, Refusal>,
+);
+
+/// Refuse an acknowledgement that no reviewed missing record actually carries.
+///
+/// A copy-pasted or stale assertion must not silently apply to some other record.
+fn require_matched_acknowledgements(
+    planned: &[PlannedReconciliation],
+    unrecoverable: &[GitRevision],
+) -> Result<(), Refusal> {
+    for acknowledged in unrecoverable {
+        if !planned.iter().any(|(record, action, _)| {
+            matches!(action, ReconciliationAction::TombstoneMissing { .. })
+                && record.head.as_deref() == Some(acknowledged.as_str())
+        }) {
+            return Err(Refusal::new(
+                "unmatched-unrecoverable-acknowledgement",
+                format!(
+                    "no reviewed missing record records commit {}",
+                    acknowledged.as_str()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Whether an operator explicitly asserted that this exact commit is unrecoverable.
+fn acknowledges(unrecoverable: &[GitRevision], head: &str) -> bool {
+    unrecoverable
+        .iter()
+        .any(|acknowledged| acknowledged.as_str() == head)
+}
+
+/// Refuse an abandonment while anything still points at the commit it would forget.
+fn require_no_containing_refs(head: &str, refs: &[String]) -> Result<(), Refusal> {
+    if refs.is_empty() {
+        return Ok(());
+    }
+    Err(Refusal::new(
+        "recorded-commit-still-reachable",
+        format!(
+            "commit {head} is still reachable from {}, so it is not unrecoverable; reconcile the \
+             record without the acknowledgement once that work is published",
+            refs.join(", ")
+        ),
+    ))
+}
+
+/// Say how to resolve a missing record that currently has no recoverable evidence.
+fn abandonment_guidance(reason: &str, record: &WorktreeRecord, head: &str) -> String {
+    format!(
+        "{reason}; if commit {head} still exists anywhere, publish it and rerun the dry-run, and \
+         only once you have established that it is gone for good abandon the record with \
+         `worktree reconcile --apply --id {} --acknowledge-unrecoverable {head}`",
+        record.id.as_str()
+    )
+}
+
 fn validate_selected_records(
     policy: &WorkspacePolicy,
     records: &[WorktreeRecord],
@@ -1555,7 +1724,7 @@ mod tests {
     use super::*;
     use std::collections::{BTreeMap, VecDeque};
     use std::sync::Mutex;
-    use tempfile::tempdir;
+    use tempfile::{TempDir, tempdir};
 
     struct FixedClock;
 
@@ -1571,6 +1740,7 @@ mod tests {
         discovered: Mutex<Vec<DiscoveredWorktree>>,
         discovered_sequence: Mutex<VecDeque<Vec<DiscoveredWorktree>>>,
         recoverable: bool,
+        containment: Mutex<BTreeMap<String, Vec<String>>>,
         resolved_revision: Mutex<Option<String>>,
         fail_remove: bool,
         snapshot_sequence: Mutex<VecDeque<String>>,
@@ -1624,6 +1794,16 @@ mod tests {
             } else {
                 Vec::new()
             })
+        }
+
+        fn containing_refs(
+            &self,
+            _repository: &Path,
+            head: &str,
+        ) -> Result<Option<Vec<String>>, Refusal> {
+            // An absent entry means Git holds no such object; an empty entry means the object
+            // survives with nothing pointing at it.
+            Ok(self.containment.lock().unwrap().get(head).cloned())
         }
 
         fn remove(&self, _repository: &Path, worktree: &Path) -> Result<(), Refusal> {
@@ -1909,6 +2089,7 @@ mod tests {
             discovered: Mutex::new(Vec::new()),
             discovered_sequence: Mutex::new(VecDeque::new()),
             recoverable: true,
+            containment: Mutex::new(BTreeMap::new()),
             resolved_revision: Mutex::new(None),
             fail_remove: false,
             snapshot_sequence: Mutex::new(VecDeque::new()),
@@ -2032,6 +2213,7 @@ mod tests {
                     primary: false,
                 }]),
                 recoverable: true,
+                containment: Mutex::new(BTreeMap::new()),
                 resolved_revision: Mutex::new(None),
                 fail_remove: false,
                 snapshot_sequence: Mutex::new(VecDeque::new()),
@@ -2055,7 +2237,13 @@ mod tests {
         };
 
         let assessments = manager
-            .reconcile(&policy, std::slice::from_ref(&registered.id), true, false)
+            .reconcile(
+                &policy,
+                std::slice::from_ref(&registered.id),
+                true,
+                false,
+                &[],
+            )
             .unwrap();
         assert!(assessments[0].eligible);
         assert!(assessments[0].evidence.is_some());
@@ -2088,6 +2276,7 @@ mod tests {
                 snapshots: Mutex::new(BTreeMap::new()),
                 discovered: Mutex::new(Vec::new()),
                 recoverable: true,
+                containment: Mutex::new(BTreeMap::new()),
                 resolved_revision: Mutex::new(None),
                 fail_remove: false,
                 snapshot_sequence: Mutex::new(VecDeque::new()),
@@ -2103,7 +2292,13 @@ mod tests {
         );
 
         let assessments = manager
-            .reconcile(&policy, std::slice::from_ref(&registered.id), true, false)
+            .reconcile(
+                &policy,
+                std::slice::from_ref(&registered.id),
+                true,
+                false,
+                &[],
+            )
             .unwrap();
         assert_eq!(
             assessments[0].evidence.as_ref().unwrap().operation,
@@ -2284,13 +2479,218 @@ mod tests {
                 std::slice::from_ref(&registered.id),
                 false,
                 false,
+                &[],
             )
             .unwrap();
         assert_eq!(assessments.len(), 1);
         assert!(!assessments[0].eligible);
+        let refusal = assessments[0].refusal.as_ref().unwrap();
+        assert_eq!(refusal.code, "missing-active-worktree");
+        // The refusal has to say what to do about it, not only that it refuses.
+        assert!(refusal.message.contains("publish it and rerun the dry-run"));
+        assert!(
+            refusal.message.contains("--acknowledge-unrecoverable abc"),
+            "{}",
+            refusal.message
+        );
+        assert!(refusal.message.contains("--id missing-active"));
+    }
+
+    /// One missing Active record whose recorded commit survives nowhere.
+    fn abandoned_fixture(
+        temporary: &TempDir,
+        containment: Option<Vec<String>>,
+        recoverable: bool,
+    ) -> (
+        WorktreeManager<FakeGit, FakeRegistry, FixedClock>,
+        WorkspacePolicy,
+        WorktreeRecord,
+    ) {
+        let workspace = temporary.path().join("workspace");
+        let repository = workspace.join("repo");
+        let managed_root = temporary.path().join("managed");
+        std::fs::create_dir_all(&repository).unwrap();
+        let registered = named_record(
+            "missing-active",
+            repository.clone(),
+            managed_root.join("repo/missing-active"),
+            Lifecycle::Active,
+        );
+        let git = FakeGit {
+            recoverable,
+            containment: Mutex::new(
+                containment
+                    .into_iter()
+                    .map(|refs| ("abc".to_owned(), refs))
+                    .collect(),
+            ),
+            ..fake_git(repository)
+        };
+        let manager =
+            WorktreeManager::new(git, fake_registry(vec![registered.clone()]), FixedClock);
+        (manager, policy(workspace, managed_root), registered)
+    }
+
+    #[test]
+    fn acknowledged_unrecoverable_commit_abandons_a_missing_active_record() {
+        let temporary = tempdir().unwrap();
+        // The object survives with nothing pointing at it, and no remote advertises it.
+        let (manager, policy, registered) = abandoned_fixture(&temporary, Some(Vec::new()), false);
+        let acknowledgement = [GitRevision::new("abc").unwrap()];
+
+        let assessments = manager
+            .reconcile(
+                &policy,
+                std::slice::from_ref(&registered.id),
+                true,
+                false,
+                &acknowledgement,
+            )
+            .unwrap();
+
+        assert_eq!(assessments.len(), 1);
+        assert!(assessments[0].eligible, "{:?}", assessments[0].refusal);
+        let evidence = assessments[0].evidence.as_ref().unwrap();
+        assert_eq!(evidence.operation, "reconcile-abandoned");
+        assert_eq!(evidence.head.as_deref(), Some("abc"));
+        // Nothing is proven, so nothing is claimed: no fabricated recovery evidence.
+        assert!(evidence.recovery.is_none());
+        assert_eq!(
+            manager.registry().list().unwrap()[0].lifecycle,
+            Lifecycle::Removed
+        );
+    }
+
+    #[test]
+    fn acknowledged_commit_absent_from_the_object_database_is_abandoned() {
+        let temporary = tempdir().unwrap();
+        // Git cannot resolve the commit at all; there is nothing left to lose.
+        let (manager, policy, registered) = abandoned_fixture(&temporary, None, false);
+
+        let assessments = manager
+            .reconcile(
+                &policy,
+                std::slice::from_ref(&registered.id),
+                true,
+                false,
+                &[GitRevision::new("abc").unwrap()],
+            )
+            .unwrap();
+
+        assert!(assessments[0].eligible, "{:?}", assessments[0].refusal);
+        assert_eq!(
+            assessments[0].evidence.as_ref().unwrap().operation,
+            "reconcile-abandoned"
+        );
+    }
+
+    #[test]
+    fn acknowledgement_is_refused_while_a_local_ref_still_contains_the_commit() {
+        let temporary = tempdir().unwrap();
+        let (manager, policy, registered) = abandoned_fixture(
+            &temporary,
+            Some(vec!["refs/heads/wave/hardening".to_owned()]),
+            false,
+        );
+
+        let assessments = manager
+            .reconcile(
+                &policy,
+                std::slice::from_ref(&registered.id),
+                true,
+                false,
+                &[GitRevision::new("abc").unwrap()],
+            )
+            .unwrap();
+
+        assert!(!assessments[0].eligible);
+        let refusal = assessments[0].refusal.as_ref().unwrap();
+        assert_eq!(refusal.code, "recorded-commit-still-reachable");
+        assert!(
+            refusal.message.contains("refs/heads/wave/hardening"),
+            "{}",
+            refusal.message
+        );
+        assert!(assessments[0].evidence.is_none());
+        assert_eq!(
+            manager.registry().list().unwrap()[0].lifecycle,
+            Lifecycle::Active
+        );
+    }
+
+    #[test]
+    fn acknowledgement_is_refused_while_a_remote_still_advertises_the_commit() {
+        let temporary = tempdir().unwrap();
+        // No local ref holds it, but a remote does: the ordinary tombstone applies instead.
+        let (manager, policy, registered) = abandoned_fixture(&temporary, Some(Vec::new()), true);
+
+        let assessments = manager
+            .reconcile(
+                &policy,
+                std::slice::from_ref(&registered.id),
+                true,
+                false,
+                &[GitRevision::new("abc").unwrap()],
+            )
+            .unwrap();
+
+        assert!(!assessments[0].eligible);
+        assert_eq!(
+            assessments[0].refusal.as_ref().unwrap().code,
+            "recorded-commit-still-reachable"
+        );
+        assert_eq!(
+            manager.registry().list().unwrap()[0].lifecycle,
+            Lifecycle::Active
+        );
+    }
+
+    #[test]
+    fn abandonment_requires_reviewed_ids_and_a_matching_acknowledgement() {
+        let temporary = tempdir().unwrap();
+        let (manager, policy, registered) = abandoned_fixture(&temporary, Some(Vec::new()), false);
+        let acknowledgement = [GitRevision::new("abc").unwrap()];
+
+        // Without the exact ids a preceding dry-run named, there is nothing reviewed to apply.
+        assert_eq!(
+            manager
+                .reconcile(&policy, &[], true, false, &acknowledgement)
+                .unwrap_err()
+                .code,
+            "explicit-reconciliation-selection-required"
+        );
+        // An acknowledgement that names no reviewed missing record is refused outright.
+        assert_eq!(
+            manager
+                .reconcile(
+                    &policy,
+                    std::slice::from_ref(&registered.id),
+                    true,
+                    false,
+                    &[GitRevision::new("0123456789").unwrap()],
+                )
+                .unwrap_err()
+                .code,
+            "unmatched-unrecoverable-acknowledgement"
+        );
+        // Without any acknowledgement the record stays exactly as stuck as it was.
+        let assessments = manager
+            .reconcile(
+                &policy,
+                std::slice::from_ref(&registered.id),
+                true,
+                false,
+                &[],
+            )
+            .unwrap();
+        assert!(!assessments[0].eligible);
         assert_eq!(
             assessments[0].refusal.as_ref().unwrap().code,
             "missing-active-worktree"
+        );
+        assert_eq!(
+            manager.registry().list().unwrap()[0].lifecycle,
+            Lifecycle::Active
         );
     }
 
@@ -2335,6 +2735,7 @@ mod tests {
                 std::slice::from_ref(&registered.id),
                 true,
                 false,
+                &[],
             )
             .unwrap();
         assert!(assessments[0].eligible);
@@ -2422,7 +2823,7 @@ mod tests {
             WorktreeManager::new(git, fake_registry(vec![provisioning, failed]), FixedClock);
 
         let assessments = manager
-            .reconcile(&policy(workspace, managed_root), &ids, true, false)
+            .reconcile(&policy(workspace, managed_root), &ids, true, false, &[])
             .unwrap();
         assert_eq!(assessments.len(), 2);
         assert!(assessments.iter().all(|assessment| {
@@ -2902,7 +3303,13 @@ mod tests {
 
         assert_eq!(
             manager
-                .reconcile(&policy, std::slice::from_ref(&registered.id), true, false,)
+                .reconcile(
+                    &policy,
+                    std::slice::from_ref(&registered.id),
+                    true,
+                    false,
+                    &[]
+                )
                 .unwrap_err()
                 .code,
             "external-retirement-confirmation-required"
@@ -2910,7 +3317,13 @@ mod tests {
         assert!(external.exists());
 
         let assessments = manager
-            .reconcile(&policy, std::slice::from_ref(&registered.id), true, true)
+            .reconcile(
+                &policy,
+                std::slice::from_ref(&registered.id),
+                true,
+                true,
+                &[],
+            )
             .unwrap();
         assert_eq!(
             assessments[0].evidence.as_ref().unwrap().operation,
@@ -2968,9 +3381,10 @@ mod tests {
         };
         let manager = WorktreeManager::new(git, registry, FixedClock);
         let policy = policy(workspace, managed_root);
+        let selected = std::slice::from_ref(&registered.id);
 
         let dry_run = manager
-            .reconcile(&policy, std::slice::from_ref(&registered.id), false, false)
+            .reconcile(&policy, selected, false, false, &[])
             .unwrap();
         assert!(matches!(
             dry_run[0].action,
@@ -2980,7 +3394,7 @@ mod tests {
 
         assert_eq!(
             manager
-                .reconcile(&policy, std::slice::from_ref(&registered.id), true, false,)
+                .reconcile(&policy, selected, true, false, &[])
                 .unwrap_err()
                 .code,
             "external-retirement-confirmation-required"
@@ -2995,7 +3409,7 @@ mod tests {
         );
 
         let applied = manager
-            .reconcile(&policy, std::slice::from_ref(&registered.id), true, true)
+            .reconcile(&policy, selected, true, true, &[])
             .unwrap();
         assert_eq!(
             applied[0].evidence.as_ref().unwrap().operation,
@@ -3070,6 +3484,7 @@ mod tests {
                     std::slice::from_ref(&registered.id),
                     false,
                     false,
+                    &[],
                 )
                 .unwrap();
             assert!(!assessments[0].eligible);
@@ -3136,6 +3551,7 @@ mod tests {
                 std::slice::from_ref(&registered.id),
                 false,
                 false,
+                &[],
             )
             .unwrap();
         assert!(matches!(
@@ -3210,6 +3626,7 @@ mod tests {
                     std::slice::from_ref(&registered.id),
                     false,
                     false,
+                    &[],
                 )
                 .unwrap();
             assert!(!assessments[0].eligible);
@@ -3269,7 +3686,13 @@ mod tests {
         let policy = policy(workspace, managed_root);
 
         let applied = manager
-            .reconcile(&policy, std::slice::from_ref(&registered.id), true, true)
+            .reconcile(
+                &policy,
+                std::slice::from_ref(&registered.id),
+                true,
+                true,
+                &[],
+            )
             .unwrap();
         assert!(!applied[0].eligible);
         assert_eq!(
@@ -3302,7 +3725,13 @@ mod tests {
         *manager.git.discovered.lock().unwrap() = vec![target];
 
         let retry = manager
-            .reconcile(&policy, std::slice::from_ref(&registered.id), false, false)
+            .reconcile(
+                &policy,
+                std::slice::from_ref(&registered.id),
+                false,
+                false,
+                &[],
+            )
             .unwrap();
         assert!(!retry[0].eligible);
         assert_eq!(
@@ -3360,6 +3789,7 @@ mod tests {
                 std::slice::from_ref(&registered.id),
                 true,
                 false,
+                &[],
             )
             .unwrap();
         assert!(assessments[0].eligible);
@@ -3419,6 +3849,7 @@ mod tests {
                 std::slice::from_ref(&registered.id),
                 false,
                 false,
+                &[],
             )
             .unwrap();
         assert!(!assessments[0].eligible);

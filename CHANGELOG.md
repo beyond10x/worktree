@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- Add a reviewed path for a missing record whose recorded commit an operator has established is
+  gone for good: `reconcile --apply --id <reviewed-id> --acknowledge-unrecoverable <commit>`
+  tombstones it. The acknowledgement asserts one exact commit named by the immediately preceding
+  dry-run, is refused while any local branch, tag, remote-tracking ref or remote advertisement
+  still contains that commit, is refused when it matches no reviewed missing record, and is
+  refused without `--apply`. It deletes nothing from disk or from Git — the tree is already
+  absent — and records the tombstone as `reconcile-abandoned` with no recovery proof, because
+  there is none.
+- Say in the `missing-active-worktree` and `no-remote-recovery-proof` reconciliation refusals what
+  to do next, naming the commit to publish and the exact command that abandons the record.
+- Add `GitPort::containing_refs`, a local-only observation of every branch, tag and
+  remote-tracking ref containing a commit, distinguishing a commit Git no longer holds at all from
+  one that survives with nothing pointing at it.
+
 ## 0.4.1 — 2026-09-10
 
 - Record the organization release-completion boundary in `AGENTS.md`: an ordinary source release

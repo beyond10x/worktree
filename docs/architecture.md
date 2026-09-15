@@ -100,6 +100,16 @@ freshly reachable from an advertised remote ref. A provisioning or failed record
 when Git already created the exact linked tree, or tombstoned without a HEAD only when no filesystem
 or Git artifact exists.
 
+A record whose stored HEAD is reachable from nothing is otherwise stuck forever, so an operator who
+has established that the commit is gone for good may say so: a reviewed exact-id apply carrying
+`--acknowledge-unrecoverable <commit>` abandons it. The assertion is checked rather than trusted.
+Git must confirm that it holds no such object at all, or holds it with no local branch, tag, or
+remote-tracking ref pointing at it and no remote advertising it; a surviving ref, an offline remote,
+or any other ambiguous observation refuses. Abandonment removes nothing from disk and touches no
+ref, because the tree is already gone, and it records no recovery proof, because it has none. It is
+the one reconciliation outcome with no proof behind it, and it is deliberately reachable only by an
+operator naming the exact commit being given up.
+
 ## Durable state
 
 Activated profiles live under `$XDG_CONFIG_HOME/worktree/config.toml`. The ownership registry,

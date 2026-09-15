@@ -148,6 +148,15 @@ struct ReconcileArgs {
     /// Explicitly permit reviewed retirement of finished trees outside the managed root.
     #[arg(long, requires = "apply")]
     allow_external_retirement: bool,
+    /// Assert that this exact recorded commit is unrecoverable, abandoning the missing record
+    /// that carries it; repeat per reviewed record. Refused while any ref still contains it.
+    #[arg(
+        long = "acknowledge-unrecoverable",
+        value_name = "COMMIT",
+        requires = "apply",
+        conflicts_with = "dry_run"
+    )]
+    unrecoverable: Vec<String>,
     /// Explicitly document dry-run intent.
     #[arg(long)]
     dry_run: bool,
@@ -558,8 +567,15 @@ fn reconcile(args: &ReconcileArgs, json: bool) -> Result<()> {
         load_config(&config_path().map_err(anyhow::Error::new)?).map_err(anyhow::Error::new)?;
     let policy = resolve_policy(&config, &repository.root).map_err(anyhow::Error::new)?;
     let ids = parse_ids(&args.ids)?;
+    let unrecoverable = parse_revisions(&args.unrecoverable)?;
     let assessments = manager()?
-        .reconcile(policy, &ids, args.apply, args.allow_external_retirement)
+        .reconcile(
+            policy,
+            &ids,
+            args.apply,
+            args.allow_external_retirement,
+            &unrecoverable,
+        )
         .map_err(anyhow::Error::new)?;
     emit_success(
         json,
@@ -833,6 +849,13 @@ fn parse_ids(ids: &[String]) -> Result<Vec<WorktreeId>> {
         .collect()
 }
 
+fn parse_revisions(revisions: &[String]) -> Result<Vec<GitRevision>> {
+    revisions
+        .iter()
+        .map(|revision| GitRevision::new(revision.clone()).map_err(anyhow::Error::new))
+        .collect()
+}
+
 fn emit_success<T, F>(json: bool, version: u32, payload: T, human: F) -> Result<()>
 where
     T: Serialize,
@@ -870,7 +893,7 @@ fn install_agent_guidance() -> Result<()> {
         .map(PathBuf::from)
         .context("HOME is not set")?;
     let block = format!(
-        "{GUIDANCE_BEGIN}\n## Managed worktrees\n\nFor repository changes, invoke `$worktree` and use the `worktree` CLI. Create isolated trees with `worktree create`, keep primary checkouts clean, and publish commits before `worktree finish`. Review cleanup with `worktree gc --dry-run`, then pass only exact reviewed ids to `worktree gc --apply --id <id>`. Use `worktree reconcile` for interrupted provisioning, adopted legacy paths, and already-missing records; external retirement additionally requires explicit `--allow-external-retirement`. Never force-remove or manually delete a managed tree.\n{GUIDANCE_END}\n"
+        "{GUIDANCE_BEGIN}\n## Managed worktrees\n\nFor repository changes, invoke `$worktree` and use the `worktree` CLI. Create isolated trees with `worktree create`, keep primary checkouts clean, and publish commits before `worktree finish`. Review cleanup with `worktree gc --dry-run`, then pass only exact reviewed ids to `worktree gc --apply --id <id>`. Use `worktree reconcile` for interrupted provisioning, adopted legacy paths, and already-missing records; external retirement additionally requires explicit `--allow-external-retirement`, and abandoning a missing record whose recorded commit you have established is gone for good additionally requires `--acknowledge-unrecoverable <recorded-commit>`. Never force-remove or manually delete a managed tree.\n{GUIDANCE_END}\n"
     );
     update_managed_block(&home.join(".codex/AGENTS.md"), &block)?;
     update_managed_block(&home.join(".claude/CLAUDE.md"), &block)
@@ -980,7 +1003,8 @@ After verification, preserve the small logs, reports, or deliverables needed for
 - If that dry-run explicitly proposes `retire-external`, confirm that destructive action separately by adding `--allow-external-retirement`; never add it for an unrelated migration or missing-record repair.
 - A finished external legacy tree may supersede a stale migration intent only when the dry-run itself proposes `retire-external`; never reinterpret or bypass a cross-device or ambiguous-relocation refusal.
 - If removal is interrupted while the path still exists, rerun GC dry-run and exact-id apply. If the path is already absent, use reconciliation dry-run and exact-id apply; its durable removal intent can safely finish the recorded transition.
-- A missing Active record without matching durable removal intent must remain refused. Preserve and investigate its registry evidence; never manually tombstone it, delete related state, or fabricate recovery proof.
+- A missing Active record without matching durable removal intent stays refused while its work may still exist. Preserve and investigate its registry evidence; never edit the registry by hand, delete related state, or fabricate recovery proof. If its recorded commit still exists anywhere, publish it and rerun the dry-run.
+- Only once you have established that such a record's recorded commit is gone for good, abandon it with `worktree reconcile --repo <path> --apply --id <reviewed-id> --acknowledge-unrecoverable <recorded-commit>`. That acknowledgement asserts one exact commit named by the immediately preceding dry-run; the command still checks it and refuses while any local branch, tag, remote-tracking ref, or remote advertisement contains it. It deletes nothing from disk or from Git, and records the tombstone with no recovery proof, because there is none to record.
 - Run `worktree doctor --check` for prerequisites and configuration.
 - Only after a human explicitly decides an existing linked tree should become manager-owned, run `worktree repo adopt --repo <primary> --path <linked-tree> --id <stable-id> --purpose <purpose>`. Then review `reconcile --dry-run` and use exact-id apply only if migration is intended.
 
@@ -1105,6 +1129,8 @@ mod tests {
         assert!(markdown.contains("gc --repo <primary> --apply --id <reviewed-id>"));
         assert!(markdown.contains("interrupted provisioning"));
         assert!(markdown.contains("--allow-external-retirement"));
+        assert!(markdown.contains("--acknowledge-unrecoverable <recorded-commit>"));
+        assert!(markdown.contains("gone for good"));
         assert!(interface.contains("$worktree"));
         assert!(interface.contains("Generated by `worktree skill`"));
     }
@@ -1114,6 +1140,44 @@ mod tests {
         assert!(
             Cli::try_parse_from(["worktree", "reconcile", "--allow-external-retirement",]).is_err()
         );
+    }
+
+    #[test]
+    fn unrecoverable_acknowledgement_requires_a_reviewed_apply() {
+        // Without --apply there is no reviewed dry-run behind the assertion.
+        assert!(
+            Cli::try_parse_from([
+                "worktree",
+                "reconcile",
+                "--acknowledge-unrecoverable",
+                "abc",
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "worktree",
+                "reconcile",
+                "--dry-run",
+                "--acknowledge-unrecoverable",
+                "abc",
+            ])
+            .is_err()
+        );
+        let reviewed = Cli::try_parse_from([
+            "worktree",
+            "reconcile",
+            "--apply",
+            "--id",
+            "missing-active",
+            "--acknowledge-unrecoverable",
+            "abc",
+        ])
+        .unwrap();
+        let Command::Reconcile(args) = reviewed.command else {
+            panic!("reconcile command");
+        };
+        assert_eq!(args.unrecoverable, vec!["abc".to_owned()]);
     }
 
     #[test]
