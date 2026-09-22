@@ -1,11 +1,11 @@
 //! Observations for inspection; none of these values authorize removal.
 
-use crate::{Refusal, WorktreeRecord, WorktreeSnapshot};
+use crate::{RecoveryKind, Refusal, WorktreeRecord, WorktreeSnapshot};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 /// A separately versioned report, leaving existing lifecycle envelopes unchanged.
-pub const INSPECTION_FORMAT: &str = "worktree.inspection/1";
+pub const INSPECTION_FORMAT: &str = "worktree.inspection/2";
 
 /// Counts under one immediate child of a checkout, without following symbolic links.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -60,10 +60,14 @@ pub struct InspectionDetails {
 pub enum InspectedRecovery {
     /// No remote observation was requested.
     NotChecked,
-    /// Freshly advertised exact branches or tags contain the observed HEAD.
+    /// Freshly advertised exact refs contain the observed HEAD or carry its unique patches.
     Proven {
+        /// How the refs prove recovery.
+        kind: RecoveryKind,
         /// Exact configured-remote and ref names returned by the Git adapter.
         refs: Vec<String>,
+        /// Commits held by no advertised ref whose patches the proving refs carry.
+        equivalent_commits: Vec<String>,
     },
     /// The advertised refs did not establish recovery of the observed HEAD.
     Unproven,

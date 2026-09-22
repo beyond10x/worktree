@@ -987,7 +987,7 @@ After verification, preserve the small logs, reports, or deliverables needed for
 
 ## Finish and clean up
 
-1. Commit and publish every wanted change. A local-only commit is deliberately not cleanup-safe.
+1. Commit and publish every wanted change. A local-only commit is deliberately not cleanup-safe. Work merged as rebased or cherry-picked copies also qualifies when an advertised ref carries every unique commit's exact patch; GC reports that proof as `patch-equivalent`.
 2. Preserve required evidence and remove this task's disposable output as described above. Release your own lease, then run `worktree finish <tree>`. It refuses dirty, locked, unmanaged, live, or mid-operation Git worktrees.
 3. Run `worktree gc --repo <primary> --dry-run --id <id>` and inspect every result. Without exact ids, `--repo` selects the activated workspace profile, not just the repository: the assessment covers records under that profile's `workspace_root`, including other repositories.
 4. Run `worktree gc --repo <primary> --apply --id <reviewed-id>` with repeated `--id` values only for the exact results intended for removal. The command refreshes remote advertisements, fetches required objects, and revalidates immediately before non-forced removal. Check the result before reporting storage reclaimed.

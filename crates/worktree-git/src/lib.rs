@@ -2,7 +2,8 @@
 
 use b10x_worktree::GitPort;
 use b10x_worktree_domain::{
-    CreatePlan, DiscoveredWorktree, Refusal, RepositorySnapshot, WorktreeSnapshot,
+    CreatePlan, DiscoveredWorktree, RecoveryEvidence, RecoveryKind, Refusal, RepositorySnapshot,
+    WorktreeSnapshot,
 };
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
@@ -11,6 +12,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 mod inspection;
+
+/// Confirmed advertised commits, each mapped to the `remote:ref` names advertising it.
+type AdvertisedTips = BTreeMap<String, Vec<String>>;
 
 /// Process-backed Git port.
 #[derive(Debug, Default, Clone, Copy)]
@@ -358,6 +362,235 @@ impl ProcessGit {
         }
     }
 
+    /// Return the exact advertised refs containing `head`, and every confirmed advertised tip.
+    ///
+    /// A tip is confirmed when the final re-advertisement lists it and its commit is local. The
+    /// tips map each commit to the `remote:ref` names advertising it.
+    fn observe_recovery(
+        repository: &Path,
+        head: &str,
+    ) -> Result<(Vec<String>, AdvertisedTips), Refusal> {
+        Self::validate_object_id(head)?;
+        Self::require_no_grafts(repository)?;
+        if !Self::commitish_exists(repository, head)? {
+            return Err(Refusal::new(
+                "invalid-recovery-head",
+                format!("{head} is not a commit"),
+            ));
+        }
+        let mut refs = Vec::new();
+        let mut tips = AdvertisedTips::new();
+        for remote in Self::remote_names(repository)? {
+            let advertised = Self::advertised_refs(repository, &remote)?;
+            let mut already_proves_recovery = false;
+            let mut missing = BTreeMap::new();
+            for (reference, tip) in &advertised {
+                if Self::commitish_exists(repository, tip)? {
+                    already_proves_recovery |= Self::contains_commit(repository, head, tip)?;
+                } else {
+                    missing.insert(reference.clone(), tip.clone());
+                }
+            }
+            if !already_proves_recovery {
+                Self::fetch_advertised_refs(repository, &remote, &missing)?;
+            }
+
+            // Observation and any fetch are separate protocol transactions. Re-advertise and only
+            // report these final remote facts. A racing update whose object is not available
+            // locally is conservatively ignored.
+            for (reference, tip) in Self::advertised_refs(repository, &remote)? {
+                if !Self::commitish_exists(repository, &tip)? {
+                    continue;
+                }
+                let label = format!("{remote}:{reference}");
+                if Self::contains_commit(repository, head, &tip)? {
+                    refs.push(label.clone());
+                }
+                tips.entry(tip).or_default().push(label);
+            }
+        }
+        refs.sort();
+        refs.dedup();
+        Ok((refs, tips))
+    }
+
+    /// Prove that one advertised tip carries a verbatim patch-identical commit for every commit
+    /// `head` adds over all confirmed tips.
+    ///
+    /// Returns evidence with no refs when nothing proves it. A root, merge or empty commit among
+    /// the unique commits has no single patch another commit could carry, so it defeats the proof.
+    fn patch_equivalence(
+        repository: &Path,
+        head: &str,
+        tips: &AdvertisedTips,
+    ) -> Result<RecoveryEvidence, Refusal> {
+        let unproven = RecoveryEvidence::default();
+        if tips.is_empty() {
+            return Ok(unproven);
+        }
+        let mut unique_range = vec![head.to_owned(), "--not".to_owned()];
+        unique_range.extend(tips.keys().cloned());
+
+        let mut listing = vec!["rev-list".to_owned(), "--parents".to_owned()];
+        listing.extend(unique_range.iter().cloned());
+        let mut unique = Vec::new();
+        for line in Self::containment_output(repository, &listing)?.lines() {
+            let mut fields = line.split_whitespace();
+            let Some(commit) = fields.next() else {
+                continue;
+            };
+            if fields.count() != 1 {
+                return Ok(unproven);
+            }
+            unique.push(commit.to_owned());
+        }
+        if unique.is_empty() {
+            return Ok(unproven);
+        }
+        let unique_ids = Self::verbatim_patch_ids(repository, &unique_range)?;
+        let Some(wanted) = unique
+            .iter()
+            .map(|commit| unique_ids.get(commit).cloned())
+            .collect::<Option<std::collections::BTreeSet<_>>>()
+        else {
+            return Ok(unproven);
+        };
+
+        let mut candidates = tips.iter().collect::<Vec<_>>();
+        candidates.sort_by_key(|(tip, labels)| {
+            let rank = labels
+                .iter()
+                .map(|label| ref_rank(label))
+                .min()
+                .unwrap_or(u8::MAX);
+            (rank, (*tip).clone())
+        });
+        for (tip, labels) in candidates {
+            let symmetric = format!("{tip}...{head}");
+            // Git's own whitespace-insensitive equivalence must hold for every commit on the
+            // HEAD side, merges included, before the stricter verbatim comparison is attempted.
+            let loose = Self::containment_output(
+                repository,
+                [
+                    "rev-list",
+                    "--right-only",
+                    "--cherry-pick",
+                    symmetric.as_str(),
+                ],
+            )?;
+            if !loose.trim().is_empty() {
+                continue;
+            }
+            let carried = Self::verbatim_patch_ids(
+                repository,
+                &[
+                    "--no-merges".to_owned(),
+                    "--left-only".to_owned(),
+                    symmetric,
+                ],
+            )?
+            .into_values()
+            .collect::<std::collections::BTreeSet<_>>();
+            if wanted.is_subset(&carried) {
+                let mut refs = labels.clone();
+                refs.sort();
+                return Ok(RecoveryEvidence {
+                    kind: RecoveryKind::PatchEquivalent,
+                    refs,
+                    equivalent_commits: unique,
+                });
+            }
+        }
+        Ok(unproven)
+    }
+
+    /// Map each commit selected by `revisions` to its whitespace-exact patch id.
+    ///
+    /// A commit with an empty diff has no id and is absent from the map. Binary changes are
+    /// compared by their full binary patch, so two different binary edits never match.
+    fn verbatim_patch_ids(
+        repository: &Path,
+        revisions: &[String],
+    ) -> Result<BTreeMap<String, String>, Refusal> {
+        let disabled_grafts = tempfile::NamedTempFile::new()
+            .map_err(|error| Refusal::new("graft-isolation-failed", error.to_string()))?;
+        let log_errors = tempfile::tempfile()
+            .map_err(|error| Refusal::new("patch-id-failed", error.to_string()))?;
+        let log_stderr = log_errors
+            .try_clone()
+            .map_err(|error| Refusal::new("patch-id-failed", error.to_string()))?;
+        let mut log = Command::new("git")
+            .arg("--no-replace-objects")
+            .arg("-C")
+            .arg(repository)
+            .args([
+                "log",
+                "--patch",
+                "--binary",
+                "--full-index",
+                "--no-color",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--no-renames",
+                "--no-show-signature",
+                "--diff-merges=off",
+                "--src-prefix=a/",
+                "--dst-prefix=b/",
+                "--format=commit %H",
+            ])
+            .args(revisions)
+            .env("GIT_GRAFT_FILE", disabled_grafts.path())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::from(log_stderr))
+            .spawn()
+            .map_err(|error| Refusal::new("git-unavailable", error.to_string()))?;
+        let patch = log
+            .stdout
+            .take()
+            .ok_or_else(|| Refusal::new("patch-id-failed", "git log stdout was unavailable"))?;
+        let ids = Command::new("git")
+            .arg("-C")
+            .arg(repository)
+            .args(["patch-id", "--verbatim"])
+            .stdin(Stdio::from(patch))
+            .output()
+            .map_err(|error| Refusal::new("git-unavailable", error.to_string()));
+        let status = log
+            .wait()
+            .map_err(|error| Refusal::new("patch-id-failed", error.to_string()))?;
+        if !status.success() {
+            let mut message = String::new();
+            let mut errors = log_errors;
+            let _ = std::io::Seek::rewind(&mut errors);
+            let _ = std::io::Read::read_to_string(&mut errors, &mut message);
+            return Err(Refusal::new(
+                "git-command-failed",
+                message.trim().to_owned(),
+            ));
+        }
+        let ids = ids?;
+        if !ids.status.success() {
+            return Err(Refusal::new(
+                "patch-id-failed",
+                String::from_utf8_lossy(&ids.stderr).trim().to_owned(),
+            ));
+        }
+        let output = String::from_utf8(ids.stdout)
+            .map_err(|error| Refusal::new("git-output-not-utf8", error.to_string()))?;
+        let mut map = BTreeMap::new();
+        for line in output.lines() {
+            let Some((patch_id, commit)) = line.split_once(' ') else {
+                return Err(Refusal::new(
+                    "patch-id-failed",
+                    "git patch-id emitted an invalid line",
+                ));
+            };
+            map.insert(commit.trim().to_owned(), patch_id.to_owned());
+        }
+        Ok(map)
+    }
+
     fn absolute_git_path(repository: &Path, argument: &str) -> Result<PathBuf, Refusal> {
         let path = PathBuf::from(
             Self::output(
@@ -479,6 +712,20 @@ impl ProcessGit {
             }
         }
         Ok(false)
+    }
+}
+
+/// Order in which advertised refs are tried as patch-equivalence proof: default branches first.
+fn ref_rank(label: &str) -> u8 {
+    let reference = label
+        .split_once(':')
+        .map_or(label, |(_, reference)| reference);
+    match reference {
+        "refs/heads/main" => 0,
+        "refs/heads/master" => 1,
+        _ if reference.starts_with("refs/heads/") => 2,
+        _ if reference.starts_with("refs/tags/") => 3,
+        _ => 4,
     }
 }
 
@@ -604,44 +851,19 @@ impl GitPort for ProcessGit {
     }
 
     fn recovery_refs(&self, repository: &Path, head: &str) -> Result<Vec<String>, Refusal> {
-        Self::validate_object_id(head)?;
-        Self::require_no_grafts(repository)?;
-        if !Self::commitish_exists(repository, head)? {
-            return Err(Refusal::new(
-                "invalid-recovery-head",
-                format!("{head} is not a commit"),
-            ));
-        }
-        let mut refs = Vec::new();
-        for remote in Self::remote_names(repository)? {
-            let advertised = Self::advertised_refs(repository, &remote)?;
-            let mut already_proves_recovery = false;
-            let mut missing = BTreeMap::new();
-            for (reference, tip) in &advertised {
-                if Self::commitish_exists(repository, tip)? {
-                    already_proves_recovery |= Self::contains_commit(repository, head, tip)?;
-                } else {
-                    missing.insert(reference.clone(), tip.clone());
-                }
-            }
-            if !already_proves_recovery {
-                Self::fetch_advertised_refs(repository, &remote, &missing)?;
-            }
+        Self::observe_recovery(repository, head).map(|(refs, _)| refs)
+    }
 
-            // Observation and any fetch are separate protocol transactions. Re-advertise and only
-            // report these final remote facts. A racing update whose object is not available
-            // locally is conservatively ignored.
-            for (reference, tip) in Self::advertised_refs(repository, &remote)? {
-                if Self::commitish_exists(repository, &tip)?
-                    && Self::contains_commit(repository, head, &tip)?
-                {
-                    refs.push(format!("{remote}:{reference}"));
-                }
-            }
+    fn recovery_evidence(
+        &self,
+        repository: &Path,
+        head: &str,
+    ) -> Result<RecoveryEvidence, Refusal> {
+        let (refs, tips) = Self::observe_recovery(repository, head)?;
+        if !refs.is_empty() {
+            return Ok(RecoveryEvidence::ancestor(refs));
         }
-        refs.sort();
-        refs.dedup();
-        Ok(refs)
+        Self::patch_equivalence(repository, head, &tips)
     }
 
     fn containing_refs(
@@ -1513,5 +1735,209 @@ mod tests {
             vec!["origin:refs/heads/main"]
         );
         assert!(ProcessGit::commitish_exists(&repository, &remote_tip).unwrap());
+    }
+
+    fn run(repository: &Path, args: &[&str]) -> String {
+        let args = args.iter().map(OsStr::new).collect::<Vec<_>>();
+        git(repository, &args).trim().to_owned()
+    }
+
+    fn commit_file(repository: &Path, path: &str, contents: &str, message: &str) -> String {
+        std::fs::write(repository.join(path), contents).unwrap();
+        run(repository, &["add", path]);
+        run(repository, &["commit", "-m", message]);
+        run(repository, &["rev-parse", "HEAD"])
+    }
+
+    /// Branch `feature` from the pushed main, then move main past the branch point.
+    fn diverged_feature() -> (TempDir, PathBuf) {
+        let (temporary, repository, _remote) = repository_with_remote();
+        run(&repository, &["switch", "-c", "feature"]);
+        commit_file(&repository, "first", "first\n", "first unit commit");
+        commit_file(&repository, "second", "second\n", "second unit commit");
+        run(&repository, &["switch", "main"]);
+        commit_file(
+            &repository,
+            "unrelated",
+            "unrelated\n",
+            "unrelated main commit",
+        );
+        (temporary, repository)
+    }
+
+    fn feature_head(repository: &Path) -> String {
+        run(repository, &["rev-parse", "feature"])
+    }
+
+    #[test]
+    fn rebased_work_on_main_is_patch_equivalent_recovery() {
+        let (_temporary, repository) = diverged_feature();
+        run(&repository, &["cherry-pick", "main..feature"]);
+        run(&repository, &["push", "origin", "main"]);
+        let head = feature_head(&repository);
+
+        assert!(
+            ProcessGit
+                .recovery_refs(&repository, &head)
+                .unwrap()
+                .is_empty()
+        );
+        let evidence = ProcessGit.recovery_evidence(&repository, &head).unwrap();
+        assert_eq!(evidence.kind, RecoveryKind::PatchEquivalent);
+        assert_eq!(evidence.refs, vec!["origin:refs/heads/main"]);
+        let mut expected = run(&repository, &["rev-list", "main..feature"])
+            .lines()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let mut observed = evidence.equivalent_commits;
+        expected.sort();
+        observed.sort();
+        assert_eq!(observed, expected);
+    }
+
+    #[test]
+    fn exact_ancestry_still_reports_ancestor_proof() {
+        let (_temporary, repository) = diverged_feature();
+        run(&repository, &["push", "origin", "feature"]);
+        let head = feature_head(&repository);
+
+        let evidence = ProcessGit.recovery_evidence(&repository, &head).unwrap();
+        assert_eq!(evidence.kind, RecoveryKind::Ancestor);
+        assert_eq!(evidence.refs, vec!["origin:refs/heads/feature"]);
+        assert!(evidence.equivalent_commits.is_empty());
+    }
+
+    #[test]
+    fn one_commit_missing_from_the_remote_defeats_equivalence() {
+        let (_temporary, repository) = diverged_feature();
+        run(&repository, &["cherry-pick", "feature~1"]);
+        run(&repository, &["push", "origin", "main"]);
+        let head = feature_head(&repository);
+
+        let evidence = ProcessGit.recovery_evidence(&repository, &head).unwrap();
+        assert!(evidence.refs.is_empty());
+        assert!(evidence.equivalent_commits.is_empty());
+    }
+
+    #[test]
+    fn whitespace_only_difference_defeats_equivalence() {
+        let (_temporary, repository, _remote) = repository_with_remote();
+        run(&repository, &["switch", "-c", "feature"]);
+        commit_file(
+            &repository,
+            "indented",
+            "if x:\n\treturn y\n",
+            "tab indentation",
+        );
+        run(&repository, &["switch", "main"]);
+        commit_file(
+            &repository,
+            "unrelated",
+            "unrelated\n",
+            "unrelated main commit",
+        );
+        commit_file(
+            &repository,
+            "indented",
+            "if x:\n    return y\n",
+            "space indentation",
+        );
+        run(&repository, &["push", "origin", "main"]);
+        let head = feature_head(&repository);
+
+        // Git's own patch ids ignore whitespace and call these the same change.
+        assert!(
+            run(
+                &repository,
+                &[
+                    "rev-list",
+                    "--right-only",
+                    "--cherry-pick",
+                    "main...feature"
+                ]
+            )
+            .is_empty()
+        );
+        let evidence = ProcessGit.recovery_evidence(&repository, &head).unwrap();
+        assert!(evidence.refs.is_empty());
+    }
+
+    #[test]
+    fn a_merge_among_unique_commits_defeats_equivalence() {
+        let (_temporary, repository, _remote) = repository_with_remote();
+        run(&repository, &["switch", "-c", "side"]);
+        commit_file(&repository, "side", "side\n", "side commit");
+        run(&repository, &["switch", "main"]);
+        run(&repository, &["switch", "-c", "feature"]);
+        commit_file(&repository, "first", "first\n", "first unit commit");
+        run(&repository, &["merge", "--no-ff", "--no-edit", "side"]);
+        run(&repository, &["switch", "main"]);
+        commit_file(
+            &repository,
+            "unrelated",
+            "unrelated\n",
+            "unrelated main commit",
+        );
+        run(&repository, &["cherry-pick", "side", "feature^1"]);
+        run(&repository, &["push", "origin", "main"]);
+        let head = feature_head(&repository);
+
+        let evidence = ProcessGit.recovery_evidence(&repository, &head).unwrap();
+        assert!(evidence.refs.is_empty());
+    }
+
+    #[test]
+    fn an_empty_unique_commit_defeats_equivalence() {
+        let (_temporary, repository) = diverged_feature();
+        run(&repository, &["cherry-pick", "main..feature"]);
+        run(&repository, &["push", "origin", "main"]);
+        run(&repository, &["switch", "feature"]);
+        run(
+            &repository,
+            &[
+                "commit",
+                "--allow-empty",
+                "-m",
+                "a message and nothing else",
+            ],
+        );
+        let head = feature_head(&repository);
+
+        let evidence = ProcessGit.recovery_evidence(&repository, &head).unwrap();
+        assert!(evidence.refs.is_empty());
+    }
+
+    #[test]
+    fn replacement_objects_cannot_fake_patch_equivalence() {
+        let (_temporary, repository) = diverged_feature();
+        run(&repository, &["push", "origin", "main"]);
+        let remote_tip = run(&repository, &["rev-parse", "main"]);
+        // A local-only copy of the unit commits on top of main, substituted for the remote tip.
+        run(&repository, &["switch", "-c", "forged", "main"]);
+        run(&repository, &["cherry-pick", "main..feature"]);
+        let forged = run(&repository, &["rev-parse", "forged"]);
+        run(&repository, &["replace", &remote_tip, &forged]);
+        let head = feature_head(&repository);
+
+        let evidence = ProcessGit.recovery_evidence(&repository, &head).unwrap();
+        assert!(evidence.refs.is_empty());
+    }
+
+    #[test]
+    fn grafts_still_refuse_equivalence_observation() {
+        let (_temporary, repository) = diverged_feature();
+        run(&repository, &["cherry-pick", "main..feature"]);
+        run(&repository, &["push", "origin", "main"]);
+        let common_dir = ProcessGit::absolute_git_path(&repository, "--git-common-dir").unwrap();
+        std::fs::write(common_dir.join("info/grafts"), "").unwrap();
+        let head = feature_head(&repository);
+
+        assert_eq!(
+            ProcessGit
+                .recovery_evidence(&repository, &head)
+                .unwrap_err()
+                .code,
+            "git-grafts-present"
+        );
     }
 }

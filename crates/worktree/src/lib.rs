@@ -2,9 +2,9 @@
 
 use b10x_worktree_domain::{
     CleanupAssessment, CreatePlan, CreateRequest, DiscoveredWorktree, GitRevision, Lifecycle,
-    OperationEvidence, ReconciliationAction, ReconciliationAssessment, RecoveryProof, Refusal,
-    RelocationIntent, RemovalIntent, RepositorySnapshot, WorkspacePolicy, WorktreeId,
-    WorktreeRecord, WorktreeSnapshot, require_child,
+    OperationEvidence, ReconciliationAction, ReconciliationAssessment, RecoveryEvidence,
+    RecoveryProof, Refusal, RelocationIntent, RemovalIntent, RepositorySnapshot, WorkspacePolicy,
+    WorktreeId, WorktreeRecord, WorktreeSnapshot, require_child,
 };
 use std::path::{Path, PathBuf};
 
@@ -47,6 +47,19 @@ pub trait GitPort: Send + Sync {
     fn create_detached(&self, plan: &CreatePlan) -> Result<(), Refusal>;
     /// Refresh advertisements and return exact remote refs containing the commit.
     fn recovery_refs(&self, repository: &Path, head: &str) -> Result<Vec<String>, Refusal>;
+    /// Refresh advertisements and return the evidence that the commit's work is recoverable.
+    ///
+    /// Ancestry comes first. An adapter may additionally prove that every commit held by no
+    /// advertised ref has a patch-identical commit on one advertised ref. The default reports
+    /// ancestry only.
+    fn recovery_evidence(
+        &self,
+        repository: &Path,
+        head: &str,
+    ) -> Result<RecoveryEvidence, Refusal> {
+        self.recovery_refs(repository, head)
+            .map(RecoveryEvidence::ancestor)
+    }
     /// Return every local ref - branch, tag, or remote-tracking - that contains the commit.
     ///
     /// Reports `None` when this repository holds no such commit object at all. It reads only
@@ -1252,17 +1265,22 @@ where
         head: &str,
         now: i64,
     ) -> Result<RecoveryProof, Refusal> {
-        let refs = self.git.recovery_refs(repository, head)?;
-        if refs.is_empty() {
+        let evidence = self.git.recovery_evidence(repository, head)?;
+        if evidence.refs.is_empty() {
             return Err(Refusal::new(
                 "no-remote-recovery-proof",
-                format!("commit {head} is not reachable from an advertised remote ref"),
+                format!(
+                    "commit {head} is not reachable from an advertised remote ref, and no \
+                     advertised ref carries a patch-identical commit for each of its unique commits"
+                ),
             ));
         }
         Ok(RecoveryProof {
             head: head.to_owned(),
-            refs,
+            refs: evidence.refs,
             observed_at: now,
+            kind: evidence.kind,
+            equivalent_commits: evidence.equivalent_commits,
         })
     }
 
@@ -2179,6 +2197,8 @@ mod tests {
                 head,
                 refs: vec!["origin:refs/heads/main".into()],
                 observed_at: 3,
+                kind: b10x_worktree_domain::RecoveryKind::Ancestor,
+                equivalent_commits: Vec::new(),
             },
             operation: "retire-external".into(),
             planned_at: 3,
@@ -2717,6 +2737,8 @@ mod tests {
                 head: "abc".into(),
                 refs: vec!["refs/remotes/origin/main".into()],
                 observed_at: 900,
+                kind: b10x_worktree_domain::RecoveryKind::Ancestor,
+                equivalent_commits: Vec::new(),
             },
             operation: "remove".into(),
             planned_at: 900,

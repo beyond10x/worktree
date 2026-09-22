@@ -1070,6 +1070,8 @@ mod tests {
             head: "abc".into(),
             refs: vec!["refs/heads/main".into()],
             observed_at: 3,
+            kind: b10x_worktree_domain::RecoveryKind::Ancestor,
+            equivalent_commits: Vec::new(),
         };
         let mut removal = RemovalIntent {
             id: record.id,
@@ -1159,6 +1161,8 @@ mod tests {
                 head: "abc".into(),
                 refs: vec!["refs/heads/main".into()],
                 observed_at: 3,
+                kind: b10x_worktree_domain::RecoveryKind::Ancestor,
+                equivalent_commits: Vec::new(),
             },
             operation: "retire-external".into(),
             planned_at: 3,
@@ -1290,6 +1294,8 @@ mod tests {
             head: "abc".into(),
             refs: vec!["origin:refs/heads/main".into()],
             observed_at: 3,
+            kind: b10x_worktree_domain::RecoveryKind::Ancestor,
+            equivalent_commits: Vec::new(),
         };
         let intent = RemovalIntent {
             id: record.id.clone(),
@@ -1352,5 +1358,13 @@ mod tests {
         assert_eq!(finished.lifecycle, Lifecycle::Finished);
         assert_eq!(finished.head.as_deref(), Some("new"));
         assert_eq!(finished.finished_at, Some(11));
+    }
+
+    #[test]
+    fn recovery_proof_stored_before_proof_kinds_decodes_as_ancestry() {
+        let stored = r#"{"head":"abc","refs":["origin:refs/heads/main"],"observed_at":3}"#;
+        let proof = serde_json::from_str::<RecoveryProof>(stored).unwrap();
+        assert_eq!(proof.kind, b10x_worktree_domain::RecoveryKind::Ancestor);
+        assert!(proof.equivalent_commits.is_empty());
     }
 }

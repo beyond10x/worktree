@@ -24,7 +24,10 @@ independent policy: every decision must come from the public façade.
 - Every removal requires an exact linked-worktree member whose HEAD remains stable across the final
   proof and intent observations, no tracked, untracked, or ignored state, no live lease or Git
   operational/worktree lock or in-progress Git operation, and fresh proof from exact refs currently
-  advertised by a configured remote.
+  advertised by a configured remote: either the exact HEAD is an ancestor of one, or every commit
+  no advertised ref holds is a single-parent, non-empty commit whose whitespace-exact patch one
+  advertised ref carries. Patch equivalence never weakens to Git's whitespace-insensitive patch ids
+  alone.
 - Ordinary GC requires canonical containment below the configured worktree root. Only exact-id
   reconciliation with separate external-retirement confirmation may retire a finished external
   legacy tree after the same removal gates pass.
@@ -42,8 +45,9 @@ independent policy: every decision must come from the public façade.
 - Apply operations for GC and reconciliation require exact reviewed worktree ids. Cleanup and
   relocation lifecycle claims, final HEAD updates, and lease exclusions are atomic, and
   proof-bearing removal intent is durable.
-- CLI JSON protocol version 2, reconciliation version 2, hook protocol version 1, and
-  configuration/workspace-policy version 1 are immutable after release. Cut a new surface version
+- CLI JSON protocol version 3, reconciliation version 3, inspection format
+  `worktree.inspection/2`, hook protocol version 1, and configuration/workspace-policy version 1
+  are immutable after release. Cut a new surface version
   for a wire change.
 - Generated skill content comes from `worktree skill`; do not edit it by hand.
 - A public API belongs in a library crate. The binary is an adapter, not the product boundary.

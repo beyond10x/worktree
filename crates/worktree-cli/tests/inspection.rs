@@ -157,8 +157,8 @@ fn inspection_scopes_by_repository_and_reports_ignored_evidence_without_writes()
     ]);
     let before = fixture.ok(&["status"]);
     let report = fixture.inspect(&[]);
-    assert_eq!(report["version"], 2);
-    assert_eq!(report["format"], "worktree.inspection/1");
+    assert_eq!(report["version"], 3);
+    assert_eq!(report["format"], "worktree.inspection/2");
     let inspections = report["inspections"].as_array().unwrap();
     assert_eq!(inspections.len(), 1);
     let first = &inspections[0];
@@ -224,6 +224,39 @@ fn inspection_distinguishes_unpublished_head_from_fresh_remote_tag_recovery() {
     );
     assert_eq!(fixture.ok(&["status"]), before);
     assert!(fixture.tree.exists());
+}
+
+#[test]
+fn rebased_work_on_the_remote_main_is_collected_with_patch_equivalent_proof() {
+    let fixture = Fixture::new();
+    std::fs::write(fixture.tree.join("unit"), "unit work\n").unwrap();
+    git(&fixture.tree, &["add", "unit"]);
+    git(&fixture.tree, &["commit", "-m", "unit work"]);
+    let unit = git(&fixture.tree, &["rev-parse", "HEAD"]);
+    std::fs::write(fixture.repository.join("unrelated"), "moved on\n").unwrap();
+    git(&fixture.repository, &["add", "unrelated"]);
+    git(&fixture.repository, &["commit", "-m", "main moved on"]);
+    git(&fixture.repository, &["cherry-pick", unit.as_str()]);
+    git(&fixture.repository, &["push", "origin", "main"]);
+
+    let inspected = fixture.inspect(&["--refresh", "--id", "first"]);
+    let recovery = &inspected["inspections"][0]["recovery"];
+    assert_eq!(recovery["state"], "proven");
+    assert_eq!(recovery["kind"], "patch-equivalent");
+    assert_eq!(recovery["refs"][0], "origin:refs/heads/main");
+    assert_eq!(recovery["equivalent_commits"][0], unit.as_str());
+
+    fixture.ok(&["finish", fixture.tree.to_str().unwrap()]);
+    let repository = fixture.repository.to_str().unwrap();
+    let reviewed = fixture.ok(&["gc", "--repo", repository, "--dry-run", "--id", "first"]);
+    assert_eq!(reviewed["version"], 3);
+    assert_eq!(reviewed["assessments"][0]["eligible"], true);
+    let applied = fixture.ok(&["gc", "--repo", repository, "--apply", "--id", "first"]);
+    let proof = &applied["assessments"][0]["evidence"]["recovery"];
+    assert_eq!(proof["kind"], "patch-equivalent");
+    assert_eq!(proof["head"], unit.as_str());
+    assert_eq!(proof["equivalent_commits"][0], unit.as_str());
+    assert!(!fixture.tree.exists());
 }
 
 #[test]

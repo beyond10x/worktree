@@ -62,6 +62,15 @@ advertisements, and proves that the exact HEAD is reachable. Local-only tags and
 fabricated remote-tracking refs do not count. Replacement refs and grafted ancestry are disabled;
 repository graft files cause refusal. Offline, changed, or ambiguous advertisements cause refusal.
 
+Work that was rebased or cherry-picked before it was merged has new commit ids on the remote, so
+its exact HEAD is reachable from no advertised ref. The manager then accepts a second, recorded
+proof kind, `patch-equivalent`: one advertised ref must carry a commit with a whitespace-exact
+identical patch for every commit that no advertised ref holds, and Git's own cherry-pick
+equivalence must agree. A unique root, merge, or empty commit has no single patch another commit
+could carry and defeats the proof. Binary changes compare by their full binary patch. The proof
+records the refs and the equivalent commits; the local branch and its commit ids are not removed,
+only the linked tree.
+
 Use `worktree repo list --repo <path>` to inventory linked trees without adopting or deleting them.
 Existing trees only become manager-owned through the explicit `repo adopt` command. Hook integrations
 can maintain cleanup-blocking leases with `hook session-start`, `hook heartbeat`, and
@@ -100,8 +109,10 @@ and registry lifecycle, evidence, and intent completion are committed atomically
 operation is interrupted, rerun GC while the path exists or reconciliation once it is absent; the
 same dry-run and exact-id apply discipline safely finishes the recorded transition.
 
-Non-hook CLI JSON uses protocol version 2, reconciliation JSON uses version 2, and lifecycle hooks
-remain on version 1. Configuration and workspace-policy schemas also remain on version 1.
+Non-hook CLI JSON uses protocol version 3, reconciliation JSON uses version 3, inspection reports
+use `worktree.inspection/2`, and lifecycle hooks remain on version 1. Version 3 and inspection 2
+add the recovery proof `kind` and `equivalent_commits` fields. Configuration and workspace-policy
+schemas also remain on version 1.
 
 ## Embed
 

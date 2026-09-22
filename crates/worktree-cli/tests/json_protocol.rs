@@ -16,7 +16,7 @@ fn ordinary_json_success_uses_cli_protocol_envelope() {
     assert!(output.stderr.is_empty());
     let stdout = String::from_utf8(output.stdout).expect("UTF-8 stdout");
     let value: serde_json::Value = serde_json::from_str(stdout.trim()).expect("one JSON document");
-    assert_eq!(value["version"], 2);
+    assert_eq!(value["version"], 3);
     assert_eq!(value["ok"], true);
     assert_eq!(value["check"], false);
     assert_eq!(value["path"], skill.display().to_string());
@@ -33,7 +33,7 @@ fn operational_json_error_is_exactly_one_document() {
     assert!(output.stdout.is_empty());
     let stderr = String::from_utf8(output.stderr).expect("UTF-8 stderr");
     let value: serde_json::Value = serde_json::from_str(stderr.trim()).expect("one JSON document");
-    assert_eq!(value["version"], 2);
+    assert_eq!(value["version"], 3);
     assert_eq!(value["ok"], false);
     assert_eq!(value["code"], "operation-failed");
     assert!(value["message"].as_str().unwrap().contains("reviewed --id"));
@@ -51,7 +51,7 @@ fn argument_json_error_is_exactly_one_document() {
     assert!(output.stdout.is_empty());
     let stderr = String::from_utf8(output.stderr).expect("UTF-8 stderr");
     let value: serde_json::Value = serde_json::from_str(stderr.trim()).expect("one JSON document");
-    assert_eq!(value["version"], 2);
+    assert_eq!(value["version"], 3);
     assert_eq!(value["ok"], false);
     assert_eq!(value["code"], "invalid-arguments");
 }

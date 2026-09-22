@@ -180,7 +180,7 @@ impl<G: GitPort + InspectionPort, R: RegistryPort, C: Clock> WorktreeManager<G, 
             match &report.recovery {
                 InspectedRecovery::Unproven => report.blockers.push(Refusal::new(
                     "no-remote-recovery-proof",
-                    "observed HEAD is not proven reachable from an advertised remote ref",
+                    "observed HEAD is neither reachable from nor patch-equivalent to an advertised remote ref",
                 )),
                 InspectedRecovery::Unavailable { refusal } => report.blockers.push(refusal.clone()),
                 _ => {}
@@ -198,8 +198,8 @@ impl<G: GitPort + InspectionPort, R: RegistryPort, C: Clock> WorktreeManager<G, 
     fn inspect_recovery(&self, record: &WorktreeRecord, head: &str) -> InspectedRecovery {
         let result = self
             .git
-            .recovery_refs(&record.repository_root, head)
-            .and_then(|refs| {
+            .recovery_evidence(&record.repository_root, head)
+            .and_then(|evidence| {
                 let after = self.exact_worktree_snapshot(&record.repository_root, &record.path)?;
                 if after.head != head {
                     return Err(Refusal::new(
@@ -207,11 +207,15 @@ impl<G: GitPort + InspectionPort, R: RegistryPort, C: Clock> WorktreeManager<G, 
                         "HEAD changed while remote recovery evidence was being observed",
                     ));
                 }
-                Ok(refs)
+                Ok(evidence)
             });
         match result {
-            Ok(refs) if refs.is_empty() => InspectedRecovery::Unproven,
-            Ok(refs) => InspectedRecovery::Proven { refs },
+            Ok(evidence) if evidence.refs.is_empty() => InspectedRecovery::Unproven,
+            Ok(evidence) => InspectedRecovery::Proven {
+                kind: evidence.kind,
+                refs: evidence.refs,
+                equivalent_commits: evidence.equivalent_commits,
+            },
             Err(refusal) => InspectedRecovery::Unavailable { refusal },
         }
     }

@@ -13,11 +13,14 @@ pub const SURFACE_VERSION: u32 = 1;
 /// Reconciliation report version.
 ///
 /// Reconciliation version 2 adds the explicit `retire-external` action without changing the
-/// stable version-1 lifecycle, configuration, or hook envelopes.
-pub const RECONCILIATION_VERSION: u32 = 2;
+/// stable version-1 lifecycle, configuration, or hook envelopes. Version 3 adds the recovery
+/// proof `kind` and `equivalent_commits` fields carried by operation evidence.
+pub const RECONCILIATION_VERSION: u32 = 3;
 
 /// Version of non-hook CLI JSON envelopes.
-pub const CLI_PROTOCOL_VERSION: u32 = 2;
+///
+/// Version 3 adds the recovery proof `kind` and `equivalent_commits` fields.
+pub const CLI_PROTOCOL_VERSION: u32 = 3;
 
 /// Immutable hook protocol version.
 pub const HOOK_PROTOCOL_VERSION: u32 = 1;
@@ -316,15 +319,55 @@ pub struct WorktreeRecord {
     pub head: Option<String>,
 }
 
+/// How advertised remote refs establish that a commit's work is recoverable.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RecoveryKind {
+    /// Every proving ref has the exact commit in its ancestry.
+    #[default]
+    Ancestor,
+    /// The exact commit is on no advertised ref, but every commit it adds over them has a
+    /// verbatim patch-identical, single-parent commit reachable from each proving ref.
+    PatchEquivalent,
+}
+
+/// Remote recovery evidence observed by the Git adapter, before it is timestamped.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveryEvidence {
+    /// How the refs prove recovery.
+    pub kind: RecoveryKind,
+    /// Fresh, advertised remote refs proving it; empty when nothing does.
+    pub refs: Vec<String>,
+    /// Commits held by no advertised ref whose patches each proving ref carries.
+    pub equivalent_commits: Vec<String>,
+}
+
+impl RecoveryEvidence {
+    /// Evidence that the exact commit is an ancestor of every listed ref.
+    pub fn ancestor(refs: Vec<String>) -> Self {
+        Self {
+            kind: RecoveryKind::Ancestor,
+            refs,
+            equivalent_commits: Vec::new(),
+        }
+    }
+}
+
 /// Exact remote evidence that makes a clean commit recoverable.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecoveryProof {
-    /// Commit proven reachable.
+    /// Commit proven reachable, or whose unique commits are proven patch-equivalent.
     pub head: String,
-    /// Fresh, advertised remote refs containing it.
+    /// Fresh, advertised remote refs proving it.
     pub refs: Vec<String>,
     /// Observation time.
     pub observed_at: i64,
+    /// How the refs prove recovery. Records stored before this field existed are ancestry proof.
+    #[serde(default)]
+    pub kind: RecoveryKind,
+    /// Commits held by no advertised ref whose patches the proving refs carry.
+    #[serde(default)]
+    pub equivalent_commits: Vec<String>,
 }
 
 /// Evidence returned after a mutation.

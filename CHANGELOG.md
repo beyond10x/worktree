@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- Accept a second recovery proof kind, `patch-equivalent`, for work that was rebased or
+  cherry-picked before it was merged. When no advertised ref contains the exact HEAD, one
+  advertised ref must carry a whitespace-exact identical patch for every commit that no advertised
+  ref holds, and Git's own cherry-pick equivalence must agree. A unique root, merge or empty commit
+  defeats the proof. Ancestry proof is unchanged and tried first; GC, reconciliation and
+  `inspect --refresh` all use both kinds, and the final pre-removal observation repeats them.
+- **Wire change:** non-hook CLI JSON moves to protocol version 3, reconciliation JSON to version
+  3 and inspection reports to `worktree.inspection/2`. Recovery proof gains `kind` (`ancestor` or
+  `patch-equivalent`) and `equivalent_commits`. Stored proofs without these fields decode as
+  ancestry proof. Hook protocol 1 and configuration schema 1 are unchanged.
+- Add `GitPort::recovery_evidence`, returning `RecoveryEvidence`. Its default implementation
+  reports ancestry from `recovery_refs`, so existing embedded ports keep compiling unchanged.
 - Add a reviewed path for a missing record whose recorded commit an operator has established is
   gone for good: `reconcile --apply --id <reviewed-id> --acknowledge-unrecoverable <commit>`
   tombstones it. The acknowledgement asserts one exact commit named by the immediately preceding
