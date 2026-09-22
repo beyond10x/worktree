@@ -14,6 +14,9 @@
   ancestry proof. Hook protocol 1 and configuration schema 1 are unchanged.
 - Add `GitPort::recovery_evidence`, returning `RecoveryEvidence`. Its default implementation
   reports ancestry from `recovery_refs`, so existing embedded ports keep compiling unchanged.
+- Refresh the lockfile to the latest Rust 1.85-compatible releases: 19 packages, all patch or
+  minor updates (clap 4.6.7, uuid 1.26.1, rustix 1.1.5, among them). Direct dependency
+  requirements are unchanged.
 - Add a reviewed path for a missing record whose recorded commit an operator has established is
   gone for good: `reconcile --apply --id <reviewed-id> --acknowledge-unrecoverable <commit>`
   tombstones it. The acknowledgement asserts one exact commit named by the immediately preceding
