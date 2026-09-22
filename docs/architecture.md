@@ -55,8 +55,8 @@ flowchart LR
 Dry-run garbage collection traverses the proof without claiming lifecycle state, writing the
 registry, or removing a worktree; it may refresh remote advertisements and fetch missing objects
 into the local object database. Apply requires the exact ids reviewed in a preceding assessment.
-Final observations are repeated before mutation;
-the proof-bearing removal intent makes an interruption after filesystem removal recoverable.
+Final observations are repeated before mutation; the proof-bearing removal intent makes an
+interruption after filesystem removal recoverable.
 
 Remote evidence is derived from `ls-remote --refs` advertisements, so any advertised branch, tag,
 pull-request ref, or custom namespace can qualify. Required missing objects are fetched with
@@ -104,9 +104,9 @@ completion clears both intents atomically.
 
 When a registered path is already absent, reconciliation changes registry state only after Git no
 longer reports the worktree and either a matching removal intent exists or the stored final HEAD is
-freshly reachable from an advertised remote ref. A provisioning or failed record can be activated
-when Git already created the exact linked tree, or tombstoned without a HEAD only when no filesystem
-or Git artifact exists.
+freshly proven recoverable from an advertised remote ref, by ancestry or patch equivalence. A
+provisioning or failed record can be activated when Git already created the exact linked tree, or
+tombstoned without a HEAD only when no filesystem or Git artifact exists.
 
 A record whose stored HEAD is reachable from nothing is otherwise stuck forever, so an operator who
 has established that the commit is gone for good may say so: a reviewed exact-id apply carrying
