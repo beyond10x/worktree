@@ -11,7 +11,7 @@ XDG-state SQLite registry.
 ## Install
 
 ```bash
-cargo install --git https://github.com/beyond10x/worktree --tag 0.4.1 b10x-worktree-cli
+cargo install --git https://github.com/beyond10x/worktree --tag 0.5.0 b10x-worktree-cli
 ```
 
 ## Use
@@ -35,9 +35,10 @@ worktree doctor --check
 Managed trees default to `$XDG_STATE_HOME/worktree/trees/<profile>/<repository>/<id>`. Activate a
 workspace profile with `worktree activate --profile profile.toml --workspace /path/to/workspace`;
 add `--install-agent-guidance` to write a managed guidance block into `~/.codex/AGENTS.md` and
-`~/.claude/CLAUDE.md`, replacing only the block between its markers. Workspace and managed roots are canonical, disjoint paths. Create plans resolve the requested base
-to an immutable commit and revalidate the repository, policy-derived destination, and exact Git
-worktree membership before changing state.
+`~/.claude/CLAUDE.md`, replacing only the block between its markers. Workspace and managed roots
+are canonical, disjoint paths. Create plans resolve the requested base to an immutable commit and
+revalidate the repository, policy-derived destination, and exact Git worktree membership before
+changing state.
 
 Generate portable agent guidance from the exact installed command surface:
 

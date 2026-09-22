@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.5.0 — 2026-09-23
 
 - Accept a second recovery proof kind, `patch-equivalent`, for work that was rebased or
   cherry-picked before it was merged. When no advertised ref contains the exact HEAD, one
