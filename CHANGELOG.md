@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.6.0 — 2026-09-24
+
+- Ship the `worktree` agent plugin from `plugins/worktree/`, released with the binary at the same
+  version. Claude Code installs it as `worktree@b10x` from the `beyond10x/agentplugins` catalog;
+  Codex reads `.agents/plugins/marketplace.json` in this repository as `worktree@worktree`. It
+  replaces the `workspace-hygiene` plugin from `beyond10x/agentplugins`, whose skill `worktree`
+  becomes `worktree:worktree`.
+- The generated skill moves from `.agents/skills/worktree/` to `plugins/worktree/skills/worktree/`;
+  `task check` verifies it there, and a test refuses a plugin manifest whose version differs from
+  the workspace package version.
+- `worktree skill` output and its `--out` default are unchanged. No library, CLI, wire-protocol,
+  schema or behavior change; every declared surface version is unchanged.
+
 ## 0.5.1 — 2026-09-24
 
 - Run the shared source gate at Gates `db7edb1`, which downloads the Gates 0.1.7 release instead
