@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.7.0 — 2026-09-24
+
+- Every release publishes prebuilt binaries: `worktree-<version>-<target>.tar.gz` for
+  `x86_64`/`aarch64` Linux and macOS, with `SHA256SUMS`, built and attached by the new
+  `.github/workflows/release.yml` when the tag is pushed. `cargo install --git … --tag` still works.
+- The `worktree` agent plugin moves to `beyond10x/agentplugins`, where every Beyond10x plugin lives;
+  `plugins/worktree/`, the Codex marketplace file and the manifest-version test are removed here.
+  Install it with `b10x` or as `worktree@b10x`; an earlier `worktree@worktree` install is migrated by
+  `b10x setup`.
+- `worktree skill` and its `--out` default are unchanged. No library, CLI, wire-protocol, schema or
+  behavior change.
+
 ## 0.6.0 — 2026-09-24
 
 - Ship the `worktree` agent plugin from `plugins/worktree/`, released with the binary at the same
