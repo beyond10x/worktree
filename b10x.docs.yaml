@@ -40,7 +40,7 @@ surfaces:
   primaryJourney: operate-services
   relationships:
   - kind: supports
-    label: Generates workspace-hygiene guidance
+    label: Ships the worktree agent plugin
     target: agentplugins/docs
   routeBase: /docs/worktree/
   sections:

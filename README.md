@@ -50,6 +50,19 @@ worktree skill --out .agents/skills/worktree --check
 The generated skill and its interface metadata are generator-owned; update them with `worktree
 skill`, not by hand.
 
+The same skill ships as the `worktree` agent plugin in [`plugins/worktree/`](plugins/worktree/),
+released with the binary at the same version. Claude Code installs it from the Beyond10x
+marketplace:
+
+```text
+/plugin marketplace add beyond10x/agentplugins
+/plugin install worktree@b10x
+```
+
+Codex reads this repository directly through `.agents/plugins/marketplace.json`:
+`codex plugin marketplace add https://github.com/beyond10x/worktree.git --ref <version>`, then
+`codex plugin add worktree@worktree`.
+
 Before removal, the manager treats tracked, untracked, and ignored files as dirty and checks Git
 worktree locks, operational lock files, and paused merge/rebase/sequencer state. It refuses live
 leases, non-members, a HEAD that changes while proof and removal intent are collected, ambiguous
