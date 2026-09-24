@@ -5,4 +5,4 @@ version: aep.project/1
 # profiles of this project's own go under `principles/` and `profiles/` beside this file.
 protocol: adp/1
 profile: development.standard
-protocols: git+https://github.com/beyond10x/aep.git#1c4e614829cfa9a35e9b809c44855bd3c8aefd9d
+protocols: git+https://github.com/beyond10x/aep.git#733dbea25c8db9e5a0b7d273c09c287db60bfac2
