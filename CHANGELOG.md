@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.5.1 — 2026-09-24
+
+- Run the shared source gate at Gates `db7edb1`, which downloads the Gates 0.1.7 release instead
+  of 0.1.3.
+- Point the AEP project file at protocol sources `733dbea`.
+- Pin the documentation bundle action at Docs System `339b4b8` and add the read-only per-source
+  documentation check on pull requests and `main` pushes.
+- No library, CLI, wire-protocol, schema or behavior change; every declared surface version is
+  unchanged.
+
 ## 0.5.0 — 2026-09-23
 
 - Accept a second recovery proof kind, `patch-equivalent`, for work that was rebased or
