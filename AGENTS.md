@@ -9,9 +9,11 @@
 
 ## Boundary
 
-This repository owns safe Git worktree lifecycle as a reusable Rust library and CLI. It knows no
-Atlas, agent harness, plugin marketplace or organization repository inventory. Consumers supply
-profiles and adapters from above.
+This repository owns safe Git worktree lifecycle as a reusable Rust library and CLI, and ships its
+own agent plugin in `plugins/worktree/`. It knows no Atlas, agent harness or organization
+repository inventory, and no marketplace other than its own Codex entry in
+`.agents/plugins/marketplace.json`; the Beyond10x `b10x` marketplace in `beyond10x/agentplugins`
+points at this plugin by tag and commit. Consumers supply profiles and adapters from above.
 
 The `b10x-worktree-domain` crate performs no I/O. `b10x-worktree` owns the application ports and
 orchestration. Concrete Git and SQLite behavior stays in their adapter crates. The CLI contains no
@@ -59,7 +61,13 @@ task check
 ```
 
 Anything executable in this repository is Rust. Releases use bare SemVer tags from `main`, after
-`CHANGELOG.md`, every workspace package version and `Cargo.lock` agree.
+`CHANGELOG.md`, every workspace package version, `Cargo.lock` and both plugin manifests
+(`plugins/worktree/.claude-plugin/plugin.json`, `plugins/worktree/.codex-plugin/plugin.json`)
+agree; `crates/worktree-cli/tests/plugin.rs` refuses a manifest version that differs. The plugin
+skill is `worktree skill --out plugins/worktree/skills/worktree`, checked by `task check`.
+
+After a release is verified, open a bot pull request on `beyond10x/agentplugins` that moves the
+`worktree` entry in `.claude-plugin/marketplace.json` to the new tag and its full commit.
 
 <!-- b10x-docs-operations:start -->
 ## Public documentation operations
