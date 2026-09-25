@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.7.1 — 2026-09-25
 
 - `worktree doctor --check` exits non-zero and names `no active profile` when the configuration
   holds no workspace profile, since every `worktree create` would then lack a policy. The readiness
