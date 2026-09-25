@@ -891,6 +891,7 @@ impl GitPort for ProcessGit {
     }
 
     fn remove(&self, repository: &Path, worktree: &Path) -> Result<(), Refusal> {
+        make_directories_owner_writable(worktree)?;
         Self::status(
             repository,
             [
@@ -899,6 +900,39 @@ impl GitPort for ProcessGit {
                 worktree.as_os_str(),
             ],
         )
+    }
+
+    #[cfg(unix)]
+    fn verify_removal_residue(
+        &self,
+        repository: &Path,
+        worktree: &Path,
+        head: &str,
+    ) -> Result<(), Refusal> {
+        Self::validate_object_id(head)?;
+        verify_residue(repository, worktree, head)
+    }
+
+    #[cfg(unix)]
+    fn delete_residue(&self, worktree: &Path) -> Result<(), Refusal> {
+        let is_directory = std::fs::symlink_metadata(worktree)
+            .map_err(|error| {
+                Refusal::new(
+                    "worktree-path-inspection-failed",
+                    format!("{}: {error}", worktree.display()),
+                )
+            })?
+            .is_dir();
+        if !is_directory {
+            return Err(residue_unproven(worktree, "is not a directory"));
+        }
+        make_directories_owner_writable(worktree)?;
+        std::fs::remove_dir_all(worktree).map_err(|error| {
+            Refusal::new(
+                "residue-delete-failed",
+                format!("{}: {error}", worktree.display()),
+            )
+        })
     }
 
     fn move_worktree(&self, repository: &Path, from: &Path, to: &Path) -> Result<(), Refusal> {
@@ -1043,6 +1077,200 @@ fn same_filesystem(_from: &Path, _to: &Path) -> Result<(), Refusal> {
     Ok(())
 }
 
+/// Give the owner full access to every directory below a tree that is about to be deleted.
+///
+/// A directory without the owner write bit makes Git's deletion of its files fail after Git has
+/// already committed to unlinking the tree. Directory modes are not tracked, so this changes no
+/// Git state. The walk follows no symlink, stays on the tree's filesystem, and leaves directories
+/// another user owns untouched.
+#[cfg(unix)]
+fn make_directories_owner_writable(root: &Path) -> Result<(), Refusal> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    let failed = |path: &Path, error: std::io::Error| {
+        Refusal::new(
+            "worktree-permission-repair-failed",
+            format!("{}: {error}", path.display()),
+        )
+    };
+    let root_metadata = std::fs::symlink_metadata(root).map_err(|error| failed(root, error))?;
+    if !root_metadata.is_dir() {
+        return Ok(());
+    }
+    let (device, owner) = (root_metadata.dev(), root_metadata.uid());
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        let metadata =
+            std::fs::symlink_metadata(&directory).map_err(|error| failed(&directory, error))?;
+        if !metadata.is_dir() || metadata.dev() != device || metadata.uid() != owner {
+            continue;
+        }
+        let mode = metadata.permissions().mode();
+        if mode & 0o700 != 0o700 {
+            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(mode | 0o700))
+                .map_err(|error| failed(&directory, error))?;
+        }
+        for entry in std::fs::read_dir(&directory).map_err(|error| failed(&directory, error))? {
+            let entry = entry.map_err(|error| failed(&directory, error))?;
+            if entry
+                .file_type()
+                .map_err(|error| failed(&entry.path(), error))?
+                .is_dir()
+            {
+                pending.push(entry.path());
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn make_directories_owner_writable(_root: &Path) -> Result<(), Refusal> {
+    Ok(())
+}
+
+fn residue_unproven(path: &Path, reason: &str) -> Refusal {
+    Refusal::new(
+        "removal-residue-unproven",
+        format!("{}: {reason}", path.display()),
+    )
+}
+
+/// Tracked entries of one commit: path bytes mapped to (mode, object id).
+type TrackedEntries = BTreeMap<Vec<u8>, (String, String)>;
+
+#[cfg(unix)]
+fn tracked_entries(repository: &Path, head: &str) -> Result<TrackedEntries, Refusal> {
+    let output = ProcessGit::output_bytes(
+        repository,
+        [
+            "ls-tree",
+            "-r",
+            "-z",
+            "--full-tree",
+            "--end-of-options",
+            head,
+        ],
+    )?;
+    let mut entries = BTreeMap::new();
+    for record in output
+        .split(|byte| *byte == 0)
+        .filter(|record| !record.is_empty())
+    {
+        let tab = record
+            .iter()
+            .position(|byte| *byte == b'\t')
+            .ok_or_else(|| Refusal::new("invalid-tree-listing", "ls-tree record has no path"))?;
+        let header = std::str::from_utf8(&record[..tab])
+            .map_err(|error| Refusal::new("git-output-not-utf8", error.to_string()))?;
+        let mut fields = header.split(' ');
+        let (Some(mode), Some(_kind), Some(object)) = (fields.next(), fields.next(), fields.next())
+        else {
+            return Err(Refusal::new(
+                "invalid-tree-listing",
+                "ls-tree record is missing a field",
+            ));
+        };
+        entries.insert(
+            record[tab + 1..].to_vec(),
+            (mode.to_owned(), object.to_owned()),
+        );
+    }
+    Ok(entries)
+}
+
+/// Prove that every file under an unlinked tree is the recorded commit's tracked content.
+#[cfg(unix)]
+fn verify_residue(repository: &Path, root: &Path, head: &str) -> Result<(), Refusal> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let entries = tracked_entries(repository, head)?;
+    let worktrees =
+        ProcessGit::absolute_git_path(repository, "--git-common-dir")?.join("worktrees");
+    let inspect = |path: &Path, error: std::io::Error| {
+        Refusal::new(
+            "worktree-path-inspection-failed",
+            format!("{}: {error}", path.display()),
+        )
+    };
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        for entry in std::fs::read_dir(&directory).map_err(|error| inspect(&directory, error))? {
+            let entry = entry.map_err(|error| inspect(&directory, error))?;
+            let path = entry.path();
+            let kind = entry.file_type().map_err(|error| inspect(&path, error))?;
+            if kind.is_dir() {
+                pending.push(path);
+                continue;
+            }
+            let relative = path
+                .strip_prefix(root)
+                .map_err(|_| residue_unproven(&path, "is outside the worktree"))?;
+            let key = relative.as_os_str().as_bytes();
+            let Some((mode, object)) = entries.get(key) else {
+                if key == b".git" && kind.is_file() && gitfile_points_into(&path, &worktrees)? {
+                    continue;
+                }
+                return Err(residue_unproven(
+                    &path,
+                    "is not tracked by the recorded commit",
+                ));
+            };
+            let matches = if kind.is_symlink() {
+                mode == "120000"
+                    && std::fs::read_link(&path)
+                        .map_err(|error| inspect(&path, error))?
+                        .as_os_str()
+                        .as_bytes()
+                        == ProcessGit::output_bytes(
+                            repository,
+                            ["cat-file", "blob", object.as_str()],
+                        )?
+                        .as_slice()
+            } else if kind.is_file() && (mode == "100644" || mode == "100755") {
+                let attributes = format!("--path={}", relative.display());
+                ProcessGit::output(
+                    repository,
+                    [
+                        OsStr::new("hash-object"),
+                        OsStr::new(attributes.as_str()),
+                        OsStr::new("--"),
+                        path.as_os_str(),
+                    ],
+                )?
+                .trim()
+                    == object
+            } else {
+                false
+            };
+            if !matches {
+                return Err(residue_unproven(
+                    &path,
+                    "differs from the recorded commit's content",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Accept the tree's own `.git` file only while it names an administrative worktree directory.
+fn gitfile_points_into(path: &Path, worktrees: &Path) -> Result<bool, Refusal> {
+    let contents = std::fs::read_to_string(path).map_err(|error| {
+        Refusal::new(
+            "worktree-path-inspection-failed",
+            format!("{}: {error}", path.display()),
+        )
+    })?;
+    Ok(contents
+        .strip_prefix("gitdir: ")
+        .map(str::trim_end)
+        .is_some_and(|target| {
+            let target = Path::new(target);
+            target.parent() == Some(worktrees)
+        }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1157,6 +1385,111 @@ mod tests {
             ],
         );
         (temporary, repository, remote)
+    }
+
+    /// A linked tree whose tracked `app/jobs/Job.txt` sits in a directory without write bits.
+    #[cfg(unix)]
+    fn linked_with_read_only_directory() -> (TempDir, PathBuf, PathBuf, String) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temporary = tempdir().unwrap();
+        let repository = temporary.path().join("repo");
+        init_repository(&repository);
+        std::fs::create_dir_all(repository.join("app/jobs")).unwrap();
+        std::fs::write(repository.join("app/jobs/Job.txt"), "job\n").unwrap();
+        git(&repository, &[OsStr::new("add"), OsStr::new("app")]);
+        git(
+            &repository,
+            &[OsStr::new("commit"), OsStr::new("-m"), OsStr::new("jobs")],
+        );
+        let head = git(&repository, &[OsStr::new("rev-parse"), OsStr::new("HEAD")])
+            .trim()
+            .to_owned();
+        let linked = temporary.path().join("linked");
+        add_linked(&repository, &linked);
+        let linked = std::fs::canonicalize(linked).unwrap();
+        std::fs::set_permissions(
+            linked.join("app/jobs"),
+            std::fs::Permissions::from_mode(0o555),
+        )
+        .unwrap();
+        (temporary, repository, linked, head)
+    }
+
+    /// Reproduce the half-removed state: Git unlinks the tree but cannot delete every file.
+    ///
+    /// Returns `false` when the process can write anyway (for example as root).
+    #[cfg(unix)]
+    fn interrupt_removal(repository: &Path, linked: &Path) -> bool {
+        let removed = Command::new("git")
+            .arg("-C")
+            .arg(repository)
+            .args([
+                OsStr::new("worktree"),
+                OsStr::new("remove"),
+                linked.as_os_str(),
+            ])
+            .stderr(Stdio::null())
+            .status()
+            .unwrap()
+            .success();
+        if removed {
+            return false;
+        }
+        assert!(linked.exists());
+        assert!(
+            !ProcessGit
+                .list_worktrees(repository)
+                .unwrap()
+                .iter()
+                .any(|item| item.path == linked)
+        );
+        true
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn removes_a_linked_tree_holding_a_read_only_directory() {
+        let (_temporary, repository, linked, _head) = linked_with_read_only_directory();
+        ProcessGit.remove(&repository, &linked).unwrap();
+        assert!(!linked.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verifies_and_deletes_the_residue_of_an_interrupted_removal() {
+        let (_temporary, repository, linked, head) = linked_with_read_only_directory();
+        if !interrupt_removal(&repository, &linked) {
+            return;
+        }
+        ProcessGit
+            .verify_removal_residue(&repository, &linked, &head)
+            .unwrap();
+        ProcessGit.delete_residue(&linked).unwrap();
+        assert!(!linked.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refuses_residue_that_is_not_the_recorded_commit() {
+        let (_temporary, repository, linked, head) = linked_with_read_only_directory();
+        if !interrupt_removal(&repository, &linked) {
+            return;
+        }
+        std::fs::write(linked.join("app/jobs/Job.txt"), "changed\n").unwrap();
+        let changed = ProcessGit
+            .verify_removal_residue(&repository, &linked, &head)
+            .unwrap_err();
+        assert_eq!(changed.code, "removal-residue-unproven");
+
+        std::fs::write(linked.join("app/jobs/Job.txt"), "job\n").unwrap();
+        std::fs::write(linked.join("notes.txt"), "new work\n").unwrap();
+        let untracked = ProcessGit
+            .verify_removal_residue(&repository, &linked, &head)
+            .unwrap_err();
+        assert_eq!(untracked.code, "removal-residue-unproven");
+        assert!(untracked.message.contains("notes.txt"));
+        make_directories_owner_writable(&linked).unwrap();
     }
 
     #[test]

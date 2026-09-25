@@ -72,6 +72,34 @@ pub trait GitPort: Send + Sync {
     ) -> Result<Option<Vec<String>>, Refusal>;
     /// Remove a linked worktree without forcing Git.
     fn remove(&self, repository: &Path, worktree: &Path) -> Result<(), Refusal>;
+    /// Prove that what an interrupted removal left behind is only the recorded commit's content.
+    ///
+    /// Git has already unlinked the path, so the tree can no longer be asked for its status.
+    /// Every remaining file must match the commit's tracked content. The default refuses.
+    fn verify_removal_residue(
+        &self,
+        _repository: &Path,
+        worktree: &Path,
+        _head: &str,
+    ) -> Result<(), Refusal> {
+        Err(Refusal::new(
+            "removal-residue-unproven",
+            format!(
+                "this Git adapter cannot verify the residue at {}",
+                worktree.display()
+            ),
+        ))
+    }
+    /// Delete the verified residue of an interrupted removal. The default refuses.
+    fn delete_residue(&self, worktree: &Path) -> Result<(), Refusal> {
+        Err(Refusal::new(
+            "removal-residue-unproven",
+            format!(
+                "this Git adapter cannot delete the residue at {}",
+                worktree.display()
+            ),
+        ))
+    }
     /// Move a linked worktree without forcing Git.
     fn move_worktree(&self, repository: &Path, from: &Path, to: &Path) -> Result<(), Refusal>;
     /// Refuse a move that the platform cannot perform atomically.
@@ -377,14 +405,17 @@ where
                             // Re-observe immediately before the only destructive call.
                             let applied = self
                                 .assess_cleanup(policy, &claimed, self.clock.now())
-                                .and_then(|proof| {
-                                    self.apply_removal(
+                                .and_then(|proof| match self.interrupted_removal(&claimed)? {
+                                    Some(intent) => {
+                                        self.finish_interrupted_removal(&claimed, intent, proof)
+                                    }
+                                    None => self.apply_removal(
                                         &claimed,
                                         &claimed.path,
                                         "remove",
                                         proof,
                                         None,
-                                    )
+                                    ),
                                 });
                             match applied {
                                 Ok(evidence) => assessments.push(CleanupAssessment {
@@ -663,9 +694,93 @@ where
     ) -> Result<RecoveryProof, Refusal> {
         require_canonical_child(&policy.worktree_root, &record.path)?;
         self.require_idle(record, now)?;
+        if let Some(intent) = self.interrupted_removal(record)? {
+            let proof = self.recovery_proof(&record.repository_root, &intent.head, now)?;
+            self.git
+                .verify_removal_residue(&record.repository_root, &record.path, &intent.head)?;
+            return Ok(proof);
+        }
         let snapshot = self.exact_worktree_snapshot(&record.repository_root, &record.path)?;
         require_clean_unlocked(&snapshot)?;
         self.recovery_for_record(record, &snapshot.head, now)
+    }
+
+    /// Return the durable `remove` intent of a tree Git already unlinked while its path remains.
+    ///
+    /// `git worktree remove` deletes the administrative directory even when deleting the files
+    /// failed, which leaves a present path that is no longer a linked worktree.
+    fn interrupted_removal(
+        &self,
+        record: &WorktreeRecord,
+    ) -> Result<Option<RemovalIntent>, Refusal> {
+        let Some(intent) = self.registry.removal(record.id.as_str())? else {
+            return Ok(None);
+        };
+        if path_absent(&record.path)?
+            || self
+                .git
+                .list_worktrees(&record.repository_root)?
+                .iter()
+                .any(|item| item.path == record.path)
+        {
+            return Ok(None);
+        }
+        if intent.path != record.path
+            || intent.operation != "remove"
+            || intent.head != intent.recovery.head
+        {
+            return Err(Refusal::new(
+                "removal-intent-mismatch",
+                "pending removal intent does not match the interrupted worktree removal",
+            ));
+        }
+        Ok(Some(intent))
+    }
+
+    /// Finish an interrupted `remove` whose residue was proven to hold only the recorded commit.
+    fn finish_interrupted_removal(
+        &self,
+        record: &WorktreeRecord,
+        intent: RemovalIntent,
+        proof: RecoveryProof,
+    ) -> Result<OperationEvidence, Refusal> {
+        if proof.head != intent.head {
+            return Err(Refusal::new(
+                "worktree-head-changed-during-proof",
+                "recovery proof differs from the pending removal commit",
+            ));
+        }
+        let intent = RemovalIntent {
+            recovery: proof,
+            planned_at: self.clock.now(),
+            ..intent
+        };
+        self.registry.begin_removal(&intent)?;
+        self.git
+            .verify_removal_residue(&record.repository_root, &intent.path, &intent.head)?;
+        self.git.delete_residue(&intent.path)?;
+        if !path_absent(&intent.path)?
+            || self
+                .git
+                .list_worktrees(&record.repository_root)?
+                .iter()
+                .any(|item| item.path == intent.path)
+        {
+            return Err(Refusal::new(
+                "worktree-removal-incomplete",
+                "the interrupted removal's residue still exists",
+            ));
+        }
+        let evidence = OperationEvidence {
+            operation: intent.operation.clone(),
+            id: record.id.clone(),
+            path: intent.path.clone(),
+            head: Some(intent.head.clone()),
+            recovery: Some(intent.recovery.clone()),
+            recorded_at: self.clock.now(),
+        };
+        self.registry.complete_removal(&intent, &evidence)?;
+        Ok(evidence)
     }
 
     fn claim_cleanup(
@@ -1413,7 +1528,21 @@ where
         if let Some((policy, Some(relocation))) = retirement {
             self.require_retirement_topology(policy, record, path, relocation, true)?;
         }
-        self.git.remove(&record.repository_root, path)?;
+        self.git
+            .remove(&record.repository_root, path)
+            .map_err(|refusal| {
+                if operation == "remove" {
+                    Refusal::new(
+                        refusal.code,
+                        format!(
+                            "{}; rerun `worktree gc --apply --id {}` to finish the removal",
+                            refusal.message, record.id
+                        ),
+                    )
+                } else {
+                    refusal
+                }
+            })?;
         if let Some((policy, Some(relocation))) = retirement {
             self.require_retirement_topology(policy, record, path, relocation, false)?;
         }
@@ -1815,8 +1944,17 @@ mod tests {
         recoverable: bool,
         containment: Mutex<BTreeMap<String, Vec<String>>>,
         resolved_revision: Mutex<Option<String>>,
-        fail_remove: bool,
+        remove_fault: Option<RemoveFault>,
         snapshot_sequence: Mutex<VecDeque<String>>,
+        residue_matches: bool,
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum RemoveFault {
+        /// `git worktree remove` refuses and changes nothing.
+        Refuse,
+        /// `git worktree remove` unlinks the tree and then fails to delete its files.
+        Unlink,
     }
 
     impl GitPort for FakeGit {
@@ -1880,8 +2018,16 @@ mod tests {
         }
 
         fn remove(&self, _repository: &Path, worktree: &Path) -> Result<(), Refusal> {
-            if self.fail_remove {
+            if self.remove_fault == Some(RemoveFault::Refuse) {
                 return Err(Refusal::new("remove-failed", "injected removal failure"));
+            }
+            if self.remove_fault == Some(RemoveFault::Unlink) {
+                self.snapshots.lock().unwrap().remove(worktree);
+                self.discovered
+                    .lock()
+                    .unwrap()
+                    .retain(|item| item.path != worktree);
+                return Err(Refusal::new("git-command-failed", "Permission denied"));
             }
             if worktree.exists() {
                 std::fs::remove_dir(worktree).unwrap();
@@ -1891,6 +2037,27 @@ mod tests {
                 .lock()
                 .unwrap()
                 .retain(|item| item.path != worktree);
+            Ok(())
+        }
+
+        fn verify_removal_residue(
+            &self,
+            _repository: &Path,
+            worktree: &Path,
+            _head: &str,
+        ) -> Result<(), Refusal> {
+            if self.residue_matches {
+                Ok(())
+            } else {
+                Err(Refusal::new(
+                    "removal-residue-unproven",
+                    worktree.display().to_string(),
+                ))
+            }
+        }
+
+        fn delete_residue(&self, worktree: &Path) -> Result<(), Refusal> {
+            std::fs::remove_dir_all(worktree).unwrap();
             Ok(())
         }
 
@@ -2164,8 +2331,9 @@ mod tests {
             recoverable: true,
             containment: Mutex::new(BTreeMap::new()),
             resolved_revision: Mutex::new(None),
-            fail_remove: false,
+            remove_fault: None,
             snapshot_sequence: Mutex::new(VecDeque::new()),
+            residue_matches: true,
         }
     }
 
@@ -2290,9 +2458,10 @@ mod tests {
                 recoverable: true,
                 containment: Mutex::new(BTreeMap::new()),
                 resolved_revision: Mutex::new(None),
-                fail_remove: false,
+                remove_fault: None,
                 snapshot_sequence: Mutex::new(VecDeque::new()),
                 discovered_sequence: Mutex::new(VecDeque::new()),
+                residue_matches: true,
             },
             FakeRegistry {
                 records: Mutex::new(vec![registered.clone()]),
@@ -2353,9 +2522,10 @@ mod tests {
                 recoverable: true,
                 containment: Mutex::new(BTreeMap::new()),
                 resolved_revision: Mutex::new(None),
-                fail_remove: false,
+                remove_fault: None,
                 snapshot_sequence: Mutex::new(VecDeque::new()),
                 discovered_sequence: Mutex::new(VecDeque::new()),
+                residue_matches: true,
             },
             FakeRegistry {
                 records: Mutex::new(vec![registered.clone()]),
@@ -3147,6 +3317,132 @@ mod tests {
         assert!(path.exists());
     }
 
+    /// A finished tree whose `git worktree remove` unlinks it and then fails to delete its files.
+    fn interrupted_removal_fixture(
+        residue_matches: bool,
+    ) -> (
+        tempfile::TempDir,
+        WorkspacePolicy,
+        WorktreeRecord,
+        WorktreeManager<FakeGit, FakeRegistry, FixedClock>,
+    ) {
+        let temporary = tempdir().unwrap();
+        let workspace = temporary.path().join("workspace");
+        let repository = workspace.join("repo");
+        let managed_root = temporary.path().join("managed");
+        let path = managed_root.join("repo/read-only");
+        std::fs::create_dir_all(&repository).unwrap();
+        std::fs::create_dir_all(path.join("app/jobs")).unwrap();
+        let registered = named_record(
+            "read-only",
+            repository.clone(),
+            path.clone(),
+            Lifecycle::Finished,
+        );
+        let git = FakeGit {
+            snapshots: Mutex::new(BTreeMap::from([(
+                path.clone(),
+                WorktreeSnapshot {
+                    path: path.clone(),
+                    head: "abc".into(),
+                    dirty: false,
+                    locked: false,
+                },
+            )])),
+            discovered: Mutex::new(vec![DiscoveredWorktree {
+                path,
+                head: Some("abc".into()),
+                locked: false,
+                primary: false,
+            }]),
+            remove_fault: Some(RemoveFault::Unlink),
+            residue_matches,
+            ..fake_git(repository)
+        };
+        let manager =
+            WorktreeManager::new(git, fake_registry(vec![registered.clone()]), FixedClock);
+        (
+            temporary,
+            policy(workspace, managed_root),
+            registered,
+            manager,
+        )
+    }
+
+    #[test]
+    fn gc_finishes_a_removal_that_git_interrupted() {
+        let (_temporary, policy, registered, manager) = interrupted_removal_fixture(true);
+        let ids = std::slice::from_ref(&registered.id);
+
+        let first = manager.gc(&policy, ids, true).unwrap();
+        let refusal = first[0].refusal.as_ref().unwrap();
+        assert_eq!(refusal.code, "git-command-failed");
+        assert!(
+            refusal
+                .message
+                .contains("worktree gc --apply --id read-only")
+        );
+        assert!(registered.path.exists());
+
+        let dry_run = manager.gc(&policy, ids, false).unwrap();
+        assert!(dry_run[0].eligible, "{:?}", dry_run[0].refusal);
+
+        let applied = manager.gc(&policy, ids, true).unwrap();
+        let evidence = applied[0].evidence.as_ref().unwrap();
+        assert_eq!(evidence.operation, "remove");
+        assert_eq!(evidence.head.as_deref(), Some("abc"));
+        assert!(!registered.path.exists());
+        assert!(
+            manager
+                .registry()
+                .removal(registered.id.as_str())
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            manager.registry().list().unwrap()[0].lifecycle,
+            Lifecycle::Removed
+        );
+    }
+
+    #[test]
+    fn gc_retains_an_interrupted_removal_whose_residue_is_unproven() {
+        let (_temporary, policy, registered, manager) = interrupted_removal_fixture(false);
+        let ids = std::slice::from_ref(&registered.id);
+        manager.gc(&policy, ids, true).unwrap();
+
+        let applied = manager.gc(&policy, ids, true).unwrap();
+        assert_eq!(
+            applied[0].refusal.as_ref().unwrap().code,
+            "removal-residue-unproven"
+        );
+        assert!(registered.path.exists());
+        assert!(
+            manager
+                .registry()
+                .removal(registered.id.as_str())
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn gc_never_deletes_an_unlinked_tree_without_removal_intent() {
+        let (_temporary, policy, registered, manager) = interrupted_removal_fixture(true);
+        manager.git.snapshots.lock().unwrap().clear();
+        manager.git.discovered.lock().unwrap().clear();
+
+        let applied = manager
+            .gc(&policy, std::slice::from_ref(&registered.id), true)
+            .unwrap();
+        assert!(applied[0].evidence.is_none());
+        assert_eq!(
+            applied[0].refusal.as_ref().unwrap().code,
+            "worktree-not-found"
+        );
+        assert!(registered.path.exists());
+    }
+
     #[test]
     fn gc_persists_removal_intent_before_a_failed_delete() {
         let temporary = tempdir().unwrap();
@@ -3178,7 +3474,7 @@ mod tests {
                 locked: false,
                 primary: false,
             }]),
-            fail_remove: true,
+            remove_fault: Some(RemoveFault::Refuse),
             ..fake_git(repository)
         };
         let manager =

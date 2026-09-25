@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.7.2 — Unreleased
+
+- `worktree gc --apply` removes a tree holding a directory without the owner write bit. Before
+  the non-forced `git worktree remove`, the Git adapter gives the owner full access to every
+  directory below the proven tree; directory modes are untracked, the walk follows no symlink,
+  stays on the tree's filesystem and skips directories another user owns. Before this, Git unlinked
+  the tree and then failed to delete its files, leaving a present path that neither `gc` nor
+  `reconcile` could finish (#16).
+- `gc` finishes such an interrupted removal. A present path that Git no longer links, with a durable
+  `remove` intent for the same path, is assessed with fresh remote recovery proof plus proof that
+  every remaining file is the intent commit's tracked content. Only its own `.git` file is exempt.
+  An exact-id apply then deletes the residue and records the removal. Any other file
+  retains the tree as `removal-residue-unproven`; an unlinked tree without intent is still refused.
+- A failed `git worktree remove` during `gc --apply` names the rerun command in its refusal.
+- `GitPort` gains `verify_removal_residue` and `delete_residue`, each with a refusing default. No
+  wire-protocol, schema or other surface version changes.
+
 ## 0.7.1 — 2026-09-25
 
 - `worktree doctor --check` exits non-zero and names `no active profile` when the configuration
