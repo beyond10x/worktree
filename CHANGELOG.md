@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- `worktree doctor --check` exits non-zero and names `no active profile` when the configuration
+  holds no workspace profile, since every `worktree create` would then lack a policy. The readiness
+  decision moves into the library façade as `readiness_failures`. The success text line, the
+  `doctor` JSON payload and every declared surface version are unchanged; the generated skill
+  states the new exit behavior.
+
 ## 0.7.0 — 2026-09-24
 
 - Every release publishes prebuilt binaries: `worktree-<version>-<target>.tar.gz` for

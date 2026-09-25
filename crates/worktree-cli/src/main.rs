@@ -1,7 +1,10 @@
 //! Command-line composition root for the worktree lifecycle service.
 
 use anyhow::{Context, Result, anyhow};
-use b10x_worktree::{GitPort, RegistryPort, SystemClock, WorktreeManager};
+use b10x_worktree::{
+    GitPort, ReadinessFailure, ReadinessObservation, RegistryPort, SystemClock, WorktreeManager,
+    readiness_failures,
+};
 use b10x_worktree_domain::{
     CLI_PROTOCOL_VERSION, CreateRequest, GitRevision, HOOK_PROTOCOL_VERSION,
     RECONCILIATION_VERSION, ReconciliationAction, Refusal, WorktreeId,
@@ -659,12 +662,18 @@ fn doctor(check: bool, json: bool) -> Result<()> {
     if !report.git {
         report.errors.push("git is unavailable".into());
     }
-    let healthy = report.git && report.config && report.registry;
-    if check && !healthy {
-        return Err(anyhow!(
-            "doctor checks failed: {}",
-            report.errors.join("; ")
-        ));
+    let failures = readiness_failures(ReadinessObservation {
+        git: report.git,
+        config: report.config,
+        registry: report.registry,
+        profiles: report.profiles,
+    });
+    if check && !failures.is_empty() {
+        let mut reasons = report.errors.clone();
+        if failures.contains(&ReadinessFailure::NoActiveProfile) {
+            reasons.push(ReadinessFailure::NoActiveProfile.to_string());
+        }
+        return Err(anyhow!("doctor checks failed: {}", reasons.join("; ")));
     }
     emit_success(json, CLI_PROTOCOL_VERSION, &report, || {
         format!(
@@ -1005,7 +1014,7 @@ After verification, preserve the small logs, reports, or deliverables needed for
 - If removal is interrupted while the path still exists, rerun GC dry-run and exact-id apply. If the path is already absent, use reconciliation dry-run and exact-id apply; its durable removal intent can safely finish the recorded transition.
 - A missing Active record without matching durable removal intent stays refused while its work may still exist. Preserve and investigate its registry evidence; never edit the registry by hand, delete related state, or fabricate recovery proof. If its recorded commit still exists anywhere, publish it and rerun the dry-run.
 - Only once you have established that such a record's recorded commit is gone for good, abandon it with `worktree reconcile --repo <path> --apply --id <reviewed-id> --acknowledge-unrecoverable <recorded-commit>`. That acknowledgement asserts one exact commit named by the immediately preceding dry-run; the command still checks it and refuses while any local branch, tag, remote-tracking ref, or remote advertisement contains it. It deletes nothing from disk or from Git, and records the tombstone with no recovery proof, because there is none to record.
-- Run `worktree doctor --check` for prerequisites and configuration.
+- Run `worktree doctor --check` for prerequisites and configuration. It exits non-zero and names each failure, including `no active profile` when no workspace profile is activated.
 - Only after a human explicitly decides an existing linked tree should become manager-owned, run `worktree repo adopt --repo <primary> --path <linked-tree> --id <stable-id> --purpose <purpose>`. Then review `reconcile --dry-run` and use exact-id apply only if migration is intended.
 
 Never run `git worktree remove --force`, recursively delete a linked tree, place managed trees below the primary workspace, or clean up a tree merely because it looks old.

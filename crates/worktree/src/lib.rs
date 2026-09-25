@@ -1731,6 +1731,61 @@ fn require_exact_snapshot_path(
     Ok(())
 }
 
+/// Observed prerequisites for a readiness check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReadinessObservation {
+    /// Whether a working `git` executable is available.
+    pub git: bool,
+    /// Whether the configuration loaded and validated.
+    pub config: bool,
+    /// Whether the registry opened.
+    pub registry: bool,
+    /// Number of active workspace profiles in the configuration.
+    pub profiles: usize,
+}
+
+/// A named reason the service is not ready to create managed worktrees.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadinessFailure {
+    /// No working `git` executable.
+    GitUnavailable,
+    /// The configuration could not be loaded.
+    ConfigUnavailable,
+    /// The registry could not be opened.
+    RegistryUnavailable,
+    /// The configuration loaded but holds no workspace profile, so no create has a policy.
+    NoActiveProfile,
+}
+
+impl std::fmt::Display for ReadinessFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::GitUnavailable => "git is unavailable",
+            Self::ConfigUnavailable => "configuration is unavailable",
+            Self::RegistryUnavailable => "registry is unavailable",
+            Self::NoActiveProfile => "no active profile",
+        })
+    }
+}
+
+/// Decide readiness from observed prerequisites; an empty result means ready.
+#[must_use]
+pub fn readiness_failures(observation: ReadinessObservation) -> Vec<ReadinessFailure> {
+    let mut failures = Vec::new();
+    if !observation.git {
+        failures.push(ReadinessFailure::GitUnavailable);
+    }
+    if !observation.config {
+        failures.push(ReadinessFailure::ConfigUnavailable);
+    } else if observation.profiles == 0 {
+        failures.push(ReadinessFailure::NoActiveProfile);
+    }
+    if !observation.registry {
+        failures.push(ReadinessFailure::RegistryUnavailable);
+    }
+    failures
+}
+
 /// Construct the default state root without reading configuration.
 #[must_use]
 pub fn default_worktree_root(state_home: &Path) -> PathBuf {
@@ -3896,6 +3951,38 @@ mod tests {
                 .removal(registered.id.as_str())
                 .unwrap()
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn readiness_requires_an_active_profile() {
+        let ready = ReadinessObservation {
+            git: true,
+            config: true,
+            registry: true,
+            profiles: 1,
+        };
+        assert!(readiness_failures(ready).is_empty());
+        let no_profile = ReadinessObservation {
+            profiles: 0,
+            ..ready
+        };
+        assert_eq!(
+            readiness_failures(no_profile),
+            vec![ReadinessFailure::NoActiveProfile]
+        );
+        assert_eq!(
+            ReadinessFailure::NoActiveProfile.to_string(),
+            "no active profile"
+        );
+        let broken_config = ReadinessObservation {
+            config: false,
+            profiles: 0,
+            ..ready
+        };
+        assert_eq!(
+            readiness_failures(broken_config),
+            vec![ReadinessFailure::ConfigUnavailable]
         );
     }
 }
