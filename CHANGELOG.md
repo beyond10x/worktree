@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.7.2 — Unreleased
+## 0.7.2 — 2026-09-25
 
 - `worktree gc --apply` removes a tree holding a directory without the owner write bit. Before
   the non-forced `git worktree remove`, the Git adapter gives the owner full access to every
