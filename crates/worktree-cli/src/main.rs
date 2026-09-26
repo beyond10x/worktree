@@ -40,7 +40,9 @@ enum Command {
     Status,
     /// Inspect actual Git state, storage, leases, and reasons a checkout is retained.
     Inspect(InspectArgs),
-    /// Mark a clean, idle worktree finished.
+    /// Archive a tree's local-only commits and uncommitted state as local recovery proof.
+    Archive(ArchiveArgs),
+    /// Mark an idle worktree finished; it must be clean or exactly match its archive.
     Finish {
         /// Managed worktree path; defaults to the current directory.
         #[arg(default_value = ".")]
@@ -100,6 +102,16 @@ struct CreateArgs {
     /// Owner class recorded for cleanup delegation.
     #[arg(long, default_value = "agent")]
     owner: String,
+}
+
+#[derive(Debug, Args)]
+struct ArchiveArgs {
+    /// Managed worktree path; defaults to the current directory.
+    #[arg(default_value = ".")]
+    path: PathBuf,
+    /// Move an existing archive aside (never deleted) and write a new one.
+    #[arg(long)]
+    replace: bool,
 }
 
 #[derive(Debug, Args)]
@@ -325,6 +337,7 @@ fn run(cli: &Cli) -> Result<()> {
                 || format!("finished {}", evidence.path.display()),
             )
         }
+        Command::Archive(args) => archive(args, cli.json),
         Command::Gc(args) => gc(args, cli.json),
         Command::Reconcile(args) => reconcile(args, cli.json),
         Command::Doctor { check } => doctor(*check, cli.json),
@@ -337,7 +350,59 @@ fn run(cli: &Cli) -> Result<()> {
 fn manager() -> Result<Manager> {
     let registry = SqliteRegistry::open(&registry_path().map_err(anyhow::Error::new)?)
         .map_err(anyhow::Error::new)?;
-    Ok(WorktreeManager::new(ProcessGit, registry, SystemClock))
+    Ok(WorktreeManager::new(ProcessGit, registry, SystemClock).with_archive_root(archive_root()?))
+}
+
+/// Archives live beside the registry, under `<state home>/worktree/archives`.
+fn archive_root() -> Result<PathBuf> {
+    Ok(state_home()
+        .map_err(anyhow::Error::new)?
+        .join("worktree")
+        .join("archives"))
+}
+
+#[derive(Serialize)]
+struct ArchivePayload<'a> {
+    archive: &'a b10x_worktree_domain::ArchiveEvidence,
+}
+
+fn archive(args: &ArchiveArgs, json: bool) -> Result<()> {
+    let evidence = manager()?
+        .archive(&args.path, args.replace)
+        .map_err(anyhow::Error::new)?;
+    emit_success(
+        json,
+        CLI_PROTOCOL_VERSION,
+        ArchivePayload { archive: &evidence },
+        || {
+            let manifest = &evidence.manifest;
+            let mut lines = vec![format!(
+                "archived {} at {} to {}",
+                manifest.id,
+                manifest.head,
+                evidence.path.display()
+            )];
+            lines.push(format!(
+                "  {} local-only commit(s){}",
+                manifest.unique_commits.len(),
+                if manifest.bundle.is_some() {
+                    " in commits.bundle"
+                } else {
+                    ""
+                }
+            ));
+            if manifest.patch.is_some() {
+                lines.push("  on-disk content that differs from HEAD in dirty.patch".into());
+            }
+            if let Some(blocker) = &evidence.blocker {
+                lines.push(format!("  gc will still refuse this tree: {blocker}"));
+            }
+            if let Some(aside) = &evidence.superseded {
+                lines.push(format!("  previous archive moved to {}", aside.display()));
+            }
+            lines.join("\n")
+        },
+    )
 }
 
 fn inspect(args: &InspectArgs, json: bool) -> Result<()> {
@@ -544,6 +609,12 @@ fn gc(args: &GcArgs, json: bool) -> Result<()> {
                             },
                             |_| "removed".into(),
                         );
+                        let outcome = match &item.archive {
+                            Some(archive) => {
+                                format!("{outcome} (archive {})", archive.display())
+                            }
+                            None => outcome,
+                        };
                         format!(
                             "{}\t{outcome}\t{}",
                             item.record.id,
@@ -997,7 +1068,8 @@ After verification, preserve the small logs, reports, or deliverables needed for
 ## Finish and clean up
 
 1. Commit and publish every wanted change. A local-only commit is deliberately not cleanup-safe. Work merged as rebased or cherry-picked copies also qualifies when an advertised ref carries every unique commit's exact patch; GC reports that proof as `patch-equivalent`.
-2. Preserve required evidence and remove this task's disposable output as described above. Release your own lease, then run `worktree finish <tree>`. It refuses dirty, locked, unmanaged, live, or mid-operation Git worktrees.
+   When work must not be published, run `worktree archive <tree>` instead. It never modifies the tree; it writes `commits.bundle` (every commit no advertised ref holds), `dirty.patch` (tracked, untracked and ignored changes over HEAD) and a `worktree.archive/1` `manifest.json` below the state directory's `worktree/archives/<repository>/<id>/`, and verifies them. GC then accepts that archive as `archive` proof while HEAD and every file still match it exactly; any later commit or edit is refused as `archive-stale` until `worktree archive --replace <tree>` writes a new one. `--replace` moves the old archive aside and never deletes it.
+2. Preserve required evidence and remove this task's disposable output as described above. Release your own lease, then run `worktree finish <tree>`. It refuses locked, unmanaged, live, or mid-operation Git worktrees, and dirty ones unless their archive holds exactly the current state.
 3. Run `worktree gc --repo <primary> --dry-run --id <id>` and inspect every result. Without exact ids, `--repo` selects the activated workspace profile, not just the repository: the assessment covers records under that profile's `workspace_root`, including other repositories.
 4. Run `worktree gc --repo <primary> --apply --id <reviewed-id>` with repeated `--id` values only for the exact results intended for removal. The command refreshes remote advertisements, fetches required objects, and revalidates immediately before non-forced removal. Check the result before reporting storage reclaimed.
 5. End with either verified cleanup or an explicit handoff: tree id and path, published branch/commit, related work-item references, retained evidence, remaining blockers, next owner and next action. Never leave a tree silently active or label work complete merely from its age or Git state.
@@ -1014,6 +1086,8 @@ After verification, preserve the small logs, reports, or deliverables needed for
 - If removal is interrupted while the path still exists, rerun GC dry-run and exact-id apply. If the path is already absent, use reconciliation dry-run and exact-id apply; its durable removal intent can safely finish the recorded transition.
 - A missing Active record without matching durable removal intent stays refused while its work may still exist. Preserve and investigate its registry evidence; never edit the registry by hand, delete related state, or fabricate recovery proof. If its recorded commit still exists anywhere, publish it and rerun the dry-run.
 - Only once you have established that such a record's recorded commit is gone for good, abandon it with `worktree reconcile --repo <path> --apply --id <reviewed-id> --acknowledge-unrecoverable <recorded-commit>`. That acknowledgement asserts one exact commit named by the immediately preceding dry-run; the command still checks it and refuses while any local branch, tag, remote-tracking ref, or remote advertisement contains it. It deletes nothing from disk or from Git, and records the tombstone with no recovery proof, because there is none to record.
+- An archive outlives the tree it retired. Restore it from a `--no-checkout` clone that has the advertised refs: first write `* -text -eol -filter -ident -working-tree-encoding` to `.git/info/attributes` so that attributes cannot rewrite the archived bytes, then `git fetch <archive>/commits.bundle refs/worktree-archive/head:refs/heads/<name>`, and run both `switch <name>` and, when the archive has one, `apply --binary --whitespace=nowarn <archive>/dirty.patch` as `git -c core.autocrlf=false -c core.fileMode=true -c core.symlinks=true …`. Never use `--attr-source` for this: Git 2.55 `apply` crashes with it. Never delete an archive to make GC pass; `archive-digest-mismatch` and `archive-incomplete` mean it no longer proves recovery.
+- `worktree-hidden-state` (assume-unchanged or skip-worktree entries, staged content only the index holds, a nested `.git`) and `worktree-local-refs` (refs under `refs/worktree/`, `refs/bisect/`, `refs/rewritten/`) retain a tree whether or not it is archived, because Git status does not show that state and removal would destroy it. Resolve the named state yourself; never clear it just to make GC pass.
 - Run `worktree doctor --check` for prerequisites and configuration. It exits non-zero and names each failure, including `no active profile` when no workspace profile is activated.
 - Only after a human explicitly decides an existing linked tree should become manager-owned, run `worktree repo adopt --repo <primary> --path <linked-tree> --id <stable-id> --purpose <purpose>`. Then review `reconcile --dry-run` and use exact-id apply only if migration is intended.
 
@@ -1140,8 +1214,35 @@ mod tests {
         assert!(markdown.contains("--allow-external-retirement"));
         assert!(markdown.contains("--acknowledge-unrecoverable <recorded-commit>"));
         assert!(markdown.contains("gone for good"));
+        assert!(markdown.contains("worktree archive <tree>"));
+        assert!(markdown.contains("worktree archive --replace <tree>"));
+        assert!(markdown.contains("archive-stale"));
+        assert!(markdown.contains(".git/info/attributes"));
+        assert!(markdown.contains("worktree-hidden-state"));
+        assert!(markdown.contains("worktree-local-refs"));
         assert!(interface.contains("$worktree"));
         assert!(interface.contains("Generated by `worktree skill`"));
+    }
+
+    #[test]
+    fn archive_defaults_to_the_current_tree_and_replaces_only_on_request() {
+        let plain = Cli::try_parse_from(["worktree", "archive"]).unwrap();
+        let Command::Archive(args) = &plain.command else {
+            panic!("archive command");
+        };
+        assert_eq!(args.path, PathBuf::from("."));
+        assert!(!args.replace);
+        assert_eq!(
+            command_protocol_version(&plain.command),
+            CLI_PROTOCOL_VERSION
+        );
+
+        let replace = Cli::try_parse_from(["worktree", "archive", "--replace", "/tree"]).unwrap();
+        let Command::Archive(args) = replace.command else {
+            panic!("archive command");
+        };
+        assert_eq!(args.path, PathBuf::from("/tree"));
+        assert!(args.replace);
     }
 
     #[test]

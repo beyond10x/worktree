@@ -1,10 +1,11 @@
 //! Embeddable lifecycle service. The policy engine depends only on injected ports.
 
 use b10x_worktree_domain::{
-    CleanupAssessment, CreatePlan, CreateRequest, DiscoveredWorktree, GitRevision, Lifecycle,
-    OperationEvidence, ReconciliationAction, ReconciliationAssessment, RecoveryEvidence,
-    RecoveryProof, Refusal, RelocationIntent, RemovalIntent, RepositorySnapshot, WorkspacePolicy,
-    WorktreeId, WorktreeRecord, WorktreeSnapshot, require_child,
+    ArchiveEvidence, ArchiveReference, ArchiveRequest, ArchiveStateCheck, CleanupAssessment,
+    CreatePlan, CreateRequest, DiscoveredWorktree, GitRevision, Lifecycle, OperationEvidence,
+    ReconciliationAction, ReconciliationAssessment, RecoveryEvidence, RecoveryKind, RecoveryProof,
+    Refusal, RelocationIntent, RemovalIntent, RepositorySnapshot, WorkspacePolicy, WorktreeId,
+    WorktreeRecord, WorktreeSnapshot, require_child,
 };
 use std::path::{Path, PathBuf};
 
@@ -106,6 +107,74 @@ pub trait GitPort: Send + Sync {
     fn validate_move_worktree(&self, from: &Path, to: &Path) -> Result<(), Refusal>;
     /// Discover all linked worktrees known to Git.
     fn list_worktrees(&self, repository: &Path) -> Result<Vec<DiscoveredWorktree>, Refusal>;
+    /// Write and verify an archive of one tree without modifying the tree. The default refuses.
+    ///
+    /// The archive holds every commit HEAD adds over the refs currently advertised by the
+    /// configured remotes and, for a dirty tree, its complete uncommitted state. It is published
+    /// at `request.destination` only after it has been verified.
+    fn write_archive(&self, request: &ArchiveRequest<'_>) -> Result<ArchiveEvidence, Refusal> {
+        Err(archive_unsupported(request.destination))
+    }
+    /// Verify an archive as recovery proof for `head`. The default refuses.
+    ///
+    /// Digests, `git bundle verify`, the bundle's own objects against every commit HEAD adds over
+    /// freshly advertised refs, and for a dirty tree its exact current content must all agree.
+    fn verify_archive(
+        &self,
+        _record: &WorktreeRecord,
+        archive: &Path,
+        _head: &str,
+        _state: ArchiveStateCheck<'_>,
+    ) -> Result<ArchiveReference, Refusal> {
+        Err(archive_unsupported(archive))
+    }
+    /// Verify, without contacting a remote, that a dirty tree's content equals the archived
+    /// state for `head`. The default refuses.
+    fn verify_archived_state(
+        &self,
+        _record: &WorktreeRecord,
+        archive: &Path,
+        _head: &str,
+    ) -> Result<(), Refusal> {
+        Err(archive_unsupported(archive))
+    }
+    /// Return a verified archived tree to its clean HEAD so it can be removed without force.
+    ///
+    /// Every file removed or restored must match the archive at the moment it is discarded. The
+    /// default refuses.
+    fn discard_archived_state(
+        &self,
+        _record: &WorktreeRecord,
+        archive: &Path,
+        _head: &str,
+    ) -> Result<(), Refusal> {
+        Err(archive_unsupported(archive))
+    }
+    /// Refuse state that a removal would lose although Git status reports nothing: entries
+    /// marked assume-unchanged or skip-worktree, staged content that differs from both HEAD and
+    /// the working copy, files below a nested `.git`, and per-worktree refs.
+    ///
+    /// Neither remote refs nor an archive cover this state. The default refuses, because an
+    /// adapter that cannot look has not shown that nothing is there.
+    fn hidden_state(&self, _repository: &Path, worktree: &Path) -> Result<(), Refusal> {
+        Err(Refusal::new(
+            "hidden-state-unobserved",
+            format!(
+                "this Git adapter cannot observe state that Git status hides in {}",
+                worktree.display()
+            ),
+        ))
+    }
+}
+
+fn archive_unsupported(archive: &Path) -> Refusal {
+    Refusal::new(
+        "archive-unsupported",
+        format!(
+            "this Git adapter cannot write or verify the archive at {}",
+            archive.display()
+        ),
+    )
 }
 
 /// Durable ownership, lifecycle and lease registry.
@@ -182,6 +251,7 @@ pub struct WorktreeManager<G, R, C> {
     registry: R,
     clock: C,
     lease_timeout_seconds: i64,
+    archive_root: Option<PathBuf>,
 }
 
 impl<G, R, C> WorktreeManager<G, R, C>
@@ -190,14 +260,161 @@ where
     R: RegistryPort,
     C: Clock,
 {
-    /// Construct a manager with a one-hour abandoned-session lease timeout.
+    /// Construct a manager with a one-hour abandoned-session lease timeout and no archive root.
     pub fn new(git: G, registry: R, clock: C) -> Self {
         Self {
             git,
             registry,
             clock,
             lease_timeout_seconds: 3_600,
+            archive_root: None,
         }
+    }
+
+    /// Keep tree archives below `root`, as `<root>/<repository name>/<id>/`.
+    ///
+    /// Without an archive root no archive is written or consulted, so every decision is exactly
+    /// the one a manager without archives makes.
+    #[must_use]
+    pub fn with_archive_root(mut self, root: PathBuf) -> Self {
+        self.archive_root = Some(root);
+        self
+    }
+
+    /// Archive a managed tree's local-only commits and uncommitted state without modifying it.
+    ///
+    /// An existing archive is refused unless `replace` is set, in which case it is moved aside,
+    /// never deleted.
+    pub fn archive(&self, path: &Path, replace: bool) -> Result<ArchiveEvidence, Refusal> {
+        let record = self.owned_record(path)?;
+        if !matches!(record.lifecycle, Lifecycle::Active | Lifecycle::Finished) {
+            return Err(Refusal::new(
+                "not-archivable",
+                "only an active or finished worktree can be archived",
+            ));
+        }
+        let destination = self.archive_dir(&record)?.ok_or_else(|| {
+            Refusal::new(
+                "archive-root-unconfigured",
+                "this manager has no archive root",
+            )
+        })?;
+        let snapshot = self.exact_worktree_snapshot(&record.repository_root, &record.path)?;
+        require_unlocked(&snapshot)?;
+        if !replace && !path_absent(&destination)? {
+            return Err(Refusal::new(
+                "archive-exists",
+                format!(
+                    "{} already holds an archive; pass --replace to move it aside and write a new one",
+                    destination.display()
+                ),
+            ));
+        }
+        let mut evidence = self.git.write_archive(&ArchiveRequest {
+            record: &record,
+            head: &snapshot.head,
+            destination: &destination,
+            replace,
+            created_at: self.clock.now(),
+        })?;
+        // The archive is kept either way; the caller learns now what cleanup will still refuse.
+        evidence.blocker = self
+            .git
+            .hidden_state(&record.repository_root, &record.path)
+            .err();
+        let after = self.exact_worktree_snapshot(&record.repository_root, &record.path)?;
+        if after.head != snapshot.head {
+            return Err(Refusal::new(
+                "archive-stale",
+                format!(
+                    "HEAD moved while {} was written; rerun `worktree archive --replace`",
+                    destination.display()
+                ),
+            ));
+        }
+        Ok(evidence)
+    }
+
+    /// The archive directory for a record, when an archive root is configured.
+    fn archive_dir(&self, record: &WorktreeRecord) -> Result<Option<PathBuf>, Refusal> {
+        let Some(root) = &self.archive_root else {
+            return Ok(None);
+        };
+        let repository = record
+            .repository_root
+            .file_name()
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| {
+                Refusal::new(
+                    "invalid-repository-name",
+                    record.repository_root.display().to_string(),
+                )
+            })?;
+        Ok(Some(root.join(repository).join(record.id.as_str())))
+    }
+
+    /// The archive directory for a record, only when an archive is actually present there.
+    fn existing_archive(&self, record: &WorktreeRecord) -> Result<Option<PathBuf>, Refusal> {
+        match self.archive_dir(record)? {
+            Some(dir) if !path_absent(&dir)? => Ok(Some(dir)),
+            _ => Ok(None),
+        }
+    }
+
+    /// Recovery proof from a verified archive.
+    fn archive_proof(
+        &self,
+        record: &WorktreeRecord,
+        archive: &Path,
+        head: &str,
+        state: ArchiveStateCheck<'_>,
+        now: i64,
+    ) -> Result<RecoveryProof, Refusal> {
+        let reference = self.git.verify_archive(record, archive, head, state)?;
+        Ok(RecoveryProof {
+            head: head.to_owned(),
+            refs: Vec::new(),
+            observed_at: now,
+            kind: RecoveryKind::Archive,
+            equivalent_commits: Vec::new(),
+            archive: Some(reference),
+        })
+    }
+
+    /// Refuse a locked tree, and a dirty one unless an archive holds exactly its current state.
+    ///
+    /// `proof` names the archive a removal relies on; its fingerprint is then checked whether
+    /// or not Git reports the tree dirty, because Git status can be told not to look. Without
+    /// proof (finish, claim), the record's own archive is consulted only for a dirty tree.
+    /// Remote-ref proof never covers uncommitted state.
+    fn require_clean_or_archived(
+        &self,
+        record: &WorktreeRecord,
+        snapshot: &WorktreeSnapshot,
+        proof: Option<&RecoveryProof>,
+    ) -> Result<(), Refusal> {
+        require_unlocked(snapshot)?;
+        let relied_on = proof
+            .filter(|proof| proof.kind == RecoveryKind::Archive)
+            .and_then(|proof| proof.archive.as_ref())
+            .map(|reference| reference.path.clone());
+        if let Some(archive) = relied_on {
+            return self
+                .git
+                .verify_archived_state(record, &archive, &snapshot.head);
+        }
+        if !snapshot.dirty {
+            return Ok(());
+        }
+        let archive = match proof {
+            Some(_) => None,
+            None => self.existing_archive(record)?,
+        };
+        let Some(archive) = archive else {
+            return Err(dirty_refusal());
+        };
+        self.git
+            .verify_archived_state(record, &archive, &snapshot.head)
     }
 
     /// Access the registry port for status-oriented integrations.
@@ -323,7 +540,7 @@ where
         let now = self.clock.now();
         self.require_idle(&record, now)?;
         let snapshot = self.exact_worktree_snapshot(&record.repository_root, &record.path)?;
-        require_clean_unlocked(&snapshot)?;
+        self.require_clean_or_archived(&record, &snapshot, None)?;
         self.registry.mark_finished(
             record.id.as_str(),
             &snapshot.head,
@@ -387,62 +604,60 @@ where
         let mut assessments = Vec::with_capacity(planned.len());
         for (record, assessment) in planned {
             match assessment {
-                Ok(_) if !apply => assessments.push(CleanupAssessment {
+                Ok(proof) if !apply => assessments.push(CleanupAssessment {
                     record,
                     eligible: true,
                     refusal: None,
                     evidence: None,
+                    archive: proof.archive.map(|reference| reference.path),
                 }),
-                Ok(_) => {
-                    match self.claim_cleanup(policy, record.clone()) {
-                        Err(refusal) => assessments.push(CleanupAssessment {
-                            record,
-                            eligible: false,
-                            refusal: Some(refusal),
-                            evidence: None,
-                        }),
-                        Ok(claimed) => {
-                            // Re-observe immediately before the only destructive call.
-                            let applied = self
-                                .assess_cleanup(policy, &claimed, self.clock.now())
-                                .and_then(|proof| match self.interrupted_removal(&claimed)? {
-                                    Some(intent) => {
-                                        self.finish_interrupted_removal(&claimed, intent, proof)
-                                    }
-                                    None => self.apply_removal(
-                                        &claimed,
-                                        &claimed.path,
-                                        "remove",
-                                        proof,
-                                        None,
-                                    ),
-                                });
-                            match applied {
-                                Ok(evidence) => assessments.push(CleanupAssessment {
-                                    record: claimed,
-                                    eligible: true,
-                                    refusal: None,
-                                    evidence: Some(evidence),
-                                }),
-                                Err(refusal) => assessments.push(CleanupAssessment {
-                                    record: claimed,
-                                    eligible: false,
-                                    refusal: Some(refusal),
-                                    evidence: None,
-                                }),
-                            }
-                        }
-                    }
-                }
+                Ok(_) => assessments.push(self.apply_cleanup(policy, record)),
                 Err(refusal) => assessments.push(CleanupAssessment {
                     record,
                     eligible: false,
                     refusal: Some(refusal),
                     evidence: None,
+                    archive: None,
                 }),
             }
         }
         Ok(assessments)
+    }
+
+    /// Claim, re-assess and remove one reviewed cleanup candidate.
+    fn apply_cleanup(&self, policy: &WorkspacePolicy, record: WorktreeRecord) -> CleanupAssessment {
+        let refused = |record, refusal| CleanupAssessment {
+            record,
+            eligible: false,
+            refusal: Some(refusal),
+            evidence: None,
+            archive: None,
+        };
+        let claimed = match self.claim_cleanup(policy, record.clone()) {
+            Ok(claimed) => claimed,
+            Err(refusal) => return refused(record, refusal),
+        };
+        // Re-observe immediately before the only destructive call.
+        let applied = self
+            .assess_cleanup(policy, &claimed, self.clock.now())
+            .and_then(|proof| match self.interrupted_removal(&claimed)? {
+                Some(intent) => self.finish_interrupted_removal(&claimed, intent, proof),
+                None => self.apply_removal(&claimed, &claimed.path, "remove", proof, None),
+            });
+        match applied {
+            Ok(evidence) => CleanupAssessment {
+                record: claimed,
+                eligible: true,
+                refusal: None,
+                archive: evidence
+                    .recovery
+                    .as_ref()
+                    .and_then(|proof| proof.archive.as_ref())
+                    .map(|reference| reference.path.clone()),
+                evidence: Some(evidence),
+            },
+            Err(refusal) => refused(claimed, refusal),
+        }
     }
 
     /// Reconcile adopted legacy paths and registry records whose worktrees are already absent.
@@ -694,15 +909,58 @@ where
     ) -> Result<RecoveryProof, Refusal> {
         require_canonical_child(&policy.worktree_root, &record.path)?;
         self.require_idle(record, now)?;
+        let archive = self.existing_archive(record)?;
         if let Some(intent) = self.interrupted_removal(record)? {
-            let proof = self.recovery_proof(&record.repository_root, &intent.head, now)?;
+            // The residue is proven to be HEAD's tracked content, so only commits need proof.
+            let proof = self
+                .recovery_proof(&record.repository_root, &intent.head, now)
+                .or_else(|refusal| match &archive {
+                    Some(dir) if refusal.code == NO_REMOTE_RECOVERY_PROOF => self.archive_proof(
+                        record,
+                        dir,
+                        &intent.head,
+                        ArchiveStateCheck::Unlinked,
+                        now,
+                    ),
+                    _ => Err(refusal),
+                })?;
             self.git
                 .verify_removal_residue(&record.repository_root, &record.path, &intent.head)?;
             return Ok(proof);
         }
         let snapshot = self.exact_worktree_snapshot(&record.repository_root, &record.path)?;
-        require_clean_unlocked(&snapshot)?;
+        require_unlocked(&snapshot)?;
+        if snapshot.dirty && archive.is_none() {
+            // Remote refs never hold uncommitted state; only an exact archive can.
+            return Err(dirty_refusal());
+        }
+        self.git
+            .hidden_state(&record.repository_root, &record.path)?;
+        if let (true, Some(dir)) = (snapshot.dirty, &archive) {
+            self.require_matching_removal_intent(record)?;
+            return self.archive_proof(
+                record,
+                dir,
+                &snapshot.head,
+                ArchiveStateCheck::Linked {
+                    worktree: &record.path,
+                },
+                now,
+            );
+        }
         self.recovery_for_record(record, &snapshot.head, now)
+            .or_else(|refusal| match &archive {
+                Some(dir) if refusal.code == NO_REMOTE_RECOVERY_PROOF => self.archive_proof(
+                    record,
+                    dir,
+                    &snapshot.head,
+                    ArchiveStateCheck::Linked {
+                        worktree: &record.path,
+                    },
+                    now,
+                ),
+                _ => Err(refusal),
+            })
     }
 
     /// Return the durable `remove` intent of a tree Git already unlinked while its path remains.
@@ -792,7 +1050,7 @@ where
             return Ok(record);
         }
         let snapshot = self.exact_worktree_snapshot(&record.repository_root, &record.path)?;
-        require_clean_unlocked(&snapshot)?;
+        self.require_clean_or_archived(&record, &snapshot, None)?;
         let now = self.clock.now();
         self.registry.claim_expired(
             record.id.as_str(),
@@ -1117,6 +1375,7 @@ where
             ));
         }
         require_clean_unlocked(&snapshot)?;
+        self.git.hidden_state(&record.repository_root, path)?;
         self.recovery_for_record(record, &snapshot.head, now)
             .map(Some)
     }
@@ -1383,7 +1642,7 @@ where
         let evidence = self.git.recovery_evidence(repository, head)?;
         if evidence.refs.is_empty() {
             return Err(Refusal::new(
-                "no-remote-recovery-proof",
+                NO_REMOTE_RECOVERY_PROOF,
                 format!(
                     "commit {head} is not reachable from an advertised remote ref, and no \
                      advertised ref carries a patch-identical commit for each of its unique commits"
@@ -1396,6 +1655,7 @@ where
             observed_at: now,
             kind: evidence.kind,
             equivalent_commits: evidence.equivalent_commits,
+            archive: None,
         })
     }
 
@@ -1405,6 +1665,11 @@ where
         head: &str,
         now: i64,
     ) -> Result<RecoveryProof, Refusal> {
+        self.require_matching_removal_intent(record)?;
+        self.recovery_proof(&record.repository_root, head, now)
+    }
+
+    fn require_matching_removal_intent(&self, record: &WorktreeRecord) -> Result<(), Refusal> {
         if let Some(intent) = self.registry.removal(record.id.as_str())? {
             if intent.path != record.path {
                 return Err(Refusal::new(
@@ -1413,7 +1678,7 @@ where
                 ));
             }
         }
-        self.recovery_proof(&record.repository_root, head, now)
+        Ok(())
     }
 
     fn require_retirement_topology(
@@ -1493,7 +1758,8 @@ where
             self.require_retirement_topology(policy, record, path, relocation, true)?;
         }
         let before_intent = self.exact_worktree_snapshot(&record.repository_root, path)?;
-        require_clean_unlocked(&before_intent)?;
+        self.require_clean_or_archived(record, &before_intent, Some(&proof))?;
+        self.git.hidden_state(&record.repository_root, path)?;
         if before_intent.head != proof.head {
             return Err(Refusal::new(
                 "worktree-head-changed-during-proof",
@@ -1517,13 +1783,35 @@ where
             planned_at: self.clock.now(),
         };
         self.registry.begin_removal(&intent)?;
-        let before_remove = self.exact_worktree_snapshot(&record.repository_root, path)?;
-        require_clean_unlocked(&before_remove)?;
+        let mut before_remove = self.exact_worktree_snapshot(&record.repository_root, path)?;
+        self.require_clean_or_archived(record, &before_remove, Some(&intent.recovery))?;
+        self.git.hidden_state(&record.repository_root, path)?;
         if before_remove.head != intent.head {
             return Err(Refusal::new(
                 "worktree-head-changed-after-intent",
                 "worktree HEAD changed after removal intent became durable",
             ));
+        }
+        if before_remove.dirty {
+            // Reached only with archive proof that holds exactly this state: return the tree to
+            // HEAD so that Git removes it without force, then prove that it did.
+            let archive = intent
+                .recovery
+                .archive
+                .as_ref()
+                .map(|reference| reference.path.clone())
+                .ok_or_else(dirty_refusal)?;
+            self.git
+                .discard_archived_state(record, &archive, &intent.head)?;
+            before_remove = self.exact_worktree_snapshot(&record.repository_root, path)?;
+            require_clean_unlocked(&before_remove)?;
+            self.git.hidden_state(&record.repository_root, path)?;
+            if before_remove.head != intent.head {
+                return Err(Refusal::new(
+                    "worktree-head-changed-after-intent",
+                    "worktree HEAD changed after removal intent became durable",
+                ));
+            }
         }
         if let Some((policy, Some(relocation))) = retirement {
             self.require_retirement_topology(policy, record, path, relocation, true)?;
@@ -1827,20 +2115,32 @@ fn validate_label(name: &str, value: &str) -> Result<(), Refusal> {
     Ok(())
 }
 
+/// Refusal code when no advertised ref proves a commit recoverable.
+const NO_REMOTE_RECOVERY_PROOF: &str = "no-remote-recovery-proof";
+
 fn require_clean_unlocked(snapshot: &WorktreeSnapshot) -> Result<(), Refusal> {
+    require_unlocked(snapshot)?;
+    if snapshot.dirty {
+        return Err(dirty_refusal());
+    }
+    Ok(())
+}
+
+fn require_unlocked(snapshot: &WorktreeSnapshot) -> Result<(), Refusal> {
     if snapshot.locked {
         return Err(Refusal::new(
             "worktree-locked",
             "Git marks the worktree locked",
         ));
     }
-    if snapshot.dirty {
-        return Err(Refusal::new(
-            "worktree-dirty",
-            "tracked, untracked, or ignored files make cleanup unsafe",
-        ));
-    }
     Ok(())
+}
+
+fn dirty_refusal() -> Refusal {
+    Refusal::new(
+        "worktree-dirty",
+        "tracked, untracked, or ignored files make cleanup unsafe",
+    )
 }
 
 fn require_exact_snapshot_path(
@@ -2086,6 +2386,10 @@ mod tests {
                 return Ok(discovered);
             }
             Ok(self.discovered.lock().unwrap().clone())
+        }
+
+        fn hidden_state(&self, _repository: &Path, _worktree: &Path) -> Result<(), Refusal> {
+            Ok(())
         }
     }
 
@@ -2422,6 +2726,7 @@ mod tests {
                 observed_at: 3,
                 kind: b10x_worktree_domain::RecoveryKind::Ancestor,
                 equivalent_commits: Vec::new(),
+                archive: None,
             },
             operation: "retire-external".into(),
             planned_at: 3,
@@ -2964,6 +3269,7 @@ mod tests {
                 observed_at: 900,
                 kind: b10x_worktree_domain::RecoveryKind::Ancestor,
                 equivalent_commits: Vec::new(),
+                archive: None,
             },
             operation: "remove".into(),
             planned_at: 900,
@@ -3367,6 +3673,115 @@ mod tests {
             registered,
             manager,
         )
+    }
+
+    /// A finished tree, an archive root, and optionally an archive directory for the tree.
+    ///
+    /// `FakeGit` keeps the refusing archive defaults, so any archive consultation is visible as
+    /// `archive-unsupported`.
+    fn archive_fixture(
+        dirty: bool,
+        recoverable: bool,
+        archived: bool,
+    ) -> (
+        tempfile::TempDir,
+        WorkspacePolicy,
+        WorktreeRecord,
+        WorktreeManager<FakeGit, FakeRegistry, FixedClock>,
+    ) {
+        let temporary = tempdir().unwrap();
+        let workspace = temporary.path().join("workspace");
+        let repository = workspace.join("repo");
+        let managed_root = temporary.path().join("managed");
+        let path = managed_root.join("repo/archived");
+        let archive_root = temporary.path().join("archive_root");
+        std::fs::create_dir_all(&repository).unwrap();
+        std::fs::create_dir_all(&path).unwrap();
+        if archived {
+            std::fs::create_dir_all(archive_root.join("repo/archived")).unwrap();
+        }
+        let registered = named_record(
+            "archived",
+            repository.clone(),
+            path.clone(),
+            Lifecycle::Finished,
+        );
+        let git = FakeGit {
+            snapshots: Mutex::new(BTreeMap::from([(
+                path.clone(),
+                WorktreeSnapshot {
+                    path: path.clone(),
+                    head: "abc".into(),
+                    dirty,
+                    locked: false,
+                },
+            )])),
+            discovered: Mutex::new(vec![discovered_worktree(&path, "abc")]),
+            recoverable,
+            ..fake_git(repository)
+        };
+        let manager =
+            WorktreeManager::new(git, fake_registry(vec![registered.clone()]), FixedClock)
+                .with_archive_root(archive_root);
+        (
+            temporary,
+            policy(workspace, managed_root),
+            registered,
+            manager,
+        )
+    }
+
+    fn assess_one(
+        manager: &WorktreeManager<FakeGit, FakeRegistry, FixedClock>,
+        policy: &WorkspacePolicy,
+        record: &WorktreeRecord,
+    ) -> CleanupAssessment {
+        let mut assessments = manager
+            .gc(policy, std::slice::from_ref(&record.id), false)
+            .unwrap();
+        assert_eq!(assessments.len(), 1);
+        assessments.remove(0)
+    }
+
+    #[test]
+    fn an_archive_is_not_consulted_while_remote_refs_prove_a_clean_tree() {
+        let (_temporary, policy, registered, manager) = archive_fixture(false, true, true);
+
+        let assessment = assess_one(&manager, &policy, &registered);
+        assert!(assessment.eligible, "{:?}", assessment.refusal);
+        assert_eq!(assessment.archive, None);
+    }
+
+    #[test]
+    fn a_present_archive_stands_in_only_for_missing_remote_proof() {
+        let (_temporary, policy, registered, manager) = archive_fixture(false, false, true);
+
+        let assessment = assess_one(&manager, &policy, &registered);
+        assert_eq!(assessment.refusal.unwrap().code, "archive-unsupported");
+    }
+
+    #[test]
+    fn without_an_archive_a_local_only_tree_is_refused_as_before() {
+        let (_temporary, policy, registered, manager) = archive_fixture(false, false, false);
+
+        let assessment = assess_one(&manager, &policy, &registered);
+        assert_eq!(assessment.refusal.unwrap().code, "no-remote-recovery-proof");
+    }
+
+    #[test]
+    fn without_an_archive_a_dirty_tree_is_refused_as_before() {
+        let (_temporary, policy, registered, manager) = archive_fixture(true, true, false);
+
+        let assessment = assess_one(&manager, &policy, &registered);
+        assert_eq!(assessment.refusal.unwrap().code, "worktree-dirty");
+    }
+
+    #[test]
+    fn remote_refs_never_cover_a_dirty_tree_that_has_an_archive() {
+        let (_temporary, policy, registered, manager) = archive_fixture(true, true, true);
+
+        let assessment = assess_one(&manager, &policy, &registered);
+        assert_eq!(assessment.refusal.unwrap().code, "archive-unsupported");
     }
 
     #[test]

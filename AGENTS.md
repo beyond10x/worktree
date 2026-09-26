@@ -28,6 +28,16 @@ independent policy: every decision must come from the public façade.
   no advertised ref holds is a single-parent, non-empty commit whose whitespace-exact patch one
   advertised ref carries. Patch equivalence never weakens to Git's whitespace-insensitive patch ids
   alone.
+- Every removal also refuses state Git status does not report: assume-unchanged and skip-worktree
+  entries, staged content that differs from both HEAD and the working copy, any `.git` below the
+  tree's root, and per-worktree refs. No proof, remote or archived, covers it.
+- The one substitute for that remote proof is a verified local archive of the same record and
+  HEAD: its files keep their recorded SHA-256, the bundle's own pack holds every object HEAD adds
+  over freshly advertised refs, and the tree's complete on-disk content still has the archived
+  fingerprint, whether or not Git reports it dirty; remote refs never cover uncommitted state. Such
+  a tree is returned to HEAD by resetting the index, then restoring or deleting each file only after
+  re-hashing it against the archive, before the non-forced removal. Archiving never modifies the
+  tree, and no command deletes an archive.
 - Ordinary GC requires canonical containment below the configured worktree root. Only exact-id
   reconciliation with separate external-retirement confirmation may retire a finished external
   legacy tree after the same removal gates pass.
@@ -45,10 +55,10 @@ independent policy: every decision must come from the public façade.
 - Apply operations for GC and reconciliation require exact reviewed worktree ids. Cleanup and
   relocation lifecycle claims, final HEAD updates, and lease exclusions are atomic, and
   proof-bearing removal intent is durable.
-- CLI JSON protocol version 3, reconciliation version 3, inspection format
-  `worktree.inspection/2`, hook protocol version 1, and configuration/workspace-policy version 1
-  are immutable after release. Cut a new surface version
-  for a wire change.
+- CLI JSON protocol version 4, reconciliation version 4, inspection format
+  `worktree.inspection/2`, archive manifest format `worktree.archive/1`, hook protocol version 1,
+  and configuration/workspace-policy version 1 are immutable after release. Cut a new surface
+  version for a wire change.
 - Generated skill content comes from `worktree skill`; do not edit it by hand.
 - A public API belongs in a library crate. The binary is an adapter, not the product boundary.
 

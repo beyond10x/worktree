@@ -40,7 +40,7 @@ fn doctor_check_json_failure_names_missing_active_profile() {
     assert!(output.stdout.is_empty());
     let stderr = String::from_utf8(output.stderr).expect("UTF-8 stderr");
     let value: serde_json::Value = serde_json::from_str(stderr.trim()).expect("one JSON document");
-    assert_eq!(value["version"], 3);
+    assert_eq!(value["version"], 4);
     assert_eq!(value["ok"], false);
     assert!(
         value["message"]
@@ -63,7 +63,7 @@ fn doctor_without_check_still_reports_zero_profiles_successfully() {
     let json = doctor(config.path(), state.path(), &["--json", "doctor"]);
     assert!(json.status.success());
     let value: serde_json::Value = serde_json::from_slice(&json.stdout).expect("one JSON document");
-    assert_eq!(value["version"], 3);
+    assert_eq!(value["version"], 4);
     assert_eq!(value["profiles"], 0);
     assert_eq!(value["errors"], serde_json::json!([]));
 }

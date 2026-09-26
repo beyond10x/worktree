@@ -1072,6 +1072,7 @@ mod tests {
             observed_at: 3,
             kind: b10x_worktree_domain::RecoveryKind::Ancestor,
             equivalent_commits: Vec::new(),
+            archive: None,
         };
         let mut removal = RemovalIntent {
             id: record.id,
@@ -1163,6 +1164,7 @@ mod tests {
                 observed_at: 3,
                 kind: b10x_worktree_domain::RecoveryKind::Ancestor,
                 equivalent_commits: Vec::new(),
+                archive: None,
             },
             operation: "retire-external".into(),
             planned_at: 3,
@@ -1296,6 +1298,7 @@ mod tests {
             observed_at: 3,
             kind: b10x_worktree_domain::RecoveryKind::Ancestor,
             equivalent_commits: Vec::new(),
+            archive: None,
         };
         let intent = RemovalIntent {
             id: record.id.clone(),

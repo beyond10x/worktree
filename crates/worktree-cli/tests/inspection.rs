@@ -157,7 +157,7 @@ fn inspection_scopes_by_repository_and_reports_ignored_evidence_without_writes()
     ]);
     let before = fixture.ok(&["status"]);
     let report = fixture.inspect(&[]);
-    assert_eq!(report["version"], 3);
+    assert_eq!(report["version"], 4);
     assert_eq!(report["format"], "worktree.inspection/2");
     let inspections = report["inspections"].as_array().unwrap();
     assert_eq!(inspections.len(), 1);
@@ -249,7 +249,7 @@ fn rebased_work_on_the_remote_main_is_collected_with_patch_equivalent_proof() {
     fixture.ok(&["finish", fixture.tree.to_str().unwrap()]);
     let repository = fixture.repository.to_str().unwrap();
     let reviewed = fixture.ok(&["gc", "--repo", repository, "--dry-run", "--id", "first"]);
-    assert_eq!(reviewed["version"], 3);
+    assert_eq!(reviewed["version"], 4);
     assert_eq!(reviewed["assessments"][0]["eligible"], true);
     let applied = fixture.ok(&["gc", "--repo", repository, "--apply", "--id", "first"]);
     let proof = &applied["assessments"][0]["evidence"]["recovery"];
