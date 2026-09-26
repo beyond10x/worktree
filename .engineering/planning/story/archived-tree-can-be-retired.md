@@ -2,9 +2,9 @@
 format: aep.planning-md/1
 id: story:archived-tree-can-be-retired
 kind: story
-status: draft
+status: implemented
 title: A tree whose commits are archived locally can be retired
-revision: 1
+revision: 4
 ---
 # A tree whose commits are archived locally can be retired
 
