@@ -165,6 +165,15 @@ pub trait GitPort: Send + Sync {
             ),
         ))
     }
+    /// Whether the repository recorded at this root is gone: nothing exists at the path, or a
+    /// directory is there with no `.git` of its own.
+    ///
+    /// `true` is a positive observation that no repository remains to ask. Anything else,
+    /// including a path this adapter cannot inspect, is `false`, so the record keeps being
+    /// assessed through Git. The default never observes an absent repository.
+    fn repository_absent(&self, _repository: &Path) -> Result<bool, Refusal> {
+        Ok(false)
+    }
 }
 
 fn archive_unsupported(archive: &Path) -> Refusal {
@@ -1072,6 +1081,13 @@ where
         policy: &WorkspacePolicy,
         record: &WorktreeRecord,
     ) -> Result<Option<ReconciliationAction>, Refusal> {
+        // A deleted repository cannot be asked anything, so no other action is assessable; the
+        // record is surfaced even while its tree still exists, so the dry-run says why it stays.
+        if self.git.repository_absent(&record.repository_root)? {
+            return Ok(Some(ReconciliationAction::TombstoneMissing {
+                path: record.path.clone(),
+            }));
+        }
         if let Some(intent) = self.registry.relocation(record.id.as_str())? {
             if intent.from != record.path {
                 return Err(Refusal::new(
@@ -1388,6 +1404,9 @@ where
         unrecoverable: &[GitRevision],
         now: i64,
     ) -> Result<Option<RecoveryProof>, Refusal> {
+        if self.git.repository_absent(&record.repository_root)? {
+            return self.assess_missing_repository(record, path, unrecoverable);
+        }
         if !path_absent(path)? {
             return Err(Refusal::new(
                 "worktree-path-exists",
@@ -1475,6 +1494,74 @@ where
                     refusal
                 }
             })
+    }
+
+    /// Assess a record whose repository no longer exists at its recorded root.
+    ///
+    /// Git cannot corroborate anything here, so the operator's acknowledgement of the exact
+    /// recorded commit is the whole of the evidence, and it is only accepted once every path the
+    /// record or its intents name is already absent. Nothing on disk is touched; a tree that is
+    /// still there is the operator's to deal with first.
+    fn assess_missing_repository(
+        &self,
+        record: &WorktreeRecord,
+        path: &Path,
+        unrecoverable: &[GitRevision],
+    ) -> Result<Option<RecoveryProof>, Refusal> {
+        let repository = record.repository_root.display();
+        let removal = self.registry.removal(record.id.as_str())?;
+        let relocation = self.registry.relocation(record.id.as_str())?;
+        let named = std::iter::once(path)
+            .chain(removal.iter().map(|intent| intent.path.as_path()))
+            .chain(
+                relocation
+                    .iter()
+                    .flat_map(|intent| [intent.from.as_path(), intent.to.as_path()]),
+            );
+        for tree in named {
+            if !path_absent(tree)? {
+                return Err(Refusal::new(
+                    "worktree-path-exists",
+                    format!(
+                        "{} still exists although repository {repository} is gone; nothing \
+                         removes it for you, so move or delete it yourself before reconciling \
+                         {}",
+                        tree.display(),
+                        record.id.as_str()
+                    ),
+                ));
+            }
+        }
+        let Some(head) = record.head.as_deref() else {
+            return Err(Refusal::new(
+                "repository-missing",
+                format!(
+                    "repository {repository} is gone and the record holds no commit that could \
+                     be acknowledged"
+                ),
+            ));
+        };
+        if removal.as_ref().is_some_and(|intent| intent.head != head) {
+            return Err(Refusal::new(
+                "removal-intent-mismatch",
+                "pending removal intent names a different commit than the record",
+            ));
+        }
+        if !acknowledges(unrecoverable, head) {
+            return Err(Refusal::new(
+                "repository-missing",
+                format!(
+                    "repository {repository} no longer exists or is not a Git repository, and \
+                     tree {} is gone, so nothing can check commit {head}; if it still exists \
+                     anywhere, recover it first, and only once you have established that it is \
+                     gone for good retire the record with `worktree reconcile --apply --id {} \
+                     --acknowledge-unrecoverable {head}`",
+                    path.display(),
+                    record.id.as_str()
+                ),
+            ));
+        }
+        Ok(None)
     }
 
     /// Assess an operator's assertion that a missing record's recorded commit is gone for good.
@@ -2247,6 +2334,7 @@ mod tests {
         remove_fault: Option<RemoveFault>,
         snapshot_sequence: Mutex<VecDeque<String>>,
         residue_matches: bool,
+        repository_absent: bool,
     }
 
     #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2390,6 +2478,10 @@ mod tests {
 
         fn hidden_state(&self, _repository: &Path, _worktree: &Path) -> Result<(), Refusal> {
             Ok(())
+        }
+
+        fn repository_absent(&self, _repository: &Path) -> Result<bool, Refusal> {
+            Ok(self.repository_absent)
         }
     }
 
@@ -2638,6 +2730,7 @@ mod tests {
             remove_fault: None,
             snapshot_sequence: Mutex::new(VecDeque::new()),
             residue_matches: true,
+            repository_absent: false,
         }
     }
 
@@ -2767,6 +2860,7 @@ mod tests {
                 snapshot_sequence: Mutex::new(VecDeque::new()),
                 discovered_sequence: Mutex::new(VecDeque::new()),
                 residue_matches: true,
+                repository_absent: false,
             },
             FakeRegistry {
                 records: Mutex::new(vec![registered.clone()]),
@@ -2831,6 +2925,7 @@ mod tests {
                 snapshot_sequence: Mutex::new(VecDeque::new()),
                 discovered_sequence: Mutex::new(VecDeque::new()),
                 residue_matches: true,
+                repository_absent: false,
             },
             FakeRegistry {
                 records: Mutex::new(vec![registered.clone()]),
@@ -3079,6 +3174,60 @@ mod tests {
         let manager =
             WorktreeManager::new(git, fake_registry(vec![registered.clone()]), FixedClock);
         (manager, policy(workspace, managed_root), registered)
+    }
+
+    #[test]
+    fn deleted_repository_is_not_retired_while_a_relocation_destination_exists() {
+        let temporary = tempdir().unwrap();
+        let workspace = temporary.path().join("workspace");
+        let repository = workspace.join("repo");
+        let managed_root = temporary.path().join("managed");
+        let destination = managed_root.join("repo/moved");
+        // The repository itself is gone; only its workspace and the moved tree remain.
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&destination).unwrap();
+        let registered = named_record(
+            "moved",
+            repository.clone(),
+            workspace.join("legacy/moved"),
+            Lifecycle::Relocating,
+        );
+        let registry = FakeRegistry {
+            relocations: Mutex::new(BTreeMap::from([(
+                registered.id.to_string(),
+                stale_relocation(&registered, &destination),
+            )])),
+            ..fake_registry(vec![registered.clone()])
+        };
+        let git = FakeGit {
+            repository_absent: true,
+            ..fake_git(repository)
+        };
+        let manager = WorktreeManager::new(git, registry, FixedClock);
+
+        let assessments = manager
+            .reconcile(
+                &policy(workspace, managed_root),
+                std::slice::from_ref(&registered.id),
+                true,
+                false,
+                &[GitRevision::new("abc").unwrap()],
+            )
+            .unwrap();
+
+        let refusal = assessments[0].refusal.as_ref().unwrap();
+        assert_eq!(refusal.code, "worktree-path-exists");
+        assert!(
+            refusal.message.contains(destination.to_str().unwrap()),
+            "{}",
+            refusal.message
+        );
+        assert!(assessments[0].evidence.is_none());
+        assert_eq!(
+            manager.registry().list().unwrap()[0].lifecycle,
+            Lifecycle::Relocating
+        );
+        assert!(destination.is_dir());
     }
 
     #[test]

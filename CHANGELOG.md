@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.8.2 — 2026-09-27
+
+- `worktree reconcile` retires a record whose repository was deleted. Before this, every such
+  record failed as `git-command-failed` (`cannot change to '<repository>'`) and
+  `--acknowledge-unrecoverable` could not run, so the record could only be cleared by recreating a
+  repository at its path. The dry-run now reports it as `repository-missing`, naming the
+  repository, the tree path and the recorded commit; `--apply --id <id>
+  --acknowledge-unrecoverable <recorded-commit>` tombstones it as `reconcile-abandoned`. A root
+  that exists without `.git` counts as deleted. It is refused as `worktree-path-exists` while the
+  tree path, or a pending relocation or removal intent's path, still exists, and it touches nothing
+  on disk. Such records are now always reconciliation candidates, so a workspace dry-run no longer
+  fails on them or skips them.
+- `GitPort` gains `repository_absent`, which defaults to `false`; an embedded adapter that does not
+  implement it keeps assessing every record through Git exactly as before. JSON protocol and
+  reconciliation versions are unchanged: `repository-missing` travels in the existing refusal field
+  and the tombstone reuses the existing `reconcile-abandoned` operation.
+
 ## 0.8.1 — 2026-09-26
 
 - The agent guidance `worktree activate --install-agent-guidance` writes to `~/.claude/CLAUDE.md`

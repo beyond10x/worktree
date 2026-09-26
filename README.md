@@ -182,6 +182,14 @@ that the commit is gone for good, `reconcile --apply --id <reviewed-id>
 tag, remote-tracking ref or remote advertisement still contains that commit, deletes nothing, and
 records no recovery proof.
 
+A record whose repository was deleted — its recorded root is gone, or is a directory without
+`.git` — has nothing left for Git to check. The dry-run reports it as `repository-missing`, naming
+the repository, the tree path and the recorded commit; pass any live repository of the same
+workspace as `--repo`. `reconcile --apply --id <reviewed-id> --acknowledge-unrecoverable <commit>`
+tombstones it as `reconcile-abandoned` only when that commit is the recorded one and the tree path,
+and every path a pending relocation or removal intent names, is already absent. A tree that still
+exists is refused as `worktree-path-exists` and left where it is. Nothing on disk is touched.
+
 For legacy state created before 0.3, a finished external tree may still carry a stale relocation
 intent. Reconciliation proposes `retire-external` only when that intent names the exact source and
 HEAD, Git reports no destination worktree, and the destination path is absent. Durable removal
