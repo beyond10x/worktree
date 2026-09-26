@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.8.1 — 2026-09-26
+
+- The agent guidance `worktree activate --install-agent-guidance` writes to `~/.claude/CLAUDE.md`
+  and `~/.codex/AGENTS.md` names the skill as the b10x plugin ships it
+  (`worktree:managing-worktrees`, with `/worktree:cleanup` for cleanup) instead of `$worktree`,
+  which only exists where `worktree skill` rendered it, and says that `worktree archive` is the
+  recovery proof for work that must not be published.
+
 ## 0.8.0 — 2026-09-26
 
 - Add `worktree archive [<tree>] [--replace]`. It writes a verified archive of a managed tree to
