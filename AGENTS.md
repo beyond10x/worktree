@@ -47,7 +47,9 @@ independent policy: every decision must come from the public façade.
 - Offline or ambiguous recovery evidence is a refusal, never permission to delete.
 - Forgetting a record is not recovering its work. A missing record whose commit no ref holds may be
   abandoned only through a reviewed exact-id apply in which the operator names that exact commit,
-  and only while Git still confirms nothing points at it.
+  and only while Git still confirms nothing points at it. When the record's repository is gone
+  (its root absent, or without `.git`), that acknowledgement alone retires it, and only once every
+  path the record and its intents name is absent; an existing tree is refused and never touched.
 - Local replacement refs, graft files, and inherited graft configuration must never influence
   remote recovery proof.
 - Create plans use immutable commits and canonical policy-derived paths; plans and exact repository

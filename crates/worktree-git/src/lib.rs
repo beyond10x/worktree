@@ -760,6 +760,24 @@ fn ref_rank(label: &str) -> u8 {
 }
 
 impl GitPort for ProcessGit {
+    fn repository_absent(&self, repository: &Path) -> Result<bool, Refusal> {
+        // Only the filesystem is asked: Git run from a directory without `.git` would answer for
+        // whichever enclosing repository it found, which is not the recorded one.
+        let inspect = |path: &Path| match std::fs::symlink_metadata(path) {
+            Ok(metadata) => Ok(Some(metadata)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(Refusal::new(
+                "repository-inspection-failed",
+                format!("{}: {error}", path.display()),
+            )),
+        };
+        match inspect(repository)? {
+            None => Ok(true),
+            Some(metadata) if metadata.is_dir() => Ok(inspect(&repository.join(".git"))?.is_none()),
+            Some(_) => Ok(false),
+        }
+    }
+
     fn repository_snapshot(&self, repository: &Path) -> Result<RepositorySnapshot, Refusal> {
         let root = self
             .list_worktrees(repository)?

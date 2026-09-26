@@ -155,6 +155,15 @@ ref, because the tree is already gone, and it records no recovery proof, because
 the one reconciliation outcome with no proof behind it, and it is deliberately reachable only by an
 operator naming the exact commit being given up.
 
+When the repository itself is gone, there is no Git left to corroborate the assertion. The Git port
+reports `repository_absent` from the filesystem alone — the recorded root does not exist, or is a
+directory with no `.git` — because Git run there would answer for an enclosing repository instead;
+the default port never reports it. Such a record is always a `tombstone-missing` candidate, even
+while its tree exists, so a workspace dry-run neither fails on it nor hides it. It is refused as
+`repository-missing` until the operator acknowledges the exact recorded commit, and as
+`worktree-path-exists` while the tree path or any relocation or removal intent path still exists.
+Apply records the same `reconcile-abandoned` tombstone and touches nothing on disk.
+
 ## Durable state
 
 Activated profiles live under `$XDG_CONFIG_HOME/worktree/config.toml`. The ownership registry,
