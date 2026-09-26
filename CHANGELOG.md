@@ -1,5 +1,48 @@
 # Changelog
 
+## 0.8.0 — 2026-09-26
+
+- Add `worktree archive [<tree>] [--replace]`. It writes a verified archive of a managed tree to
+  `$XDG_STATE_HOME/worktree/archives/<repository>/<id>/` without modifying the tree:
+  `commits.bundle` holds every commit HEAD adds over the refs the configured remotes advertise,
+  `dirty.patch` recreates every tracked, untracked and ignored file over HEAD, and `manifest.json`
+  (new format `worktree.archive/1`) records the tree, HEAD, branch, unique commits, SHA-256 digests
+  and the tree id of the archived content. An existing archive is refused as `archive-exists`;
+  `--replace` moves it aside and never deletes it.
+- `gc` and `finish` accept such an archive as recovery proof of kind `archive` for a tree whose
+  commits are on no advertised ref, and for a dirty tree, while the manifest matches the record and
+  HEAD, the digests hold, the bundle's own pack carries every object HEAD adds over freshly
+  advertised refs, and a dirty tree's content equals the archived state. Mismatches refuse as
+  `archive-stale`, `archive-incomplete`, `archive-digest-mismatch`, `archive-bundle-invalid` or
+  `archive-invalid`. The dry-run names the archive; apply returns an archived dirty tree to HEAD,
+  deleting only files that still match the archive, removes it without force and keeps the archive.
+  Trees without an archive are assessed exactly as before.
+- **Wire change:** non-hook CLI JSON moves to protocol version 4 and reconciliation JSON to version
+  4. Recovery proof gains the `archive` kind and an optional `archive` reference; cleanup
+  assessments gain an optional `archive` path. Both are omitted when no archive is involved, and
+  stored proofs without them decode unchanged. Inspection 2, hook protocol 1 and configuration
+  schema 1 are unchanged.
+- Every archive records `worktree_tree`, a fingerprint of the tree's complete on-disk content read
+  without filters or index flags, including for a tree Git reports clean; `dirty.patch` is written
+  whenever that content differs from HEAD. Removal compares the tree against it before relying on
+  the archive. Discarding an archived tree's state resets only the index first and re-hashes each
+  tracked file immediately before restoring it, so a later edit is refused, not overwritten.
+- **Fix, also on the remote-proof path:** GC and external retirement refuse state Git status does
+  not report but removal would destroy: assume-unchanged and skip-worktree entries, staged content
+  that differs from both HEAD and the working copy, any `.git` below the tree's root
+  (`worktree-hidden-state`), and refs under `refs/worktree/`, `refs/bisect/` and `refs/rewritten/`
+  (`worktree-local-refs`). Before this, a published tree holding any of them was removed and the
+  state lost. `worktree archive` reports such state as `blocker`.
+- The README documents a restore that reproduces archived bytes exactly. It disables every
+  attribute conversion through `.git/info/attributes` in a `--no-checkout` clone, because a plain
+  `git apply` rewrites line endings under `text eol=crlf`. `--attr-source` does not work for this:
+  Git 2.55 `apply` crashes with it on any patch that changes an existing file.
+- `GitPort` gains `write_archive`, `verify_archive`, `verify_archived_state`,
+  `discard_archived_state` and `hidden_state`, each refusing by default, and `WorktreeManager`
+  gains `with_archive_root` and `archive`. An embedded adapter must now implement `hidden_state`,
+  or its cleanup refuses as `hidden-state-unobserved`. The Git adapter gains the `sha2` dependency
+  for manifest digests.
+
 ## 0.7.2 — 2026-09-25
 
 - `worktree gc --apply` removes a tree holding a directory without the owner write bit. Before

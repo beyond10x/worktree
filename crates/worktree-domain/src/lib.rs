@@ -4,7 +4,9 @@ use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter};
 use std::path::{Path, PathBuf};
 
+mod archive;
 mod inspection;
+pub use archive::*;
 pub use inspection::*;
 
 /// Configuration and workspace-policy schema version.
@@ -14,13 +16,16 @@ pub const SURFACE_VERSION: u32 = 1;
 ///
 /// Reconciliation version 2 adds the explicit `retire-external` action without changing the
 /// stable version-1 lifecycle, configuration, or hook envelopes. Version 3 adds the recovery
-/// proof `kind` and `equivalent_commits` fields carried by operation evidence.
-pub const RECONCILIATION_VERSION: u32 = 3;
+/// proof `kind` and `equivalent_commits` fields carried by operation evidence. Version 4 adds the
+/// `archive` recovery kind and the proof's `archive` reference.
+pub const RECONCILIATION_VERSION: u32 = 4;
 
 /// Version of non-hook CLI JSON envelopes.
 ///
-/// Version 3 adds the recovery proof `kind` and `equivalent_commits` fields.
-pub const CLI_PROTOCOL_VERSION: u32 = 3;
+/// Version 3 adds the recovery proof `kind` and `equivalent_commits` fields. Version 4 adds the
+/// `archive` command, the `archive` recovery kind and reference, and the cleanup assessment's
+/// `archive` path.
+pub const CLI_PROTOCOL_VERSION: u32 = 4;
 
 /// Immutable hook protocol version.
 pub const HOOK_PROTOCOL_VERSION: u32 = 1;
@@ -329,6 +334,9 @@ pub enum RecoveryKind {
     /// The exact commit is on no advertised ref, but every commit it adds over them has a
     /// verbatim patch-identical, single-parent commit reachable from each proving ref.
     PatchEquivalent,
+    /// No advertised ref proves recovery, but a verified local archive carries every commit
+    /// HEAD adds over them and, for a dirty tree, exactly its current uncommitted state.
+    Archive,
 }
 
 /// Remote recovery evidence observed by the Git adapter, before it is timestamped.
@@ -368,6 +376,9 @@ pub struct RecoveryProof {
     /// Commits held by no advertised ref whose patches the proving refs carry.
     #[serde(default)]
     pub equivalent_commits: Vec<String>,
+    /// The verified local archive, for [`RecoveryKind::Archive`] proof only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive: Option<ArchiveReference>,
 }
 
 /// Evidence returned after a mutation.
@@ -398,6 +409,9 @@ pub struct CleanupAssessment {
     pub refusal: Option<Refusal>,
     /// Removal evidence when an apply run removed it.
     pub evidence: Option<OperationEvidence>,
+    /// The verified archive an eligible assessment relies on instead of remote refs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive: Option<PathBuf>,
 }
 
 /// One manager-owned registry inconsistency that can be reconciled safely.
@@ -562,6 +576,42 @@ mod tests {
             };
             assert_eq!(policy.validate().unwrap_err().code, "invalid-policy-name");
         }
+    }
+
+    #[test]
+    fn stored_proof_without_an_archive_keeps_its_shape_and_archive_proof_round_trips() {
+        let stored = serde_json::json!({
+            "head": "abc",
+            "refs": ["origin:refs/heads/main"],
+            "observed_at": 3,
+        });
+        let proof: RecoveryProof = serde_json::from_value(stored).unwrap();
+        assert_eq!(proof.kind, RecoveryKind::Ancestor);
+        assert_eq!(proof.archive, None);
+        assert!(
+            serde_json::to_value(&proof)
+                .unwrap()
+                .get("archive")
+                .is_none()
+        );
+
+        let archived = RecoveryProof {
+            kind: RecoveryKind::Archive,
+            refs: Vec::new(),
+            archive: Some(ArchiveReference {
+                path: "/state/worktree/archives/repo/tree".into(),
+                manifest_sha256: "0".repeat(64),
+                commits: vec!["abc".into()],
+                worktree_tree: None,
+            }),
+            ..proof
+        };
+        let value = serde_json::to_value(&archived).unwrap();
+        assert_eq!(value["kind"], "archive");
+        assert_eq!(
+            serde_json::from_value::<RecoveryProof>(value).unwrap(),
+            archived
+        );
     }
 
     #[test]

@@ -1,6 +1,10 @@
 //! Git CLI adapter. Commands are executed directly, never through a shell.
 
 use b10x_worktree::GitPort;
+#[cfg(unix)]
+use b10x_worktree_domain::{
+    ArchiveEvidence, ArchiveReference, ArchiveRequest, ArchiveStateCheck, WorktreeRecord,
+};
 use b10x_worktree_domain::{
     CreatePlan, DiscoveredWorktree, RecoveryEvidence, RecoveryKind, Refusal, RepositorySnapshot,
     WorktreeSnapshot,
@@ -11,6 +15,9 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+#[cfg(unix)]
+mod archive;
+mod hidden;
 mod inspection;
 
 /// Confirmed advertised commits, each mapped to the `remote:ref` names advertising it.
@@ -428,22 +435,15 @@ impl ProcessGit {
         if tips.is_empty() {
             return Ok(unproven);
         }
-        let mut unique_range = vec![head.to_owned(), "--not".to_owned()];
-        unique_range.extend(tips.keys().cloned());
-
-        let mut listing = vec!["rev-list".to_owned(), "--parents".to_owned()];
-        listing.extend(unique_range.iter().cloned());
-        let mut unique = Vec::new();
-        for line in Self::containment_output(repository, &listing)?.lines() {
-            let mut fields = line.split_whitespace();
-            let Some(commit) = fields.next() else {
-                continue;
-            };
-            if fields.count() != 1 {
-                return Ok(unproven);
-            }
-            unique.push(commit.to_owned());
+        let unique_range = Self::unique_range(head, tips);
+        let listed = Self::unique_commits(repository, head, tips)?;
+        if listed.iter().any(|(_, parents)| *parents != 1) {
+            return Ok(unproven);
         }
+        let unique = listed
+            .into_iter()
+            .map(|(commit, _)| commit)
+            .collect::<Vec<_>>();
         if unique.is_empty() {
             return Ok(unproven);
         }
@@ -502,6 +502,36 @@ impl ProcessGit {
             }
         }
         Ok(unproven)
+    }
+
+    /// Revision arguments selecting what `head` adds over every confirmed advertised tip.
+    fn unique_range(head: &str, tips: &AdvertisedTips) -> Vec<String> {
+        let mut range = vec![head.to_owned(), "--not".to_owned()];
+        range.extend(tips.keys().cloned());
+        range
+    }
+
+    /// Every commit `head` adds over the confirmed advertised tips, newest first, each with its
+    /// parent count, with local ancestry overrides disabled.
+    ///
+    /// Patch-equivalence proof and archives both read this one list, so an archive always holds
+    /// exactly the commits whose absence from the remotes the recovery check reports.
+    fn unique_commits(
+        repository: &Path,
+        head: &str,
+        tips: &AdvertisedTips,
+    ) -> Result<Vec<(String, usize)>, Refusal> {
+        let mut listing = vec!["rev-list".to_owned(), "--parents".to_owned()];
+        listing.extend(Self::unique_range(head, tips));
+        let mut unique = Vec::new();
+        for line in Self::containment_output(repository, &listing)?.lines() {
+            let mut fields = line.split_whitespace();
+            let Some(commit) = fields.next() else {
+                continue;
+            };
+            unique.push((commit.to_owned(), fields.count()));
+        }
+        Ok(unique)
     }
 
     /// Map each commit selected by `revisions` to its whitespace-exact patch id.
@@ -957,6 +987,46 @@ impl GitPort for ProcessGit {
     fn validate_move_worktree(&self, from: &Path, to: &Path) -> Result<(), Refusal> {
         let destination_parent = Self::existing_ancestor(to)?;
         same_filesystem(from, destination_parent)
+    }
+
+    #[cfg(unix)]
+    fn write_archive(&self, request: &ArchiveRequest<'_>) -> Result<ArchiveEvidence, Refusal> {
+        archive::write(request)
+    }
+
+    #[cfg(unix)]
+    fn verify_archive(
+        &self,
+        record: &WorktreeRecord,
+        archive: &Path,
+        head: &str,
+        state: ArchiveStateCheck<'_>,
+    ) -> Result<ArchiveReference, Refusal> {
+        archive::verify(record, archive, head, state)
+    }
+
+    #[cfg(unix)]
+    fn verify_archived_state(
+        &self,
+        record: &WorktreeRecord,
+        archive: &Path,
+        head: &str,
+    ) -> Result<(), Refusal> {
+        archive::verify_state(record, archive, head)
+    }
+
+    fn hidden_state(&self, _repository: &Path, worktree: &Path) -> Result<(), Refusal> {
+        hidden::require_none(worktree)
+    }
+
+    #[cfg(unix)]
+    fn discard_archived_state(
+        &self,
+        record: &WorktreeRecord,
+        archive: &Path,
+        head: &str,
+    ) -> Result<(), Refusal> {
+        archive::discard(record, archive, head)
     }
 
     fn list_worktrees(&self, repository: &Path) -> Result<Vec<DiscoveredWorktree>, Refusal> {

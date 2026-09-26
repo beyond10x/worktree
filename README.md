@@ -30,6 +30,8 @@ worktree status
 worktree hook heartbeat --path <tree> --session <session-id>
 # Publish wanted changes and remove this task's disposable build output.
 worktree hook session-end --path <tree> --session <session-id>
+# Or keep unpublished work in a verified local archive instead of on a remote.
+worktree archive <tree>
 worktree finish <tree>
 worktree gc --repo /path/to/repository --dry-run --id <reviewed-id>
 worktree gc --repo /path/to/repository --apply --id <reviewed-id>
@@ -81,6 +83,71 @@ could carry and defeats the proof. Binary changes compare by their full binary p
 records the refs and the equivalent commits; the local branch and its commit ids are not removed,
 only the linked tree.
 
+Work that must not be published can be retired against a local archive instead. `worktree archive
+<tree>` writes `$XDG_STATE_HOME/worktree/archives/<repository>/<id>/` with mode 0700 and never
+modifies the tree, its index or the repository's refs:
+
+| File | Content |
+|---|---|
+| `commits.bundle` | every commit HEAD adds over the refs the configured remotes advertise, as `refs/worktree-archive/head`; absent when there are none |
+| `dirty.patch` | a binary patch from HEAD that recreates every tracked, untracked and ignored file byte for byte; absent when the tree's content equals HEAD |
+| `manifest.json` | format `worktree.archive/1`: tree id, repository root, path, HEAD, branch, the unique commits, each file's SHA-256 and size, `worktree_tree` (the fingerprint of the tree's complete on-disk content), and `created_at` |
+
+The fingerprint is a Git tree id computed from every file on disk, read without filters, index
+flags or attributes. It is recorded for every archive, including one of a tree Git reports clean,
+because Git status can be told not to look at a file. Before publishing an archive the command runs
+`git bundle verify`, indexes the bundle's pack on its own and checks that it holds every object
+those commits need, applies the patch to HEAD in a scratch index and compares the result with the
+fingerprint, and re-reads every digest. An existing archive is refused as `archive-exists`;
+`--replace` moves it to `<id>.superseded-<time>` and never deletes it.
+
+GC and finish consult an archive only when one exists. A clean tree with no remote proof, or a
+dirty tree, is then eligible with recovery kind `archive` while all of this still holds: the
+manifest names this record and its current HEAD, every file has its recorded digest, freshly
+advertised refs plus the bundle's own objects hold every commit HEAD adds, and the tree's complete
+content still has the archived fingerprint. A dirty tree is never covered by remote refs. Any
+mismatch refuses by name: `archive-stale` (HEAD moved, or files changed), `archive-incomplete` (a
+missing bundle, or a bundle lacking an object), `archive-digest-mismatch`, `archive-bundle-invalid`
+or `archive-invalid`. Leases, locks and paused Git operations refuse exactly as without an archive.
+The dry-run names the archive.
+
+Apply resets an archived dirty tree's index to HEAD, then restores each tracked file Git reports as
+changed only after re-hashing it and finding the archived bytes, and deletes each untracked or
+ignored file only when it still matches the archive; it then removes the tree without `--force`.
+The archive stays.
+
+Some state is invisible to `git status`, and neither remote refs nor an archive hold it, so every
+removal, with or without an archive, is refused while it exists; `worktree archive` reports it as
+`blocker`:
+
+| Refusal | State |
+|---|---|
+| `worktree-hidden-state` | an entry marked assume-unchanged or skip-worktree; staged content that differs from both HEAD and the working copy; any `.git` directory or file below the tree's root |
+| `worktree-local-refs` | a ref under `refs/worktree/`, `refs/bisect/` or `refs/rewritten/`, which Git deletes with the tree |
+
+Restore into a fresh `--no-checkout` clone of a remote that still has the advertised refs. Every
+attribute conversion is switched off, so `switch` and `apply` write the archived bytes rather
+than converted ones. `.git/info/attributes` takes precedence over every `.gitattributes`. Left
+enabled, a `text eol=crlf` attribute rewrites a lone LF even in a file the patch recreates:
+
+```bash
+git clone --no-checkout <remote> restored && cd restored
+printf '* -text -eol -filter -ident -working-tree-encoding\n' > .git/info/attributes
+git fetch <archive>/commits.bundle refs/worktree-archive/head:refs/heads/restored
+raw() { git -c core.autocrlf=false -c core.fileMode=true -c core.symlinks=true "$@"; }
+raw switch restored
+raw apply --binary --whitespace=nowarn <archive>/dirty.patch   # only when the archive has one
+```
+
+Delete `.git/info/attributes` afterwards if the clone should convert line endings again. Do not
+use `--attr-source` or `GIT_ATTR_SOURCE` instead: Git 2.55 `apply` crashes with either one on any
+patch that changes an existing file.
+
+The bundle's prerequisites are the advertised commits it was cut against, so restoring needs a
+remote that still has them. Submodules, nested repositories, special files and paths containing a
+newline are refused as `archive-unsupported-entry`. Every ignored file is archived; there is no
+policy for disposable output yet, so remove build output first.
+
 Use `worktree repo list --repo <path>` to inventory linked trees without adopting or deleting them.
 Existing trees only become manager-owned through the explicit `repo adopt` command. Hook integrations
 can maintain cleanup-blocking leases with `hook session-start`, `hook heartbeat`, and
@@ -126,10 +193,12 @@ and registry lifecycle, evidence, and intent completion are committed atomically
 operation is interrupted, rerun GC while the path exists or reconciliation once it is absent; the
 same dry-run and exact-id apply discipline safely finishes the recorded transition.
 
-Non-hook CLI JSON uses protocol version 3, reconciliation JSON uses version 3, inspection reports
-use `worktree.inspection/2`, and lifecycle hooks remain on version 1. Version 3 and inspection 2
-add the recovery proof `kind` and `equivalent_commits` fields. Configuration and workspace-policy
-schemas also remain on version 1.
+Non-hook CLI JSON uses protocol version 4, reconciliation JSON uses version 4, inspection reports
+use `worktree.inspection/2`, archive manifests use `worktree.archive/1`, and lifecycle hooks remain
+on version 1. Version 3 and inspection 2 add the recovery proof `kind` and `equivalent_commits`
+fields. Version 4 adds the `archive` command, the `archive` recovery kind with its `archive`
+reference, and the cleanup assessment's `archive` path; both fields are omitted when no archive is
+involved. Configuration and workspace-policy schemas also remain on version 1.
 
 ## Embed
 
