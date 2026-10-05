@@ -20,7 +20,7 @@ fn doctor_check_fails_and_names_missing_active_profile() {
     let output = doctor(config.path(), state.path(), &["doctor", "--check"]);
 
     assert!(!output.status.success());
-    assert!(output.stdout.is_empty());
+    assert_eq!(output.stdout, [] as [u8; 0]);
     let stderr = String::from_utf8(output.stderr).expect("UTF-8 stderr");
     assert!(stderr.contains("no active profile"), "stderr: {stderr}");
 }
@@ -37,7 +37,7 @@ fn doctor_check_json_failure_names_missing_active_profile() {
     );
 
     assert!(!output.status.success());
-    assert!(output.stdout.is_empty());
+    assert_eq!(output.stdout, [] as [u8; 0]);
     let stderr = String::from_utf8(output.stderr).expect("UTF-8 stderr");
     let value: serde_json::Value = serde_json::from_str(stderr.trim()).expect("one JSON document");
     assert_eq!(value["version"], 4);

@@ -290,7 +290,7 @@ mod tests {
         let report = measure(root.path(), 1).unwrap();
         assert!(!report.complete);
         assert_eq!(report.entries, 1);
-        assert!(!report.errors.is_empty());
+        assert_ne!(report.errors, [] as [b10x_worktree_domain::Refusal; 0]);
         assert!(measure(&root.path().join("missing"), 100).is_err());
     }
 

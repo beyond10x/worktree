@@ -3647,7 +3647,10 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(refusal.code, "primary-worktree");
-        assert!(manager.registry().list().unwrap().is_empty());
+        assert_eq!(
+            manager.registry().list().unwrap(),
+            [] as [b10x_worktree_domain::WorktreeRecord; 0]
+        );
     }
 
     #[test]
@@ -3688,7 +3691,10 @@ mod tests {
             manager.create(&policy, &plan).unwrap_err().code,
             "create-plan-base-not-immutable"
         );
-        assert!(manager.registry().list().unwrap().is_empty());
+        assert_eq!(
+            manager.registry().list().unwrap(),
+            [] as [b10x_worktree_domain::WorktreeRecord; 0]
+        );
     }
 
     #[cfg(unix)]
@@ -3730,7 +3736,10 @@ mod tests {
             "non-canonical-worktree-path"
         );
         assert!(!external.join("symlink-escape").exists());
-        assert!(manager.registry().list().unwrap().is_empty());
+        assert_eq!(
+            manager.registry().list().unwrap(),
+            [] as [b10x_worktree_domain::WorktreeRecord; 0]
+        );
     }
 
     #[test]
@@ -4822,7 +4831,7 @@ mod tests {
             registry: true,
             profiles: 1,
         };
-        assert!(readiness_failures(ready).is_empty());
+        assert_eq!(readiness_failures(ready), [] as [ReadinessFailure; 0]);
         let no_profile = ReadinessObservation {
             profiles: 0,
             ..ready

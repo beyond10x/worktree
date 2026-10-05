@@ -1698,7 +1698,7 @@ mod tests {
             .output()
             .unwrap();
         assert!(!output.status.success());
-        assert!(
+        assert_eq!(
             ProcessGit::output(
                 &linked,
                 [
@@ -1709,8 +1709,8 @@ mod tests {
                     "--ignored=matching",
                 ],
             )
-            .unwrap()
-            .is_empty()
+            .unwrap(),
+            ""
         );
         assert!(
             ProcessGit
@@ -1915,7 +1915,7 @@ mod tests {
             .trim(),
             head
         );
-        assert!(recovery_refs.is_empty());
+        assert_eq!(recovery_refs, [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -1932,11 +1932,9 @@ mod tests {
         );
 
         // Local branches still hold it, even though no remote advertises it.
-        assert!(
-            ProcessGit
-                .recovery_refs(&repository, &head)
-                .unwrap()
-                .is_empty()
+        assert_eq!(
+            ProcessGit.recovery_refs(&repository, &head).unwrap(),
+            [] as [std::string::String; 0]
         );
         assert_eq!(
             ProcessGit.containing_refs(&repository, &head).unwrap(),
@@ -2197,11 +2195,9 @@ mod tests {
         run(&repository, &["push", "origin", "main"]);
         let head = feature_head(&repository);
 
-        assert!(
-            ProcessGit
-                .recovery_refs(&repository, &head)
-                .unwrap()
-                .is_empty()
+        assert_eq!(
+            ProcessGit.recovery_refs(&repository, &head).unwrap(),
+            [] as [std::string::String; 0]
         );
         let evidence = ProcessGit.recovery_evidence(&repository, &head).unwrap();
         assert_eq!(evidence.kind, RecoveryKind::PatchEquivalent);
@@ -2225,7 +2221,7 @@ mod tests {
         let evidence = ProcessGit.recovery_evidence(&repository, &head).unwrap();
         assert_eq!(evidence.kind, RecoveryKind::Ancestor);
         assert_eq!(evidence.refs, vec!["origin:refs/heads/feature"]);
-        assert!(evidence.equivalent_commits.is_empty());
+        assert_eq!(evidence.equivalent_commits, [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -2236,8 +2232,8 @@ mod tests {
         let head = feature_head(&repository);
 
         let evidence = ProcessGit.recovery_evidence(&repository, &head).unwrap();
-        assert!(evidence.refs.is_empty());
-        assert!(evidence.equivalent_commits.is_empty());
+        assert_eq!(evidence.refs, [] as [std::string::String; 0]);
+        assert_eq!(evidence.equivalent_commits, [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -2267,7 +2263,7 @@ mod tests {
         let head = feature_head(&repository);
 
         // Git's own patch ids ignore whitespace and call these the same change.
-        assert!(
+        assert_eq!(
             run(
                 &repository,
                 &[
@@ -2276,11 +2272,11 @@ mod tests {
                     "--cherry-pick",
                     "main...feature"
                 ]
-            )
-            .is_empty()
+            ),
+            ""
         );
         let evidence = ProcessGit.recovery_evidence(&repository, &head).unwrap();
-        assert!(evidence.refs.is_empty());
+        assert_eq!(evidence.refs, [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -2304,7 +2300,7 @@ mod tests {
         let head = feature_head(&repository);
 
         let evidence = ProcessGit.recovery_evidence(&repository, &head).unwrap();
-        assert!(evidence.refs.is_empty());
+        assert_eq!(evidence.refs, [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -2325,7 +2321,7 @@ mod tests {
         let head = feature_head(&repository);
 
         let evidence = ProcessGit.recovery_evidence(&repository, &head).unwrap();
-        assert!(evidence.refs.is_empty());
+        assert_eq!(evidence.refs, [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -2341,7 +2337,7 @@ mod tests {
         let head = feature_head(&repository);
 
         let evidence = ProcessGit.recovery_evidence(&repository, &head).unwrap();
-        assert!(evidence.refs.is_empty());
+        assert_eq!(evidence.refs, [] as [std::string::String; 0]);
     }
 
     #[test]

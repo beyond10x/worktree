@@ -1368,6 +1368,6 @@ mod tests {
         let stored = r#"{"head":"abc","refs":["origin:refs/heads/main"],"observed_at":3}"#;
         let proof = serde_json::from_str::<RecoveryProof>(stored).unwrap();
         assert_eq!(proof.kind, b10x_worktree_domain::RecoveryKind::Ancestor);
-        assert!(proof.equivalent_commits.is_empty());
+        assert_eq!(proof.equivalent_commits, [] as [std::string::String; 0]);
     }
 }
