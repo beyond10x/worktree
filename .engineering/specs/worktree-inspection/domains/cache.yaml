@@ -1,0 +1,29 @@
+domain: worktree.cache
+
+# A report of one cache discard, not a new persisted lifecycle. The worktree it names is the
+# existing registry record (crates/worktree-domain/src/lib.rs, WorktreeRecord).
+entities:
+  - name: worktree.cache.CacheDiscard
+    identity:
+      name: worktree_id
+      type: String
+    fields:
+      - name: observed_at
+        type: Integer
+      # false for `discard-cache --dry-run`: the entries were classified, nothing was deleted.
+      - name: applied
+        type: Boolean
+      # Ignored directories recognised as cache their own tool recreates from tracked sources:
+      # Cargo profile directories, node_modules below a tracked lockfile, a virtualenv beside a
+      # tracked Python manifest, and tagged tool caches.
+      - name: discarded_entries
+        type: Integer
+      # Every other ignored entry. Never deleted; `worktree archive` keeps it.
+      - name: retained_ignored_entries
+        type: Integer
+    lifecycle:
+      initial: Observed
+      states: [Observed]
+      terminal: [Observed]
+    # UNMAPPED: no process-ownership noun exists. "In use" is an observation of /proc at the
+    # moment of the discard, reported as a refusal, not a field of this report.
