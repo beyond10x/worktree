@@ -5,8 +5,10 @@ use std::fmt::{Display, Formatter};
 use std::path::{Path, PathBuf};
 
 mod archive;
+mod cache;
 mod inspection;
 pub use archive::*;
+pub use cache::*;
 pub use inspection::*;
 
 /// Configuration and workspace-policy schema version.

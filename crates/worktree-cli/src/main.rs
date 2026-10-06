@@ -43,11 +43,9 @@ enum Command {
     /// Archive a tree's local-only commits and uncommitted state as local recovery proof.
     Archive(ArchiveArgs),
     /// Mark an idle worktree finished; it must be clean or exactly match its archive.
-    Finish {
-        /// Managed worktree path; defaults to the current directory.
-        #[arg(default_value = ".")]
-        path: PathBuf,
-    },
+    Finish(FinishArgs),
+    /// Delete recognised build cache from an idle tree; every other ignored file is kept.
+    DiscardCache(DiscardCacheArgs),
     /// Assess or safely remove finished and expired worktrees.
     Gc(GcArgs),
     /// Reconcile interrupted provisioning, adopted paths, and missing records.
@@ -112,6 +110,29 @@ struct ArchiveArgs {
     /// Move an existing archive aside (never deleted) and write a new one.
     #[arg(long)]
     replace: bool,
+}
+
+#[derive(Debug, Args)]
+struct FinishArgs {
+    /// Managed worktree path; defaults to the current directory.
+    #[arg(default_value = ".")]
+    path: PathBuf,
+    /// First delete the recognised build cache, as `worktree discard-cache` does.
+    #[arg(long)]
+    discard_cache: bool,
+    /// First archive whatever the tree holds that no advertised ref recovers.
+    #[arg(long)]
+    archive: bool,
+}
+
+#[derive(Debug, Args)]
+struct DiscardCacheArgs {
+    /// Managed worktree path; defaults to the current directory.
+    #[arg(default_value = ".")]
+    path: PathBuf,
+    /// Classify and report without deleting anything.
+    #[arg(long)]
+    dry_run: bool,
 }
 
 #[derive(Debug, Args)]
@@ -326,17 +347,8 @@ fn run(cli: &Cli) -> Result<()> {
         Command::Create(args) => create(args, cli.json),
         Command::Status => status(cli.json),
         Command::Inspect(args) => inspect(args, cli.json),
-        Command::Finish { path } => {
-            let evidence = manager()?.finish(path).map_err(anyhow::Error::new)?;
-            emit_success(
-                cli.json,
-                CLI_PROTOCOL_VERSION,
-                EvidencePayload {
-                    evidence: &evidence,
-                },
-                || format!("finished {}", evidence.path.display()),
-            )
-        }
+        Command::Finish(args) => finish(args, cli.json),
+        Command::DiscardCache(args) => discard_cache(args, cli.json),
         Command::Archive(args) => archive(args, cli.json),
         Command::Gc(args) => gc(args, cli.json),
         Command::Reconcile(args) => reconcile(args, cli.json),
@@ -403,6 +415,99 @@ fn archive(args: &ArchiveArgs, json: bool) -> Result<()> {
             lines.join("\n")
         },
     )
+}
+
+#[derive(Serialize)]
+struct CachePayload<'a> {
+    cache: &'a b10x_worktree_domain::CacheDiscard,
+}
+
+#[derive(Serialize)]
+struct FinishPayload<'a> {
+    evidence: &'a b10x_worktree_domain::OperationEvidence,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache: Option<&'a b10x_worktree_domain::CacheDiscard>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    archive: Option<&'a b10x_worktree_domain::ArchiveEvidence>,
+}
+
+fn finish(args: &FinishArgs, json: bool) -> Result<()> {
+    let options = b10x_worktree::FinishOptions {
+        discard_cache: args.discard_cache,
+        archive: args.archive,
+    };
+    let finished = manager()?
+        .finish_with(&args.path, options)
+        .map_err(anyhow::Error::new)?;
+    emit_success(
+        json,
+        CLI_PROTOCOL_VERSION,
+        FinishPayload {
+            evidence: &finished.evidence,
+            cache: finished.cache.as_ref(),
+            archive: finished.archive.as_ref(),
+        },
+        || {
+            let mut lines = Vec::new();
+            if let Some(cache) = &finished.cache {
+                lines.push(cache_lines(cache));
+            }
+            if let Some(archive) = &finished.archive {
+                lines.push(format!("archived to {}", archive.path.display()));
+            }
+            lines.push(format!("finished {}", finished.evidence.path.display()));
+            lines.join("\n")
+        },
+    )
+}
+
+fn discard_cache(args: &DiscardCacheArgs, json: bool) -> Result<()> {
+    let cache = manager()?
+        .discard_cache(&args.path, !args.dry_run)
+        .map_err(anyhow::Error::new)?;
+    emit_success(
+        json,
+        CLI_PROTOCOL_VERSION,
+        CachePayload { cache: &cache },
+        || cache_lines(&cache),
+    )
+}
+
+fn cache_lines(cache: &b10x_worktree_domain::CacheDiscard) -> String {
+    let verb = if cache.applied {
+        "discarded"
+    } else {
+        "would discard"
+    };
+    let mut lines = vec![format!(
+        "{verb} {} recognised cache entr{} ({} MiB) in {}",
+        cache.discarded.len(),
+        if cache.discarded.len() == 1 {
+            "y"
+        } else {
+            "ies"
+        },
+        cache.discarded_bytes() / (1024 * 1024),
+        cache.path.display()
+    )];
+    for entry in &cache.discarded {
+        lines.push(format!(
+            "  {verb} {} ({:?}, {} MiB)",
+            entry.path.display(),
+            entry.kind,
+            entry.allocated_bytes / (1024 * 1024)
+        ));
+    }
+    for path in &cache.retained_ignored {
+        lines.push(format!("  kept {} (not recognised cache)", path.display()));
+    }
+    if !cache.processes_observed {
+        lines.push(
+            "  running processes could not be observed here; only the lease guarded the tree"
+                .into(),
+        );
+    }
+    lines.join("\n")
 }
 
 fn inspect(args: &InspectArgs, json: bool) -> Result<()> {
@@ -973,7 +1078,7 @@ fn install_agent_guidance() -> Result<()> {
         .map(PathBuf::from)
         .context("HOME is not set")?;
     let block = format!(
-        "{GUIDANCE_BEGIN}\n## Managed worktrees\n\nFor repository changes, load the worktree skill (the b10x plugin ships it as `worktree:managing-worktrees`, with `/worktree:cleanup` for cleanup; `worktree skill` renders it elsewhere) and use the `worktree` CLI. Create isolated trees with `worktree create`, keep primary checkouts clean, and publish commits before `worktree finish`. Work that must not be published is archived with `worktree archive <tree>`, which gc accepts as recovery proof while the tree still matches it. Review cleanup with `worktree gc --dry-run`, then pass only exact reviewed ids to `worktree gc --apply --id <id>`. Use `worktree reconcile` for interrupted provisioning, adopted legacy paths, and already-missing records; external retirement additionally requires explicit `--allow-external-retirement`, and abandoning a missing record whose recorded commit you have established is gone for good additionally requires `--acknowledge-unrecoverable <recorded-commit>`. Never force-remove or manually delete a managed tree.\n{GUIDANCE_END}\n"
+        "{GUIDANCE_BEGIN}\n## Managed worktrees\n\nFor repository changes, load the worktree skill (the b10x plugin ships it as `worktree:managing-worktrees`, with `/worktree:cleanup` for cleanup; `worktree skill` renders it elsewhere) and use the `worktree` CLI. Create isolated trees with `worktree create`, keep primary checkouts clean, publish commits, and end with `worktree finish --discard-cache --archive <tree>`: it deletes only recognised build cache, archives anything else no remote ref holds, and finishes. Keep records out of ignored build directories such as `target/`. Work that must not be published is archived with `worktree archive <tree>`, which gc accepts as recovery proof while the tree still matches it. Review cleanup with `worktree gc --dry-run`, then pass only exact reviewed ids to `worktree gc --apply --id <id>`. Use `worktree reconcile` for interrupted provisioning, adopted legacy paths, and already-missing records; external retirement additionally requires explicit `--allow-external-retirement`, and abandoning a missing record whose recorded commit you have established is gone for good additionally requires `--acknowledge-unrecoverable <recorded-commit>`. Never force-remove or manually delete a managed tree.\n{GUIDANCE_END}\n"
     );
     update_managed_block(&home.join(".codex/AGENTS.md"), &block)?;
     update_managed_block(&home.join(".claude/CLAUDE.md"), &block)
@@ -1063,13 +1168,13 @@ Release only your own lease with `worktree hook session-end --path <tree> --sess
 
 Before a large build, inspect free space and `worktree inspect --repo <primary> --id <id>`. Keep compiler caches and dependencies separate from source and retained evidence. Prefer a repository-supported cache location and bounded build settings; do not force a shared target directory across incompatible build configurations.
 
-After verification, preserve the small logs, reports, or deliverables needed for review in their intended durable location. Remove only exact build or dependency directories known to be reproducible, owned by this task, and unused by any running process. Ignored files can contain valuable work: never blanket-delete them or use `git clean -fdx`. A worktree saves duplicate Git history; its build output still consumes disk and is not automatically reclaimed.
+After verification, preserve the small logs, reports, or deliverables needed for review in their intended durable location, never only below an ignored build directory such as `target/`. Delete build output with `worktree discard-cache [<tree>]`; run it with `--dry-run` first to see the classification. It deletes only ignored directories it recognises as cache by their structure: Cargo profiles inside a tagged target, `node_modules` at or below a tracked lockfile, a virtual environment beside a tracked Python manifest, and tagged `.pytest_cache`, `.mypy_cache` and `.ruff_cache`. Every other ignored entry is kept and named. It refuses while a lease is live or another process uses the tree. Ignored files can contain valuable work: never blanket-delete them or use `git clean -fdx`. A worktree saves duplicate Git history; its build output still consumes disk until it is discarded.
 
 ## Finish and clean up
 
 1. Commit and publish every wanted change. A local-only commit is deliberately not cleanup-safe. Work merged as rebased or cherry-picked copies also qualifies when an advertised ref carries every unique commit's exact patch; GC reports that proof as `patch-equivalent`.
    When work must not be published, run `worktree archive <tree>` instead. It never modifies the tree; it writes `commits.bundle` (every commit no advertised ref holds), `dirty.patch` (tracked, untracked and ignored changes over HEAD) and a `worktree.archive/1` `manifest.json` below the state directory's `worktree/archives/<repository>/<id>/`, and verifies them. GC then accepts that archive as `archive` proof while HEAD and every file still match it exactly; any later commit or edit is refused as `archive-stale` until `worktree archive --replace <tree>` writes a new one. `--replace` moves the old archive aside and never deletes it.
-2. Preserve required evidence and remove this task's disposable output as described above. Release your own lease, then run `worktree finish <tree>`. It refuses locked, unmanaged, live, or mid-operation Git worktrees, and dirty ones unless their archive holds exactly the current state.
+2. Preserve required evidence. Release your own lease, then run `worktree finish --discard-cache --archive <tree>`. It deletes the recognised build cache, archives whatever the tree still holds that no advertised ref recovers, and finishes, so nothing that is not cache is lost. Without `--archive` it refuses a tree that still differs from HEAD and names what was kept. Every form refuses locked, unmanaged, live, or mid-operation Git worktrees; plain `worktree finish <tree>` also refuses a dirty tree unless its archive holds exactly the current state.
 3. Run `worktree gc --repo <primary> --dry-run --id <id>` and inspect every result. Without exact ids, `--repo` selects the activated workspace profile, not just the repository: the assessment covers records under that profile's `workspace_root`, including other repositories.
 4. Run `worktree gc --repo <primary> --apply --id <reviewed-id>` with repeated `--id` values only for the exact results intended for removal. The command refreshes remote advertisements, fetches required objects, and revalidates immediately before non-forced removal. Check the result before reporting storage reclaimed.
 5. End with either verified cleanup or an explicit handoff: tree id and path, published branch/commit, related work-item references, retained evidence, remaining blockers, next owner and next action. Never leave a tree silently active or label work complete merely from its age or Git state.

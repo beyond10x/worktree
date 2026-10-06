@@ -1,11 +1,11 @@
 //! Embeddable lifecycle service. The policy engine depends only on injected ports.
 
 use b10x_worktree_domain::{
-    ArchiveEvidence, ArchiveReference, ArchiveRequest, ArchiveStateCheck, CleanupAssessment,
-    CreatePlan, CreateRequest, DiscoveredWorktree, GitRevision, Lifecycle, OperationEvidence,
-    ReconciliationAction, ReconciliationAssessment, RecoveryEvidence, RecoveryKind, RecoveryProof,
-    Refusal, RelocationIntent, RemovalIntent, RepositorySnapshot, WorkspacePolicy, WorktreeId,
-    WorktreeRecord, WorktreeSnapshot, require_child,
+    ArchiveEvidence, ArchiveReference, ArchiveRequest, ArchiveStateCheck, CacheClassification,
+    CacheDiscard, CleanupAssessment, CreatePlan, CreateRequest, DiscoveredWorktree, GitRevision,
+    Lifecycle, OperationEvidence, ReconciliationAction, ReconciliationAssessment, RecoveryEvidence,
+    RecoveryKind, RecoveryProof, Refusal, RelocationIntent, RemovalIntent, RepositorySnapshot,
+    WorkspacePolicy, WorktreeId, WorktreeRecord, WorktreeSnapshot, require_child,
 };
 use std::path::{Path, PathBuf};
 
@@ -161,6 +161,26 @@ pub trait GitPort: Send + Sync {
             "hidden-state-unobserved",
             format!(
                 "this Git adapter cannot observe state that Git status hides in {}",
+                worktree.display()
+            ),
+        ))
+    }
+    /// Classify a tree's ignored entries into recognised build cache and everything else and, with
+    /// `apply`, delete the cache. The default refuses.
+    ///
+    /// Recognition follows [`b10x_worktree_domain::CacheKind`]; an ignored entry no rule
+    /// recognises is retained and reported, never deleted. An applying adapter refuses as
+    /// `worktree-in-use` while a process other than the caller and its ancestors uses the tree.
+    fn discard_cache(
+        &self,
+        _repository: &Path,
+        worktree: &Path,
+        _apply: bool,
+    ) -> Result<CacheClassification, Refusal> {
+        Err(Refusal::new(
+            "cache-discard-unsupported",
+            format!(
+                "this Git adapter cannot classify the build cache in {}",
                 worktree.display()
             ),
         ))
@@ -564,6 +584,125 @@ where
             recovery: None,
             recorded_at: now,
         })
+    }
+
+    /// Finish a tree after optionally discarding its recognised build cache and archiving what
+    /// remains, so that nothing which is not cache is lost.
+    ///
+    /// With `archive`, an archive is written when the tree still differs from HEAD, or HEAD adds
+    /// commits no advertised ref holds, and no existing archive already holds exactly this state.
+    /// The final checks are those of [`Self::finish`].
+    pub fn finish_with(
+        &self,
+        path: &Path,
+        options: FinishOptions,
+    ) -> Result<FinishEvidence, Refusal> {
+        let record = self.owned_record(path)?;
+        if record.lifecycle != Lifecycle::Active {
+            return Err(Refusal::new(
+                "not-active",
+                "only an active worktree can be finished",
+            ));
+        }
+        self.require_idle(&record, self.clock.now())?;
+        let cache = if options.discard_cache {
+            Some(self.discard_record_cache(&record, true)?)
+        } else {
+            None
+        };
+        let archive = if options.archive {
+            self.archive_unless_recoverable(&record, path)?
+        } else {
+            None
+        };
+        if let Some(cache) = cache.as_ref().filter(|_| archive.is_none()) {
+            let snapshot = self.exact_worktree_snapshot(&record.repository_root, &record.path)?;
+            if snapshot.dirty && self.existing_archive(&record)?.is_none() {
+                return Err(retained_refusal(cache));
+            }
+        }
+        let evidence = self.finish(path)?;
+        Ok(FinishEvidence {
+            evidence,
+            cache,
+            archive,
+        })
+    }
+
+    /// Classify an idle tree's ignored entries and, with `apply`, delete the recognised build
+    /// cache. Every other ignored entry is retained and reported.
+    ///
+    /// A dry-run reads only. Applying is refused for a live lease, a Git lock, or a tree that is
+    /// neither active nor finished.
+    pub fn discard_cache(&self, path: &Path, apply: bool) -> Result<CacheDiscard, Refusal> {
+        let record = self.owned_record(path)?;
+        self.discard_record_cache(&record, apply)
+    }
+
+    fn discard_record_cache(
+        &self,
+        record: &WorktreeRecord,
+        apply: bool,
+    ) -> Result<CacheDiscard, Refusal> {
+        if !matches!(record.lifecycle, Lifecycle::Active | Lifecycle::Finished) {
+            return Err(Refusal::new(
+                "not-discardable",
+                "only an active or finished worktree's build cache can be discarded",
+            ));
+        }
+        let now = self.clock.now();
+        let snapshot = self.exact_worktree_snapshot(&record.repository_root, &record.path)?;
+        if apply {
+            self.require_idle(record, now)?;
+            require_unlocked(&snapshot)?;
+        }
+        let classification =
+            self.git
+                .discard_cache(&record.repository_root, &record.path, apply)?;
+        let after = self.exact_worktree_snapshot(&record.repository_root, &record.path)?;
+        if after.head != snapshot.head {
+            return Err(Refusal::new(
+                "cache-discard-state-changed",
+                "HEAD moved while the build cache was classified; inspect the tree and retry",
+            ));
+        }
+        Ok(CacheDiscard {
+            id: record.id.clone(),
+            path: record.path.clone(),
+            observed_at: now,
+            applied: apply,
+            discarded: classification.discarded,
+            retained_ignored: classification.retained_ignored,
+            processes_observed: classification.processes_observed,
+        })
+    }
+
+    /// Write an archive unless the tree is clean with HEAD on an advertised ref, or an existing
+    /// archive already holds exactly the current state.
+    fn archive_unless_recoverable(
+        &self,
+        record: &WorktreeRecord,
+        path: &Path,
+    ) -> Result<Option<ArchiveEvidence>, Refusal> {
+        let snapshot = self.exact_worktree_snapshot(&record.repository_root, &record.path)?;
+        if !snapshot.dirty {
+            match self.recovery_proof(&record.repository_root, &snapshot.head, self.clock.now()) {
+                Ok(_) => return Ok(None),
+                Err(refusal) if refusal.code == NO_REMOTE_RECOVERY_PROOF => {}
+                Err(refusal) => return Err(refusal),
+            }
+        }
+        let existing = self.existing_archive(record)?;
+        if let Some(dir) = &existing {
+            if self
+                .git
+                .verify_archived_state(record, dir, &snapshot.head)
+                .is_ok()
+            {
+                return Ok(None);
+            }
+        }
+        self.archive(path, existing.is_some()).map(Some)
     }
 
     /// Assess cleanup candidates and optionally remove those with fresh recovery proof.
@@ -2228,6 +2367,55 @@ fn dirty_refusal() -> Refusal {
         "worktree-dirty",
         "tracked, untracked, or ignored files make cleanup unsafe",
     )
+}
+
+/// The dirty refusal after a cache discard, naming what was kept and why.
+fn retained_refusal(cache: &CacheDiscard) -> Refusal {
+    const SHOWN: usize = 8;
+    let kept = if cache.retained_ignored.is_empty() {
+        "no ignored entry; tracked or untracked changes remain".to_owned()
+    } else {
+        let named = cache
+            .retained_ignored
+            .iter()
+            .take(SHOWN)
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let more = match cache.retained_ignored.len().saturating_sub(SHOWN) {
+            0 => String::new(),
+            rest => format!(" and {rest} more"),
+        };
+        format!("ignored entries that are not recognised cache: {named}{more}")
+    };
+    Refusal::new(
+        "worktree-dirty",
+        format!(
+            "the recognised build cache was discarded and the tree still differs from HEAD ({kept}); \
+             commit what belongs to the work, or add --archive to keep the rest in an archive and \
+             finish"
+        ),
+    )
+}
+
+/// Steps [`WorktreeManager::finish_with`] takes before finishing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FinishOptions {
+    /// Delete the recognised build cache first.
+    pub discard_cache: bool,
+    /// Archive whatever the tree still holds that no advertised ref recovers.
+    pub archive: bool,
+}
+
+/// Evidence of [`WorktreeManager::finish_with`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FinishEvidence {
+    /// The finish itself.
+    pub evidence: OperationEvidence,
+    /// The cache discard, when requested.
+    pub cache: Option<CacheDiscard>,
+    /// The archive written, when one was needed.
+    pub archive: Option<ArchiveEvidence>,
 }
 
 fn require_exact_snapshot_path(

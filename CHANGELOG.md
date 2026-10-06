@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.9.0 — 2026-10-06
+
+- Add `worktree discard-cache [<tree>] [--dry-run]`. It deletes the ignored directories it
+  recognises as build cache by structure, never by name: a Cargo profile (holding `.fingerprint/`)
+  inside a target carrying a valid `CACHEDIR.TAG`, directly or below a target-triple or nested
+  tagged target; `node_modules` at or below a tracked npm, Yarn, pnpm or Bun lockfile; a virtual
+  environment (`pyvenv.cfg`) beside a tracked Python manifest; and a tagged `.pytest_cache`,
+  `.mypy_cache` or `.ruff_cache`. A tagged target holding only profiles, Cargo metadata and empty
+  directories goes whole. Every other ignored entry is kept and listed, including records written
+  inside `target/`. No symbolic link is followed. `--dry-run` classifies and deletes nothing.
+- Applying is refused as `live-session` for a live lease, for a Git-locked tree, and as
+  `worktree-in-use` while a process other than the caller and its ancestors has its working
+  directory, executable or an open file in the tree (read from `/proc` on Linux; elsewhere the
+  report sets `processes_observed: false` and only the lease guards the tree).
+- `worktree finish` gains `--discard-cache`, which discards first, and `--archive`, which archives
+  whatever the tree still holds that no advertised ref recovers (a tree still differing from HEAD,
+  or HEAD adding commits no advertised ref holds) unless an existing archive already matches. After
+  a discard without `--archive`, a tree that still differs from HEAD is refused as
+  `worktree-dirty`, naming the kept entries. `finish` without the new flags is unchanged.
+- Before this, `finish` and `gc` refused any tree holding ignored build output, and the guidance
+  told agents to delete only directories they could prove they owned. On 2026-10-06, 105 active
+  trees across four profiles (49.0 GB) differed from HEAD only by ignored files, and a by-name prune
+  of every ignored `target/` deleted agent records that committed evidence cites below `target/`.
+- The generated skill and the installed agent guidance end work with `worktree finish
+  --discard-cache --archive <tree>` and tell agents to keep records out of ignored build
+  directories.
+- `GitPort` gains `discard_cache`, refusing by default as `cache-discard-unsupported`;
+  `WorktreeManager` gains `discard_cache` and `finish_with` with `FinishOptions` and
+  `FinishEvidence`; the domain gains `CacheDiscard`, `CacheClassification`, `DiscardedCache`,
+  `CacheKind` and the recognition constants. JSON protocol 4 is unchanged: `discard-cache` is a new
+  command with its own `cache` payload, and `finish` adds the optional `cache` and `archive` keys
+  only when the new flags are given.
+
 ## 0.8.2 — 2026-09-27
 
 - `worktree reconcile` retires a record whose repository was deleted. Before this, every such

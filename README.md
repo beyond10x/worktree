@@ -28,11 +28,12 @@ worktree hook session-start --path <tree> --session <session-id>
 worktree inspect --repo /path/to/repository
 worktree status
 worktree hook heartbeat --path <tree> --session <session-id>
-# Publish wanted changes and remove this task's disposable build output.
+# Publish wanted changes.
 worktree hook session-end --path <tree> --session <session-id>
-# Or keep unpublished work in a verified local archive instead of on a remote.
-worktree archive <tree>
-worktree finish <tree>
+# Review which ignored directories are recognised build cache; everything else is kept.
+worktree discard-cache <tree> --dry-run
+# Delete that cache, archive whatever no remote ref recovers, and finish.
+worktree finish --discard-cache --archive <tree>
 worktree gc --repo /path/to/repository --dry-run --id <reviewed-id>
 worktree gc --repo /path/to/repository --apply --id <reviewed-id>
 worktree reconcile --repo /path/to/repository --dry-run
@@ -47,6 +48,15 @@ add `--install-agent-guidance` to write a managed guidance block into `~/.codex/
 are canonical, disjoint paths. Create plans resolve the requested base to an immutable commit and
 revalidate the repository, policy-derived destination, and exact Git worktree membership before
 changing state.
+
+`worktree discard-cache` recognises build cache by structure, never by a directory's name: a Cargo
+profile (it holds `.fingerprint/`) inside a target carrying a valid `CACHEDIR.TAG`, `node_modules`
+at or below a tracked npm, Yarn, pnpm or Bun lockfile, a virtual environment (`pyvenv.cfg`) beside
+a tracked Python manifest, and a tagged `.pytest_cache`, `.mypy_cache` or `.ruff_cache`. Every other
+ignored entry, including records written inside `target/`, is kept and named in the report. It
+follows no symbolic link, and it refuses while a session lease is live, Git locks the tree, or
+another process has its working directory, executable or an open file inside the tree (observed
+through `/proc` on Linux; elsewhere the report says processes were not observed).
 
 Generate portable agent guidance from the exact installed command surface:
 

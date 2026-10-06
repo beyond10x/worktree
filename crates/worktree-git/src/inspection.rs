@@ -127,7 +127,7 @@ fn allocation(metadata: &Metadata) -> Option<u64> {
     }
 }
 
-fn measure(root: &Path, limit: u64) -> Result<StorageObservation, Refusal> {
+pub(crate) fn measure(root: &Path, limit: u64) -> Result<StorageObservation, Refusal> {
     if limit == 0 {
         return Err(Refusal::new(
             "invalid-inspection-limit",

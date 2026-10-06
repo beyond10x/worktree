@@ -6,8 +6,8 @@ use b10x_worktree_domain::{
     ArchiveEvidence, ArchiveReference, ArchiveRequest, ArchiveStateCheck, WorktreeRecord,
 };
 use b10x_worktree_domain::{
-    CreatePlan, DiscoveredWorktree, RecoveryEvidence, RecoveryKind, Refusal, RepositorySnapshot,
-    WorktreeSnapshot,
+    CacheClassification, CreatePlan, DiscoveredWorktree, RecoveryEvidence, RecoveryKind, Refusal,
+    RepositorySnapshot, WorktreeSnapshot,
 };
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
@@ -17,6 +17,7 @@ use std::process::{Command, Stdio};
 
 #[cfg(unix)]
 mod archive;
+mod cache;
 mod hidden;
 mod inspection;
 
@@ -1035,6 +1036,15 @@ impl GitPort for ProcessGit {
 
     fn hidden_state(&self, _repository: &Path, worktree: &Path) -> Result<(), Refusal> {
         hidden::require_none(worktree)
+    }
+
+    fn discard_cache(
+        &self,
+        _repository: &Path,
+        worktree: &Path,
+        apply: bool,
+    ) -> Result<CacheClassification, Refusal> {
+        cache::discard(worktree, apply)
     }
 
     #[cfg(unix)]

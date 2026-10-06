@@ -38,6 +38,13 @@ independent policy: every decision must come from the public façade.
   a tree is returned to HEAD by resetting the index, then restoring or deleting each file only after
   re-hashing it against the archive, before the non-forced removal. Archiving never modifies the
   tree, and no command deletes an archive.
+- The only command that deletes files a tree's owner wrote is `discard-cache` (and `finish
+  --discard-cache`), and it deletes only ignored, real directories recognised as build cache by
+  structure: a Cargo profile holding `.fingerprint/` inside a validly tagged target, `node_modules`
+  at or below a tracked lockfile, a virtual environment beside a tracked Python manifest, and a
+  tagged `.pytest_cache`, `.mypy_cache` or `.ruff_cache`. A name alone never qualifies; anything
+  unrecognised is retained and reported. It refuses for a live lease, a Git lock, or another
+  process using the tree.
 - Ordinary GC requires canonical containment below the configured worktree root. Only exact-id
   reconciliation with separate external-retirement confirmation may retire a finished external
   legacy tree after the same removal gates pass.
