@@ -21,9 +21,35 @@ entities:
       # Every other ignored entry. Never deleted; `worktree archive` keeps it.
       - name: retained_ignored_entries
         type: Integer
+      # Allocated bytes of those retained entries; a sweep refuses to archive more than its limit.
+      - name: retained_bytes
+        type: Integer
     lifecycle:
       initial: Observed
       states: [Observed]
       terminal: [Observed]
     # UNMAPPED: no process-ownership noun exists. "In use" is an observation of /proc at the
     # moment of the discard, reported as a refusal, not a field of this report.
+
+  - name: worktree.cache.SweepItem
+    identity:
+      name: worktree_id
+      type: String
+    fields:
+      # Seconds since the later of the registry's recorded activity and the tree's own Git index,
+      # HEAD or HEAD log.
+      - name: idle_seconds
+        type: Integer
+      - name: discarded_entries
+        type: Integer
+      # True when the sweep wrote an archive for an expired or finished tree.
+      - name: archived
+        type: Boolean
+      # True when the sweep left the record, or part of it, as it was; the refusal names why.
+      - name: refused
+        type: Boolean
+    lifecycle:
+      initial: Observed
+      states: [Observed]
+      terminal: [Observed]
+    # A sweep never changes the registry lifecycle and never removes a tree; GC stays review-bound.
