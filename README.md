@@ -58,6 +58,28 @@ follows no symbolic link, and it refuses while a session lease is live, Git lock
 another process has its working directory, executable or an open file inside the tree (observed
 through `/proc` on Linux; elsewhere the report says processes were not observed).
 
+`worktree sweep --all-profiles` does the same for every tree without a live lease that shows no
+activity, in the registry or in its own Git index and HEAD, for `--idle-days` (default 1). For a
+tree past the profile's expiry, or already finished, it also writes an archive of whatever no
+advertised ref recovers, refusing as `archive-too-large` above `--max-archive-mib` (default 1024).
+It never changes lifecycle and never removes a tree: `worktree gc` stays review-bound. Run it from
+a systemd user timer:
+
+```ini
+# ~/.config/systemd/user/worktree-sweep.service
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/worktree sweep --all-profiles
+
+# ~/.config/systemd/user/worktree-sweep.timer
+[Timer]
+OnCalendar=*-*-* 04:30:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+```
+
 Generate portable agent guidance from the exact installed command surface:
 
 ```bash

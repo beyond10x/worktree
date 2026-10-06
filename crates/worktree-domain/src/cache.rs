@@ -5,7 +5,7 @@
 //! directories too: on 2026-10-06 a prune of every ignored `target/` by name deleted review
 //! records that committed evidence cites under `target/`.
 
-use crate::WorktreeId;
+use crate::{ArchiveEvidence, Refusal, WorktreeId, WorktreeRecord};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -92,6 +92,9 @@ pub struct CacheClassification {
     pub discarded: Vec<DiscardedCache>,
     /// Every other ignored entry, relative to the tree root. Never deleted.
     pub retained_ignored: Vec<PathBuf>,
+    /// Allocated bytes of the retained ignored entries, without following symbolic links.
+    #[serde(default)]
+    pub retained_bytes: u64,
     /// Whether running processes could be observed. When false, only the lease guarded the tree.
     pub processes_observed: bool,
 }
@@ -111,8 +114,29 @@ pub struct CacheDiscard {
     pub discarded: Vec<DiscardedCache>,
     /// Every other ignored entry; `worktree archive` keeps these.
     pub retained_ignored: Vec<PathBuf>,
+    /// Allocated bytes of the retained ignored entries.
+    #[serde(default)]
+    pub retained_bytes: u64,
     /// Whether running processes could be observed.
     pub processes_observed: bool,
+}
+
+/// What one sweep did, or would do, for one idle record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SweepItem {
+    /// The record as the sweep found it. A sweep never changes lifecycle.
+    pub record: WorktreeRecord,
+    /// Seconds since the later of the recorded activity and the tree's own Git activity.
+    pub idle_seconds: i64,
+    /// The cache discard, or its classification in a dry-run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache: Option<CacheDiscard>,
+    /// The archive written for an expired or finished tree, when one was needed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive: Option<ArchiveEvidence>,
+    /// Why the sweep left this record, or part of it, as it was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refusal: Option<Refusal>,
 }
 
 impl CacheDiscard {

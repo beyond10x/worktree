@@ -5,7 +5,7 @@ use b10x_worktree_domain::{
     CacheDiscard, CleanupAssessment, CreatePlan, CreateRequest, DiscoveredWorktree, GitRevision,
     Lifecycle, OperationEvidence, ReconciliationAction, ReconciliationAssessment, RecoveryEvidence,
     RecoveryKind, RecoveryProof, Refusal, RelocationIntent, RemovalIntent, RepositorySnapshot,
-    WorkspacePolicy, WorktreeId, WorktreeRecord, WorktreeSnapshot, require_child,
+    SweepItem, WorkspacePolicy, WorktreeId, WorktreeRecord, WorktreeSnapshot, require_child,
 };
 use std::path::{Path, PathBuf};
 
@@ -184,6 +184,12 @@ pub trait GitPort: Send + Sync {
                 worktree.display()
             ),
         ))
+    }
+    /// The latest Git activity observed in the tree itself, in Unix seconds, or `None` when the
+    /// adapter cannot tell. A sweep counts idle time from the later of this and the record's own
+    /// activity. The default observes nothing.
+    fn last_activity(&self, _worktree: &Path) -> Option<i64> {
+        None
     }
     /// Whether the repository recorded at this root is gone: nothing exists at the path, or a
     /// directory is there with no `.git` of its own.
@@ -673,8 +679,79 @@ where
             applied: apply,
             discarded: classification.discarded,
             retained_ignored: classification.retained_ignored,
+            retained_bytes: classification.retained_bytes,
             processes_observed: classification.processes_observed,
         })
+    }
+
+    /// Discard the recognised build cache of every idle tree in the workspace and archive what an
+    /// expired or finished tree still holds, so that a reviewed GC can remove it without loss.
+    ///
+    /// A record is idle once neither the registry nor the tree's own Git state shows activity for
+    /// `discard_after_seconds`, and expired once that reaches the policy's expiry. A sweep never
+    /// changes lifecycle and never removes a tree. Each record's refusal is reported in its item
+    /// and the sweep moves on; without `apply` nothing is deleted or written.
+    pub fn sweep(
+        &self,
+        policy: &WorkspacePolicy,
+        options: SweepOptions,
+    ) -> Result<Vec<SweepItem>, Refusal> {
+        require_canonical_policy(policy)?;
+        let now = self.clock.now();
+        let mut items = Vec::new();
+        for record in self.registry.list()? {
+            if !record.repository_root.starts_with(&policy.workspace_root)
+                || !matches!(record.lifecycle, Lifecycle::Active | Lifecycle::Finished)
+                || path_absent(&record.path)?
+            {
+                continue;
+            }
+            let activity = self
+                .git
+                .last_activity(&record.path)
+                .map_or(record.last_seen_at, |seen| seen.max(record.last_seen_at));
+            let idle_seconds = now.saturating_sub(activity);
+            if idle_seconds < options.discard_after_seconds {
+                continue;
+            }
+            let expired = record.lifecycle == Lifecycle::Finished
+                || idle_seconds >= policy.expire_after_seconds;
+            let mut item = SweepItem {
+                record,
+                idle_seconds,
+                cache: None,
+                archive: None,
+                refusal: None,
+            };
+            match self.discard_record_cache(&item.record, options.apply) {
+                Ok(cache) => item.cache = Some(cache),
+                Err(refusal) => {
+                    item.refusal = Some(refusal);
+                    items.push(item);
+                    continue;
+                }
+            }
+            if expired && options.apply {
+                let retained = item.cache.as_ref().map_or(0, |cache| cache.retained_bytes);
+                if retained > options.max_archive_bytes {
+                    item.refusal = Some(Refusal::new(
+                        "archive-too-large",
+                        format!(
+                            "{retained} bytes of ignored files are not recognised cache; archive \
+                             them deliberately with `worktree archive` or remove what is not needed"
+                        ),
+                    ));
+                } else {
+                    let path = item.record.path.clone();
+                    match self.archive_unless_recoverable(&item.record, &path) {
+                        Ok(archive) => item.archive = archive,
+                        Err(refusal) => item.refusal = Some(refusal),
+                    }
+                }
+            }
+            items.push(item);
+        }
+        Ok(items)
     }
 
     /// Write an archive unless the tree is clean with HEAD on an advertised ref, or an existing
@@ -2396,6 +2473,27 @@ fn retained_refusal(cache: &CacheDiscard) -> Refusal {
              finish"
         ),
     )
+}
+
+/// Thresholds for [`WorktreeManager::sweep`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SweepOptions {
+    /// Delete and write; without it the sweep only classifies.
+    pub apply: bool,
+    /// Idle seconds before a tree's recognised build cache is discarded.
+    pub discard_after_seconds: i64,
+    /// Largest retained ignored content an expired tree's archive may take on; larger is refused.
+    pub max_archive_bytes: u64,
+}
+
+impl Default for SweepOptions {
+    fn default() -> Self {
+        Self {
+            apply: false,
+            discard_after_seconds: 86_400,
+            max_archive_bytes: 1 << 30,
+        }
+    }
 }
 
 /// Steps [`WorktreeManager::finish_with`] takes before finishing.

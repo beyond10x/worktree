@@ -46,6 +46,8 @@ enum Command {
     Finish(FinishArgs),
     /// Delete recognised build cache from an idle tree; every other ignored file is kept.
     DiscardCache(DiscardCacheArgs),
+    /// Discard build cache in idle trees and archive expired ones; never removes a tree.
+    Sweep(SweepArgs),
     /// Assess or safely remove finished and expired worktrees.
     Gc(GcArgs),
     /// Reconcile interrupted provisioning, adopted paths, and missing records.
@@ -133,6 +135,25 @@ struct DiscardCacheArgs {
     /// Classify and report without deleting anything.
     #[arg(long)]
     dry_run: bool,
+}
+
+#[derive(Debug, Args)]
+struct SweepArgs {
+    /// Repository used to select its activated workspace policy.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Sweep every activated workspace profile instead of the one `--repo` selects.
+    #[arg(long)]
+    all_profiles: bool,
+    /// Classify and report without deleting or writing anything.
+    #[arg(long)]
+    dry_run: bool,
+    /// Days without activity before a tree's build cache is discarded; 0 sweeps every idle lease.
+    #[arg(long, default_value_t = 1)]
+    idle_days: u32,
+    /// Largest retained ignored content, in MiB, that an expired tree's archive may take on.
+    #[arg(long, default_value_t = 1024)]
+    max_archive_mib: u64,
 }
 
 #[derive(Debug, Args)]
@@ -349,6 +370,7 @@ fn run(cli: &Cli) -> Result<()> {
         Command::Inspect(args) => inspect(args, cli.json),
         Command::Finish(args) => finish(args, cli.json),
         Command::DiscardCache(args) => discard_cache(args, cli.json),
+        Command::Sweep(args) => sweep(args, cli.json),
         Command::Archive(args) => archive(args, cli.json),
         Command::Gc(args) => gc(args, cli.json),
         Command::Reconcile(args) => reconcile(args, cli.json),
@@ -471,6 +493,87 @@ fn discard_cache(args: &DiscardCacheArgs, json: bool) -> Result<()> {
         CachePayload { cache: &cache },
         || cache_lines(&cache),
     )
+}
+
+fn sweep(args: &SweepArgs, json: bool) -> Result<()> {
+    let config =
+        load_config(&config_path().map_err(anyhow::Error::new)?).map_err(anyhow::Error::new)?;
+    let policies = if args.all_profiles {
+        config.profiles.iter().collect::<Vec<_>>()
+    } else {
+        let repository = ProcessGit
+            .repository_snapshot(&args.repo)
+            .map_err(anyhow::Error::new)?;
+        vec![resolve_policy(&config, &repository.root).map_err(anyhow::Error::new)?]
+    };
+    let options = b10x_worktree::SweepOptions {
+        apply: !args.dry_run,
+        discard_after_seconds: i64::from(args.idle_days) * 86_400,
+        max_archive_bytes: args.max_archive_mib.saturating_mul(1024 * 1024),
+    };
+    let service = manager()?;
+    let mut items = Vec::new();
+    for policy in policies {
+        items.extend(service.sweep(policy, options).map_err(anyhow::Error::new)?);
+    }
+    emit_success(
+        json,
+        CLI_PROTOCOL_VERSION,
+        ItemsPayload { items: &items },
+        || sweep_lines(&items),
+    )
+}
+
+fn sweep_lines(items: &[b10x_worktree_domain::SweepItem]) -> String {
+    const MIB: u64 = 1024 * 1024;
+    let mut lines = Vec::new();
+    let (mut discarded, mut archived, mut left) = (0, 0, 0);
+    for item in items {
+        let mut parts = vec![format!(
+            "{} idle {}d",
+            item.record.id,
+            item.idle_seconds / 86_400
+        )];
+        if let Some(cache) = &item.cache {
+            discarded += cache.discarded_bytes();
+            parts.push(format!(
+                "{} {} MiB",
+                if cache.applied {
+                    "discarded"
+                } else {
+                    "would discard"
+                },
+                cache.discarded_bytes() / MIB
+            ));
+            if !cache.retained_ignored.is_empty() {
+                parts.push(format!(
+                    "kept {} ignored entr{}",
+                    cache.retained_ignored.len(),
+                    if cache.retained_ignored.len() == 1 {
+                        "y"
+                    } else {
+                        "ies"
+                    }
+                ));
+            }
+        }
+        if let Some(archive) = &item.archive {
+            archived += 1;
+            parts.push(format!("archived to {}", archive.path.display()));
+        }
+        if let Some(refusal) = &item.refusal {
+            left += 1;
+            parts.push(format!("left: {refusal}"));
+        }
+        lines.push(parts.join("; "));
+    }
+    lines.push(format!(
+        "{} idle tree(s): {} MiB of recognised cache, {archived} archive(s) written, {left} left as \
+         they were. Nothing was removed; review `worktree gc --dry-run`.",
+        items.len(),
+        discarded / MIB
+    ));
+    lines.join("\n")
 }
 
 fn cache_lines(cache: &b10x_worktree_domain::CacheDiscard) -> String {
@@ -1182,6 +1285,7 @@ After verification, preserve the small logs, reports, or deliverables needed for
 ## Audit and recovery
 
 - Run `worktree inspect --repo <path>` for actual Git state, separate ignored-file counts, storage, leases, and retention blockers. It defaults to that repository; add `--workspace` to expand to its profile and repeat `--id` to narrow the selection. Sizes are bounded observations, not promised reclaimable bytes. Add `--refresh` for fresh remote recovery evidence (which may fetch objects). Inspection never changes lifecycle or infers owner abandonment or story completion; review GC separately before removal.
+- Operators run `worktree sweep --all-profiles` daily from a timer. It discards the recognised build cache of every tree idle for a day or more without a live lease, and archives what an expired or finished tree still holds; it never changes lifecycle, removes a tree, or applies GC. A tree it archived shows as eligible in `worktree gc --dry-run`. Add `--dry-run` to see what it would do.
 - Run `worktree status` for durable lifecycle state. It accepts no filter and reports every record in every profile, so read `repository_root` on each one before acting.
 - Run `worktree repo list --repo <path>` to distinguish managed, unmanaged, primary, and linked checkouts.
 - Run `worktree reconcile --repo <path> --dry-run` to assess interrupted provisioning, adopted legacy paths, finished external trees, and missing records.

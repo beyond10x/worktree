@@ -1047,6 +1047,10 @@ impl GitPort for ProcessGit {
         cache::discard(worktree, apply)
     }
 
+    fn last_activity(&self, worktree: &Path) -> Option<i64> {
+        cache::last_activity(worktree)
+    }
+
     #[cfg(unix)]
     fn discard_archived_state(
         &self,

@@ -45,6 +45,8 @@ independent policy: every decision must come from the public façade.
   tagged `.pytest_cache`, `.mypy_cache` or `.ruff_cache`. A name alone never qualifies; anything
   unrecognised is retained and reported. It refuses for a live lease, a Git lock, or another
   process using the tree.
+- `sweep` composes only `discard-cache` and `archive`. It never changes lifecycle, never removes a
+  tree and never applies GC; removal stays an exact-id, reviewed `gc --apply`.
 - Ordinary GC requires canonical containment below the configured worktree root. Only exact-id
   reconciliation with separate external-retirement confirmation may retire a finished external
   legacy tree after the same removal gates pass.

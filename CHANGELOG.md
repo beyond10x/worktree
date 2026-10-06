@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.10.0 — 2026-10-06
+
+- Add `worktree sweep [--repo <path> | --all-profiles] [--dry-run] [--idle-days N]
+  [--max-archive-mib N]`. For every active or finished tree without a live lease and without
+  activity for `--idle-days` (default 1), it runs `discard-cache`. For a tree past the profile's
+  expiry, or finished, it then writes an archive of whatever no advertised ref recovers unless one
+  already matches; above `--max-archive-mib` (default 1024) of retained ignored content it refuses
+  as `archive-too-large` and writes nothing. Each record's refusal is reported in its item and the
+  sweep goes on. It never changes lifecycle, never removes a tree and never applies GC: a swept
+  tree shows as eligible in `worktree gc --dry-run`, and removal stays an exact-id apply.
+- Idle time counts from the later of the registry's recorded activity and the tree's own Git
+  index, HEAD and HEAD log, so a tree an agent worked in without a lease is not treated as idle.
+- The README shows a systemd user timer that runs `worktree sweep --all-profiles` daily, and the
+  generated skill tells agents what the sweep does.
+- `CacheClassification` and `CacheDiscard` gain `retained_bytes` (default 0 when absent).
+  `GitPort` gains `last_activity`, observing nothing by default; `WorktreeManager` gains `sweep`
+  with `SweepOptions`; the domain gains `SweepItem`. JSON protocol 4 unchanged: `sweep` is a new
+  command with its own `items` payload, and `discard-cache` adds the `retained_bytes` field.
+
 ## 0.9.0 — 2026-10-06
 
 - Add `worktree discard-cache [<tree>] [--dry-run]`. It deletes the ignored directories it

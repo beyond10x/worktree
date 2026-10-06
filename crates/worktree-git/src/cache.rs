@@ -72,6 +72,11 @@ pub(crate) fn discard(worktree: &Path, apply: bool) -> Result<CacheClassificatio
     }
     Ok(CacheClassification {
         discarded,
+        retained_bytes: plan
+            .retained
+            .iter()
+            .map(|relative| allocated_bytes(&worktree.join(relative)))
+            .sum(),
         retained_ignored: plan.retained,
         processes_observed: users.is_some(),
     })
@@ -287,11 +292,45 @@ fn python_manifest_beside(directory: &Path, tracked: &BTreeSet<PathBuf>) -> bool
 }
 
 fn allocated_bytes(path: &Path) -> u64 {
+    if !real_directory(path) {
+        return std::fs::symlink_metadata(path).map_or(0, |metadata| file_allocation(&metadata));
+    }
     crate::inspection::measure(path, u64::MAX).map_or(0, |observation| {
         observation
             .allocated_bytes
             .unwrap_or(observation.logical_bytes)
     })
+}
+
+fn file_allocation(metadata: &std::fs::Metadata) -> u64 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        metadata.blocks() * 512
+    }
+    #[cfg(not(unix))]
+    {
+        metadata.len()
+    }
+}
+
+/// The latest change to the tree's own Git index, HEAD or HEAD log, in Unix seconds.
+///
+/// `git status`, staging, commits and checkouts touch these; a build does not.
+pub(crate) fn last_activity(worktree: &Path) -> Option<i64> {
+    let gitfile = std::fs::read_to_string(worktree.join(".git")).ok()?;
+    let admin = PathBuf::from(gitfile.strip_prefix("gitdir:")?.trim());
+    let admin = if admin.is_absolute() {
+        admin
+    } else {
+        worktree.join(admin)
+    };
+    ["index", "HEAD", "logs/HEAD"]
+        .iter()
+        .filter_map(|name| std::fs::metadata(admin.join(name)).ok()?.modified().ok())
+        .filter_map(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|elapsed| i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX))
+        .max()
 }
 
 fn remove(path: &Path) -> Result<(), Refusal> {
