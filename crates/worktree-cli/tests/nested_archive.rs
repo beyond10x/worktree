@@ -33,6 +33,11 @@ fn git(path: &Path, args: &[&str]) -> Output {
             "init.defaultBranch=main",
             "-c",
             "protocol.file.allow=always",
+            // A commit otherwise starts a detached `git maintenance run --auto`, which creates
+            // `objects/maintenance.lock` inside a nested repository after the command returns
+            // and can change the tree between two listings.
+            "-c",
+            "maintenance.auto=false",
         ])
         .args(args)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")

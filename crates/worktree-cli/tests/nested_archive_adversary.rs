@@ -42,6 +42,10 @@ fn git(path: &Path, args: &[&str]) -> Output {
             "commit.gpgsign=false",
             "-c",
             "init.defaultBranch=main",
+            // No detached `git maintenance run --auto` writing into a nested repository after
+            // the command returns.
+            "-c",
+            "maintenance.auto=false",
         ])
         .args(args)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
