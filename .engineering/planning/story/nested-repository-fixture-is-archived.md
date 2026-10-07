@@ -2,7 +2,7 @@
 format: aep.planning-md/3
 id: story:nested-repository-fixture-is-archived
 kind: story
-status: active
+status: implemented
 title: A tree holding a nested Git fixture is archived and retired without loss
 summary: worktree archive keeps a byte image of each nested repository, and gc retires the tree on it
 refs:
@@ -18,6 +18,8 @@ scope:
 - confidence: cited
   path: crates/worktree-cli/tests/nested_archive.rs
 - confidence: cited
+  path: crates/worktree-cli/tests/nested_archive_adversary.rs
+- confidence: cited
   path: crates/worktree-domain/src/archive.rs
 - confidence: cited
   path: crates/worktree-git/Cargo.toml
@@ -29,10 +31,11 @@ scope:
   path: crates/worktree-git/src/lib.rs
 - confidence: cited
   path: crates/worktree/src/lib.rs
-revision: 4
+revision: 8
 transitions:
 - {from: "draft", to: "proposed", at: "2026-10-07T08:09:40Z", actor: "human:timo", revision: 3}
 - {from: "proposed", to: "active", at: "2026-10-07T08:09:40Z", actor: "human:timo", revision: 4}
+- {from: "active", to: "implemented", at: "2026-10-07T23:01:25Z", actor: "human:timo", revision: 8, decided_on: {"recorded":{"test_result":1,"review_outcome":3,"verification":1}}}
 ---
 ## Outcome
 
@@ -60,13 +63,14 @@ a directory only as `<path>/` and indexes nothing below it, so the existing patc
   whose `<path>/.git` is a real directory.
 - Still refused as `archive-unsupported-entry`, naming the path and the reason: a `.git` that is a
   file or a symlink (submodule or linked worktree); a `.git` holding `commondir`, a non-empty
-  `objects/info/alternates`, or any entry under `worktrees/`; a path HEAD records as a submodule
-  (mode 160000); any entry below the root that is not a regular file, directory or symlink; any
+  `objects/info/alternates`, any entry under `worktrees/` or any symlink; a root at or below which
+  HEAD or the index tracks any path (a submodule's gitlink, mode 160000, included); any entry
+  below the root that is not a regular file, directory or symlink; any
   path containing a newline.
 - The archive holds one `nested-<n>.tar` per nested repository, `n` counting from 1 in path-byte
   order: the root directory and every entry below it, `.git` included, with permission bits,
   modification times and symlink targets; entry names are relative to the tree root, so
-  `tar -xf nested-<n>.tar -C <tree>` restores it.
+  `tar -xpf nested-<n>.tar -C <tree>` restores it, permission bits included.
 - Each image has a fingerprint: the SHA-256 of the canonical listing of every entry below the root
   (relative path, kind, permission bits, size, SHA-256 of a file's content or a symlink's target),
   sorted by path bytes. The image read back, and the directory on disk before and after writing,

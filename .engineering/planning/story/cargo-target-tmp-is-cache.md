@@ -2,7 +2,7 @@
 format: aep.planning-md/3
 id: story:cargo-target-tmp-is-cache
 kind: story
-status: active
+status: implemented
 title: Cargo's target/tmp scratch is discarded as cache whatever it holds
 summary: a non-empty target/tmp no longer forces an archive of test scratch
 relations:
@@ -14,10 +14,11 @@ scope:
   path: crates/worktree-domain/src/cache.rs
 - confidence: cited
   path: crates/worktree-git/src/cache.rs
-revision: 4
+revision: 5
 transitions:
 - {from: "draft", to: "proposed", at: "2026-10-07T08:09:40Z", actor: "human:timo", revision: 3}
 - {from: "proposed", to: "active", at: "2026-10-07T08:09:40Z", actor: "human:timo", revision: 4}
+- {from: "active", to: "implemented", at: "2026-10-07T23:01:25Z", actor: "human:timo", revision: 5, decided_on: {"recorded":{"test_result":1,"verification":1}}}
 ---
 ## Outcome
 

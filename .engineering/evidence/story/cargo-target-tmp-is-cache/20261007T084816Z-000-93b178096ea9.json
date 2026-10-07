@@ -1,0 +1,13 @@
+{
+  "at": "2026-10-07T08:48:16Z",
+  "actor": "human:timo",
+  "artifact": "story:cargo-target-tmp-is-cache",
+  "kind": "story",
+  "revision": 4,
+  "change": {
+    "change": "evidence",
+    "kind": "verification",
+    "source": "cargo test -p b10x-worktree-cli --locked --test cache_discard: base a4f0ef8 FAILED 8 passed 2 failed (finish refused worktree-dirty target/tmp; discarded lacked target/tmp); unit 49b5339 ok 10 passed",
+    "reference": "commit 49b5339 against a4f0ef8"
+  }
+}

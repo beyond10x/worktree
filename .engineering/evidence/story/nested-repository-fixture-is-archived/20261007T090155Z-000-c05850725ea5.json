@@ -1,0 +1,13 @@
+{
+  "at": "2026-10-07T09:01:55Z",
+  "actor": "human:timo",
+  "artifact": "story:nested-repository-fixture-is-archived",
+  "kind": "story",
+  "revision": 4,
+  "change": {
+    "change": "evidence",
+    "kind": "verification",
+    "source": "cargo test -p b10x-worktree-cli --locked --test nested_archive: base a4f0ef8 FAILED 1 passed 8 failed (archive-unsupported-entry: nested repositories and submodules are not archived); unit ccf4a6d ok 9 passed",
+    "reference": "commit ccf4a6d against a4f0ef8"
+  }
+}

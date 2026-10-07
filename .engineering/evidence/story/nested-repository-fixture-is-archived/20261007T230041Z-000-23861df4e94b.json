@@ -1,0 +1,13 @@
+{
+  "at": "2026-10-07T23:00:41Z",
+  "actor": "human:timo",
+  "artifact": "story:nested-repository-fixture-is-archived",
+  "kind": "story",
+  "revision": 7,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "cargo test -p b10x-worktree-cli -p b10x-worktree-git -p b10x-worktree-domain -p b10x-worktree --locked --no-fail-fast",
+    "reference": "commit ffe43f4 (wave head, unit merge de784ad): exit 0; nested_archive 11 passed, nested_archive_adversary 7 passed, b10x_worktree_git 37 passed, b10x_worktree_domain 13 passed, b10x_worktree 39 passed"
+  }
+}
