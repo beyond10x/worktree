@@ -154,9 +154,16 @@ pub trait GitPort: Send + Sync {
     /// marked assume-unchanged or skip-worktree, staged content that differs from both HEAD and
     /// the working copy, files below a nested `.git`, and per-worktree refs.
     ///
-    /// Neither remote refs nor an archive cover this state. The default refuses, because an
-    /// adapter that cannot look has not shown that nothing is there.
-    fn hidden_state(&self, _repository: &Path, worktree: &Path) -> Result<(), Refusal> {
+    /// Neither remote refs nor an archive cover this state, with one exception: `archive` names
+    /// the archive the caller verified in the same flow, and a nested `.git` below a repository
+    /// root that archive images, verified against the tree again here, is not refused. The
+    /// default refuses, because an adapter that cannot look has not shown that nothing is there.
+    fn hidden_state(
+        &self,
+        _repository: &Path,
+        worktree: &Path,
+        _archive: Option<&Path>,
+    ) -> Result<(), Refusal> {
         Err(Refusal::new(
             "hidden-state-unobserved",
             format!(
@@ -353,9 +360,10 @@ where
             created_at: self.clock.now(),
         })?;
         // The archive is kept either way; the caller learns now what cleanup will still refuse.
+        // It was verified as it was written, so the nested repositories it images are covered.
         evidence.blocker = self
             .git
-            .hidden_state(&record.repository_root, &record.path)
+            .hidden_state(&record.repository_root, &record.path, Some(&destination))
             .err();
         let after = self.exact_worktree_snapshot(&record.repository_root, &record.path)?;
         if after.head != snapshot.head {
@@ -429,14 +437,10 @@ where
         proof: Option<&RecoveryProof>,
     ) -> Result<(), Refusal> {
         require_unlocked(snapshot)?;
-        let relied_on = proof
-            .filter(|proof| proof.kind == RecoveryKind::Archive)
-            .and_then(|proof| proof.archive.as_ref())
-            .map(|reference| reference.path.clone());
-        if let Some(archive) = relied_on {
+        if let Some(archive) = proof.and_then(relied_on_archive) {
             return self
                 .git
-                .verify_archived_state(record, &archive, &snapshot.head);
+                .verify_archived_state(record, archive, &snapshot.head);
         }
         if !snapshot.dirty {
             return Ok(());
@@ -1159,8 +1163,11 @@ where
             // Remote refs never hold uncommitted state; only an exact archive can.
             return Err(dirty_refusal());
         }
+        // A dirty tree is assessed on its archive alone, verified below in this same flow, so the
+        // nested repositories that archive images are covered; a clean one relies on no archive.
+        let relied_on = archive.as_deref().filter(|_| snapshot.dirty);
         self.git
-            .hidden_state(&record.repository_root, &record.path)?;
+            .hidden_state(&record.repository_root, &record.path, relied_on)?;
         if let (true, Some(dir)) = (snapshot.dirty, &archive) {
             self.require_matching_removal_intent(record)?;
             return self.archive_proof(
@@ -1607,7 +1614,7 @@ where
             ));
         }
         require_clean_unlocked(&snapshot)?;
-        self.git.hidden_state(&record.repository_root, path)?;
+        self.git.hidden_state(&record.repository_root, path, None)?;
         self.recovery_for_record(record, &snapshot.head, now)
             .map(Some)
     }
@@ -2049,6 +2056,21 @@ where
         Ok(())
     }
 
+    /// Refuse what [`Self::require_clean_or_archived`] refuses, then hidden state. Only archive
+    /// proof, whose state the first check has just verified, lets hidden state rely on its
+    /// archive.
+    fn require_removable_state(
+        &self,
+        record: &WorktreeRecord,
+        path: &Path,
+        snapshot: &WorktreeSnapshot,
+        proof: &RecoveryProof,
+    ) -> Result<(), Refusal> {
+        self.require_clean_or_archived(record, snapshot, Some(proof))?;
+        self.git
+            .hidden_state(&record.repository_root, path, relied_on_archive(proof))
+    }
+
     fn apply_removal(
         &self,
         record: &WorktreeRecord,
@@ -2061,8 +2083,7 @@ where
             self.require_retirement_topology(policy, record, path, relocation, true)?;
         }
         let before_intent = self.exact_worktree_snapshot(&record.repository_root, path)?;
-        self.require_clean_or_archived(record, &before_intent, Some(&proof))?;
-        self.git.hidden_state(&record.repository_root, path)?;
+        self.require_removable_state(record, path, &before_intent, &proof)?;
         if before_intent.head != proof.head {
             return Err(Refusal::new(
                 "worktree-head-changed-during-proof",
@@ -2087,8 +2108,7 @@ where
         };
         self.registry.begin_removal(&intent)?;
         let mut before_remove = self.exact_worktree_snapshot(&record.repository_root, path)?;
-        self.require_clean_or_archived(record, &before_remove, Some(&intent.recovery))?;
-        self.git.hidden_state(&record.repository_root, path)?;
+        self.require_removable_state(record, path, &before_remove, &intent.recovery)?;
         if before_remove.head != intent.head {
             return Err(Refusal::new(
                 "worktree-head-changed-after-intent",
@@ -2108,7 +2128,8 @@ where
                 .discard_archived_state(record, &archive, &intent.head)?;
             before_remove = self.exact_worktree_snapshot(&record.repository_root, path)?;
             require_clean_unlocked(&before_remove)?;
-            self.git.hidden_state(&record.repository_root, path)?;
+            // The discard deleted every imaged nested repository; a nested `.git` now is not one.
+            self.git.hidden_state(&record.repository_root, path, None)?;
             if before_remove.head != intent.head {
                 return Err(Refusal::new(
                     "worktree-head-changed-after-intent",
@@ -2446,6 +2467,15 @@ fn dirty_refusal() -> Refusal {
     )
 }
 
+/// The archive a removal relies on, when its proof is archive proof.
+fn relied_on_archive(proof: &RecoveryProof) -> Option<&Path> {
+    proof
+        .archive
+        .as_ref()
+        .filter(|_| proof.kind == RecoveryKind::Archive)
+        .map(|reference| reference.path.as_path())
+}
+
 /// The dirty refusal after a cache discard, naming what was kept and why.
 fn retained_refusal(cache: &CacheDiscard) -> Refusal {
     const SHOWN: usize = 8;
@@ -2621,6 +2651,8 @@ mod tests {
         snapshot_sequence: Mutex<VecDeque<String>>,
         residue_matches: bool,
         repository_absent: bool,
+        /// The archive each hidden-state observation was told it may rely on, in call order.
+        hidden_archives: Mutex<Vec<Option<PathBuf>>>,
     }
 
     #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2762,7 +2794,16 @@ mod tests {
             Ok(self.discovered.lock().unwrap().clone())
         }
 
-        fn hidden_state(&self, _repository: &Path, _worktree: &Path) -> Result<(), Refusal> {
+        fn hidden_state(
+            &self,
+            _repository: &Path,
+            _worktree: &Path,
+            archive: Option<&Path>,
+        ) -> Result<(), Refusal> {
+            self.hidden_archives
+                .lock()
+                .unwrap()
+                .push(archive.map(Path::to_path_buf));
             Ok(())
         }
 
@@ -3017,6 +3058,7 @@ mod tests {
             snapshot_sequence: Mutex::new(VecDeque::new()),
             residue_matches: true,
             repository_absent: false,
+            hidden_archives: Mutex::new(Vec::new()),
         }
     }
 
@@ -3147,6 +3189,7 @@ mod tests {
                 discovered_sequence: Mutex::new(VecDeque::new()),
                 residue_matches: true,
                 repository_absent: false,
+                hidden_archives: Mutex::new(Vec::new()),
             },
             FakeRegistry {
                 records: Mutex::new(vec![registered.clone()]),
@@ -3212,6 +3255,7 @@ mod tests {
                 discovered_sequence: Mutex::new(VecDeque::new()),
                 residue_matches: true,
                 repository_absent: false,
+                hidden_archives: Mutex::new(Vec::new()),
             },
             FakeRegistry {
                 records: Mutex::new(vec![registered.clone()]),
@@ -4226,6 +4270,24 @@ mod tests {
 
         let assessment = assess_one(&manager, &policy, &registered);
         assert_eq!(assessment.refusal.unwrap().code, "archive-unsupported");
+    }
+
+    #[test]
+    fn hidden_state_relies_on_the_archive_only_of_a_dirty_tree_assessed_on_it() {
+        let observed = |dirty, archived| {
+            let (temporary, policy, registered, manager) = archive_fixture(dirty, true, archived);
+            assess_one(&manager, &policy, &registered);
+            let archive = temporary.path().join("archive_root/repo/archived");
+            let calls = manager.git.hidden_archives.lock().unwrap().clone();
+            (calls, archive)
+        };
+
+        let (dirty_archived, archive) = observed(true, true);
+        assert_eq!(dirty_archived, vec![Some(archive)]);
+        let (clean_archived, _) = observed(false, true);
+        assert_eq!(clean_archived, vec![None]);
+        let (clean_unarchived, _) = observed(false, false);
+        assert_eq!(clean_unarchived, vec![None]);
     }
 
     #[test]

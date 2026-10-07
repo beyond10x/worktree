@@ -2,17 +2,28 @@
 
 use crate::ProcessGit;
 use b10x_worktree_domain::Refusal;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Namespaces Git stores per worktree; removing the tree deletes every ref in them.
 const PER_WORKTREE_REFS: [&str; 3] = ["refs/worktree/", "refs/bisect/", "refs/rewritten/"];
 
 /// Refuse the first kind of hidden state found in `worktree`.
-pub(crate) fn require_none(worktree: &Path) -> Result<(), Refusal> {
+///
+/// `covered` is called only once every other rule has passed. It returns the nested repository
+/// roots, relative to `worktree`, that a verified archive images; a `.git` at or below exactly
+/// those roots is not refused. Every other rule is the same with or without it.
+pub(crate) fn require_none(
+    worktree: &Path,
+    covered: impl FnOnce() -> Result<Vec<PathBuf>, Refusal>,
+) -> Result<(), Refusal> {
     require_no_index_flags(worktree)?;
     require_staged_content_on_disk(worktree)?;
     require_no_per_worktree_refs(worktree)?;
-    require_no_nested_dot_git(worktree, worktree)
+    let covered = covered()?
+        .into_iter()
+        .map(|root| worktree.join(root))
+        .collect::<Vec<_>>();
+    require_no_nested_dot_git(worktree, worktree, &covered)
 }
 
 fn hidden(path: &[u8], reason: &str) -> Refusal {
@@ -100,7 +111,14 @@ fn require_no_per_worktree_refs(worktree: &Path) -> Result<(), Refusal> {
 }
 
 /// Git lists nothing below a directory or file named `.git`, but removal deletes it.
-fn require_no_nested_dot_git(root: &Path, directory: &Path) -> Result<(), Refusal> {
+///
+/// A directory in `covered` (absolute) is a nested repository root a verified archive images
+/// byte for byte; it is not descended into.
+fn require_no_nested_dot_git(
+    root: &Path,
+    directory: &Path,
+    covered: &[PathBuf],
+) -> Result<(), Refusal> {
     let unreadable = |error: std::io::Error| {
         Refusal::new(
             "worktree-state-unreadable",
@@ -110,6 +128,9 @@ fn require_no_nested_dot_git(root: &Path, directory: &Path) -> Result<(), Refusa
     for entry in std::fs::read_dir(directory).map_err(unreadable)? {
         let entry = entry.map_err(unreadable)?;
         let path = entry.path();
+        if covered.contains(&path) {
+            continue;
+        }
         if entry.file_name() == ".git" {
             if directory == root {
                 continue;
@@ -122,7 +143,7 @@ fn require_no_nested_dot_git(root: &Path, directory: &Path) -> Result<(), Refusa
             ));
         }
         if entry.file_type().map_err(unreadable)?.is_dir() {
-            require_no_nested_dot_git(root, &path)?;
+            require_no_nested_dot_git(root, &path, covered)?;
         }
     }
     Ok(())

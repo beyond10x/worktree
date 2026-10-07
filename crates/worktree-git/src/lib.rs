@@ -1034,8 +1034,20 @@ impl GitPort for ProcessGit {
         archive::verify_state(record, archive, head)
     }
 
-    fn hidden_state(&self, _repository: &Path, worktree: &Path) -> Result<(), Refusal> {
-        hidden::require_none(worktree)
+    fn hidden_state(
+        &self,
+        _repository: &Path,
+        worktree: &Path,
+        archive: Option<&Path>,
+    ) -> Result<(), Refusal> {
+        hidden::require_none(worktree, || match archive {
+            // Only the roots whose images this archive still proves against the tree.
+            #[cfg(unix)]
+            Some(archive) => archive::covered_roots(worktree, archive),
+            #[cfg(not(unix))]
+            Some(_) => Ok(Vec::new()),
+            None => Ok(Vec::new()),
+        })
     }
 
     fn discard_cache(
