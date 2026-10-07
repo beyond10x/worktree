@@ -7,3 +7,4 @@ domains:
   - worktree.cache
   - worktree.guidance
   - worktree.archive
+  - worktree.branches

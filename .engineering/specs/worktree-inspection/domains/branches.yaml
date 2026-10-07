@@ -1,0 +1,93 @@
+domain: worktree.branches
+
+types:
+  # What a branch sweep does with one local or remote branch. Every deletion is preceded by the
+  # tip record; a local branch no rule proves recoverable is pushed unchanged first, or bundled
+  # when the push is refused.
+  #   DeleteMerged: local, tip an ancestor of origin/main (`git branch -d`).
+  #   DeleteEquivalent: local, `git cherry origin/main <branch>` prints only `-` lines.
+  #   DeleteRemoteHeld: local, tip reachable from a remote-tracking ref.
+  #   PushThenDelete: local, pushed unchanged through the publish adapter, then deleted.
+  #   BundleThenDelete: local, push refused; a verified bundle is written, then deleted.
+  #   DeleteRemote: remote, work on main (tip an ancestor of origin/main, tree equal to a main
+  #     commit's, or every patch equivalent), no open pull request, no live tree.
+  #   Keep: anything else, with the reason.
+  - name: worktree.branches.BranchDecision
+    kind: enum
+    variants: [DeleteMerged, DeleteEquivalent, DeleteRemoteHeld, PushThenDelete, BundleThenDelete, DeleteRemote, Keep]
+
+entities:
+  # One branch of one repository in the workspace, as a reviewed plan proposes it and an apply
+  # carries it out. Apply revalidates the tip and refuses an item whose tip moved.
+  - name: worktree.branches.BranchSweepItem
+    identity:
+      name: item_id
+      type: String
+    fields:
+      # Canonical primary checkout of the repository.
+      - name: repository
+        type: String
+      # Full ref name: refs/heads/<branch> or refs/remotes/origin/<branch>.
+      - name: ref_name
+        type: String
+      - name: tip
+        type: String
+      - name: decision
+        type: worktree.branches.BranchDecision
+      # Why the decision was taken, or why the branch is kept.
+      - name: reason
+        type: String
+      # Commits the tip holds that origin/main does not.
+      - name: commits_ahead
+        type: Integer
+      # Open pull request whose head is this branch, from the pull-request adapter.
+      - name: open_pull_request
+        type: Optional<Integer>
+      # A managed or linked tree has this branch checked out and is live: a process has its
+      # working directory inside it, or a file in it changed within the liveness window.
+      - name: live_tree
+        type: Boolean
+      # The tips file written before any deletion:
+      # <archive root>/<repository>/branch-tips-<date>.tsv
+      - name: tips_record
+        type: String
+      # <archive root>/<repository>/<branch>.bundle, for BundleThenDelete.
+      - name: bundle
+        type: Optional<String>
+    invariants:
+      - commits_ahead >= 0
+    lifecycle:
+      initial: Observed
+      states: [Observed]
+      terminal: [Observed]
+
+  # What the caller supplies from above. The worktree tool knows no bot, no hosting service and no
+  # credential: it runs these argv templates without a shell, substituting {repository},
+  # {remote}, {branch} and {tip} as whole arguments.
+  - name: worktree.branches.BranchAdapters
+    identity:
+      name: adapters_id
+      type: String
+    fields:
+      # Pushes {tip} to {remote} as {branch} unchanged, under the repository's publishing
+      # identity. Exit 0 means published.
+      - name: publish_argv
+        type: String
+      # Deletes {branch} on {remote}. Exit 0 means deleted.
+      - name: delete_remote_argv
+        type: String
+      # Prints a JSON array of open pull-request numbers whose head is {branch}; read-only.
+      - name: open_pull_requests_argv
+        type: String
+      # Seconds within which a changed file makes a tree live; 21600 by default.
+      - name: liveness_window_seconds
+        type: Integer
+    invariants:
+      - liveness_window_seconds >= 0
+    lifecycle:
+      initial: Configured
+      states: [Configured]
+      terminal: [Configured]
+    # UNMAPPED: the argv templates are written here as String, each a JSON array of arguments.
+    # Whether ESS should type them as a list is open; the adapter file format is a new versioned
+    # surface (worktree.branch-adapters/1), since configuration version 1 is immutable.
