@@ -54,7 +54,7 @@ impl Fixture {
         write(&repository.join("source"), "original\n");
         write(
             &repository.join(".gitignore"),
-            "/target\nnode_modules/\n.venv/\n.pytest_cache/\n",
+            "/target\n/build\nnode_modules/\n.venv/\n.pytest_cache/\n",
         );
         write(&repository.join("web/package-lock.json"), "{}\n");
         write(&repository.join("tools/pyproject.toml"), "[project]\n");
@@ -159,6 +159,20 @@ impl Fixture {
         );
     }
 
+    /// Test scratch as integration tests leave it in `CARGO_TARGET_TMPDIR`: a file, a
+    /// subdirectory and a nested Git repository with one commit.
+    fn test_scratch(&self, relative: &str) {
+        let scratch = self.tree.join(relative);
+        write(&scratch.join("output.log"), "scratch\n");
+        write(&scratch.join("case/one/state.json"), "{}\n");
+        let nested = scratch.join("fixture");
+        std::fs::create_dir_all(&nested).unwrap();
+        git(&nested, &["init", "-b", "main"]);
+        write(&nested.join("file"), "nested\n");
+        git(&nested, &["add", "."]);
+        git(&nested, &["commit", "-m", "nested fixture"]);
+    }
+
     fn lifecycle(&self) -> String {
         let status = self.ok(&["status"]);
         status["records"]
@@ -186,6 +200,15 @@ fn paths(cache: &Value, field: &str) -> Vec<String> {
                 .unwrap()
                 .to_owned()
         })
+        .collect()
+}
+
+fn kinds(cache: &Value) -> Vec<String> {
+    cache["discarded"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["kind"].as_str().unwrap().to_owned())
         .collect()
 }
 
@@ -266,6 +289,120 @@ fn a_target_of_nothing_but_cache_goes_whole_and_the_tree_is_collected() {
     assert_eq!(review["assessments"][0]["eligible"], true, "{review}");
     fixture.ok(&["gc", "--repo", repo, "--apply", "--id", "cache"]);
     assert!(!fixture.tree.exists());
+}
+
+#[test]
+fn a_target_whose_tmp_holds_test_scratch_goes_whole_and_the_tree_is_collected() {
+    let fixture = Fixture::new();
+    write(&fixture.tree.join("target/CACHEDIR.TAG"), TAG);
+    fixture.profile("target/debug");
+    fixture.test_scratch("target/tmp");
+
+    let finished = fixture.ok(&["finish", "--discard-cache", fixture.tree_str()]);
+    assert_eq!(paths(&finished["cache"], "discarded"), ["target"]);
+    assert_eq!(kinds(&finished["cache"]), ["cargo-target"]);
+    assert!(finished.get("archive").is_none());
+    assert!(!fixture.tree.join("target").exists());
+    assert_eq!(fixture.lifecycle(), "finished");
+
+    let repo = fixture.repository.to_str().unwrap();
+    let review = fixture.ok(&["gc", "--repo", repo, "--dry-run", "--id", "cache"]);
+    assert_eq!(review["assessments"][0]["eligible"], true, "{review}");
+    fixture.ok(&["gc", "--repo", repo, "--apply", "--id", "cache"]);
+    assert!(!fixture.tree.exists());
+}
+
+#[test]
+fn beside_a_record_the_target_tmp_is_discarded_on_its_own() {
+    let fixture = Fixture::new();
+    write(&fixture.tree.join("target/CACHEDIR.TAG"), TAG);
+    fixture.profile("target/debug");
+    fixture.test_scratch("target/tmp");
+    write(
+        &fixture.tree.join("target/backlog-input/notes.md"),
+        "a record a commit cites\n",
+    );
+
+    let planned = fixture.discard(&["--dry-run"]);
+    assert_eq!(paths(&planned, "discarded"), ["target/debug", "target/tmp"]);
+    assert_eq!(kinds(&planned), ["cargo-profile", "cargo-target-tmp"]);
+    assert_eq!(
+        paths(&planned, "retained_ignored"),
+        ["target/backlog-input"]
+    );
+    assert!(fixture.tree.join("target/tmp/fixture/.git").exists());
+
+    let applied = fixture.discard(&[]);
+    assert_eq!(applied["applied"], true);
+    assert_eq!(paths(&applied, "discarded"), ["target/debug", "target/tmp"]);
+    assert_eq!(kinds(&applied), ["cargo-profile", "cargo-target-tmp"]);
+    assert!(!fixture.tree.join("target/tmp").exists());
+    assert!(!fixture.tree.join("target/debug").exists());
+    assert_eq!(
+        std::fs::read_to_string(fixture.tree.join("target/backlog-input/notes.md")).unwrap(),
+        "a record a commit cites\n"
+    );
+}
+
+#[test]
+fn a_tmp_outside_a_tagged_target_holding_a_profile_is_retained() {
+    let fixture = Fixture::new();
+    // Untagged: a profile and a tmp, but no CACHEDIR.TAG.
+    fixture.profile("build/debug");
+    write(&fixture.tree.join("build/tmp/output.log"), "scratch\n");
+    // Tagged, but no profile.
+    write(&fixture.tree.join("target/CACHEDIR.TAG"), TAG);
+    write(&fixture.tree.join("target/tmp/output.log"), "scratch\n");
+
+    let applied = fixture.discard(&[]);
+    assert!(paths(&applied, "discarded").is_empty(), "{applied}");
+    assert_eq!(paths(&applied, "retained_ignored"), ["build", "target/tmp"]);
+    assert!(fixture.tree.join("build/tmp/output.log").exists());
+    assert!(fixture.tree.join("build/debug/deps/libone.rlib").exists());
+    assert!(fixture.tree.join("target/tmp/output.log").exists());
+}
+
+#[test]
+fn a_symlinked_tmp_or_one_below_a_target_triple_is_retained() {
+    let fixture = Fixture::new();
+    write(&fixture.tree.join("target/CACHEDIR.TAG"), TAG);
+    fixture.profile("target/debug");
+    let elsewhere = fixture.tree.join("records");
+    write(&elsewhere.join("notes.md"), "kept\n");
+    std::os::unix::fs::symlink(&elsewhere, fixture.tree.join("target/tmp")).unwrap();
+    fixture.profile("target/x86_64-unknown-linux-gnu/release");
+    write(
+        &fixture
+            .tree
+            .join("target/x86_64-unknown-linux-gnu/tmp/output.log"),
+        "scratch\n",
+    );
+
+    let applied = fixture.discard(&[]);
+    assert_eq!(
+        paths(&applied, "discarded"),
+        ["target/debug", "target/x86_64-unknown-linux-gnu/release"]
+    );
+    assert_eq!(kinds(&applied), ["cargo-profile", "cargo-profile"]);
+    assert_eq!(
+        paths(&applied, "retained_ignored"),
+        ["target/tmp", "target/x86_64-unknown-linux-gnu/tmp"]
+    );
+    assert_eq!(
+        std::fs::read_to_string(elsewhere.join("notes.md")).unwrap(),
+        "kept\n"
+    );
+    assert!(
+        std::fs::symlink_metadata(fixture.tree.join("target/tmp"))
+            .unwrap()
+            .is_symlink()
+    );
+    assert!(
+        fixture
+            .tree
+            .join("target/x86_64-unknown-linux-gnu/tmp/output.log")
+            .exists()
+    );
 }
 
 #[test]

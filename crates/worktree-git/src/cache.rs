@@ -7,8 +7,8 @@
 use crate::ProcessGit;
 use b10x_worktree_domain::{
     CACHEDIR_TAG_FILE, CACHEDIR_TAG_SIGNATURE, CARGO_PROFILE_MARKER, CARGO_TARGET_METADATA,
-    CacheClassification, CacheKind, DiscardedCache, NODE_LOCKFILES, PYTHON_MANIFESTS,
-    PYTHON_VIRTUALENV_MARKER, Refusal, TAGGED_TOOL_CACHES, is_cache_tag,
+    CARGO_TARGET_TMP, CacheClassification, CacheKind, DiscardedCache, NODE_LOCKFILES,
+    PYTHON_MANIFESTS, PYTHON_VIRTUALENV_MARKER, Refusal, TAGGED_TOOL_CACHES, is_cache_tag,
 };
 use std::collections::BTreeSet;
 use std::io::Read as _;
@@ -23,7 +23,8 @@ struct Plan {
 
 /// What a tagged Cargo target turned out to hold.
 enum TargetShape {
-    /// Only profiles, nested targets of the same shape, Cargo metadata and empty directories.
+    /// Only profiles, nested targets of the same shape, Cargo metadata, empty directories and
+    /// Cargo's `tmp`.
     Whole,
     /// Some cache and some other content.
     Partial(Plan),
@@ -184,10 +185,17 @@ fn cargo_target(worktree: &Path, relative: &Path, tagged: bool) -> Result<Target
     children.sort();
     let mut inner = Plan::default();
     let mut found_profile = false;
+    // Cargo's `tmp` below a tagged target is cache whatever it holds, but only beside a
+    // profile, which is known once every child was read.
+    let mut scratch = None;
     for name in children {
         let child = relative.join(&name);
         let path = worktree.join(&child);
         if real_directory(&path) {
+            if tagged && name == CARGO_TARGET_TMP {
+                scratch = Some(child);
+                continue;
+            }
             if cargo_profile(&path) {
                 found_profile = true;
                 inner.discarded.push((child, CacheKind::CargoProfile));
@@ -219,6 +227,17 @@ fn cargo_target(worktree: &Path, relative: &Path, tagged: bool) -> Result<Target
                 .is_some_and(|name| CARGO_TARGET_METADATA.contains(&name)))
         {
             inner.retained.push(child);
+        }
+    }
+    if let Some(scratch) = scratch {
+        if found_profile {
+            let at = inner.discarded.partition_point(|(path, _)| *path < scratch);
+            inner
+                .discarded
+                .insert(at, (scratch, CacheKind::CargoTargetTmp));
+        } else if !read_names(&worktree.join(&scratch))?.is_empty() {
+            let at = inner.retained.partition_point(|path| *path < scratch);
+            inner.retained.insert(at, scratch);
         }
     }
     Ok(if !found_profile {
