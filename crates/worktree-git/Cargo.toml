@@ -14,6 +14,7 @@ b10x-worktree-domain.workspace = true
 b10x-worktree.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+tar.workspace = true
 tempfile.workspace = true
 
 [lints]
