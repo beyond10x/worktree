@@ -261,14 +261,15 @@ struct SessionArgs {
 
 #[derive(Debug, Args)]
 struct SkillArgs {
-    /// Skill directory to create or verify.
-    #[arg(long, default_value = ".agents/skills/worktree")]
-    out: PathBuf,
-    /// Compare generated files without modifying them.
-    #[arg(long, conflicts_with = "force")]
-    check: bool,
-    /// Replace files even when they lack the generator marker.
+    /// Skill directory to create or verify. Without it the skill is printed to standard output
+    /// and no file is written.
     #[arg(long)]
+    out: Option<PathBuf>,
+    /// Compare the generated files below --out without modifying them.
+    #[arg(long, conflicts_with = "force", requires = "out")]
+    check: bool,
+    /// Replace files below --out even when they lack the generator marker.
+    #[arg(long, requires = "out")]
     force: bool,
 }
 
@@ -1081,9 +1082,18 @@ fn hook(command: &HookCommand, json: bool) -> Result<()> {
 }
 
 fn render_skill(args: &SkillArgs, json: bool) -> Result<()> {
+    let Some(out) = &args.out else {
+        if json {
+            return Err(anyhow!(
+                "`worktree skill` without --out prints the skill as Markdown; pass --out <dir> to use --json"
+            ));
+        }
+        print!("{}", skill_markdown());
+        return Ok(());
+    };
     let files = [
-        (args.out.join("SKILL.md"), skill_markdown()),
-        (args.out.join("agents/openai.yaml"), skill_interface()),
+        (out.join("SKILL.md"), skill_markdown()),
+        (out.join("agents/openai.yaml"), skill_interface()),
     ];
     if args.check {
         let stale = files
@@ -1114,14 +1124,14 @@ fn render_skill(args: &SkillArgs, json: bool) -> Result<()> {
         }
     }
     let value = serde_json::json!({
-        "path": args.out,
+        "path": out,
         "check": args.check,
     });
     emit_success(json, CLI_PROTOCOL_VERSION, &value, || {
         if args.check {
-            format!("skill is current: {}", args.out.display())
+            format!("skill is current: {}", out.display())
         } else {
-            format!("rendered skill: {}", args.out.display())
+            format!("rendered skill: {}", out.display())
         }
     })
 }
@@ -1180,11 +1190,15 @@ fn install_agent_guidance() -> Result<()> {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .context("HOME is not set")?;
-    let block = format!(
-        "{GUIDANCE_BEGIN}\n## Managed worktrees\n\nFor repository changes, load the worktree skill (the b10x plugin ships it as `worktree:managing-worktrees`, with `/worktree:cleanup` for cleanup; `worktree skill` renders it elsewhere) and use the `worktree` CLI. Create isolated trees with `worktree create`, keep primary checkouts clean, publish commits, and end with `worktree finish --discard-cache --archive <tree>`: it deletes only recognised build cache, archives anything else no remote ref holds, and finishes. Keep records out of ignored build directories such as `target/`. Work that must not be published is archived with `worktree archive <tree>`, which gc accepts as recovery proof while the tree still matches it. Review cleanup with `worktree gc --dry-run`, then pass only exact reviewed ids to `worktree gc --apply --id <id>`. Use `worktree reconcile` for interrupted provisioning, adopted legacy paths, and already-missing records; external retirement additionally requires explicit `--allow-external-retirement`, and abandoning a missing record whose recorded commit you have established is gone for good additionally requires `--acknowledge-unrecoverable <recorded-commit>`. Never force-remove or manually delete a managed tree.\n{GUIDANCE_END}\n"
-    );
+    let block = agent_guidance_block();
     update_managed_block(&home.join(".codex/AGENTS.md"), &block)?;
     update_managed_block(&home.join(".claude/CLAUDE.md"), &block)
+}
+
+fn agent_guidance_block() -> String {
+    format!(
+        "{GUIDANCE_BEGIN}\n## Managed worktrees\n\nFor repository changes, load the worktree skill (the b10x plugin ships it as `worktree:managing-worktrees`, with `/worktree:cleanup` for cleanup; elsewhere `worktree skill` prints it to standard output and writes no file) and use the `worktree` CLI. Create isolated trees with `worktree create`, keep primary checkouts clean, publish commits, and end with `worktree finish --discard-cache --archive <tree>`: it deletes only recognised build cache, archives anything else no remote ref holds, and finishes. Keep records out of ignored build directories such as `target/`. Work that must not be published is archived with `worktree archive <tree>`, which gc accepts as recovery proof while the tree still matches it. Review cleanup with `worktree gc --dry-run`, then pass only exact reviewed ids to `worktree gc --apply --id <id>`. Use `worktree reconcile` for interrupted provisioning, adopted legacy paths, and already-missing records; external retirement additionally requires explicit `--allow-external-retirement`, and abandoning a missing record whose recorded commit you have established is gone for good additionally requires `--acknowledge-unrecoverable <recorded-commit>`. Never force-remove or manually delete a managed tree.\n{GUIDANCE_END}\n"
+    )
 }
 
 fn update_managed_block(path: &Path, block: &str) -> Result<()> {
@@ -1505,12 +1519,39 @@ mod tests {
     fn generated_skill_can_refresh_without_force() {
         let temporary = tempfile::tempdir().unwrap();
         let args = SkillArgs {
-            out: temporary.path().join("worktree"),
+            out: Some(temporary.path().join("worktree")),
             check: false,
             force: false,
         };
 
         render_skill(&args, false).unwrap();
         render_skill(&args, false).unwrap();
+    }
+
+    #[test]
+    fn skill_writes_files_only_below_an_explicit_out() {
+        let plain = Cli::try_parse_from(["worktree", "skill"]).unwrap();
+        let Command::Skill(args) = plain.command else {
+            panic!("skill command");
+        };
+        assert_eq!(args.out, None);
+        assert!(Cli::try_parse_from(["worktree", "skill", "--check"]).is_err());
+        assert!(Cli::try_parse_from(["worktree", "skill", "--force"]).is_err());
+        let explicit =
+            Cli::try_parse_from(["worktree", "skill", "--out", "dir", "--check"]).unwrap();
+        let Command::Skill(args) = explicit.command else {
+            panic!("skill command");
+        };
+        assert_eq!(args.out, Some(PathBuf::from("dir")));
+        assert!(args.check);
+    }
+
+    #[test]
+    fn installed_guidance_says_the_skill_prints_without_writing() {
+        let block = agent_guidance_block();
+        assert!(block.contains("`worktree skill` prints it to standard output and writes no file"));
+        assert!(!block.contains("renders it elsewhere"));
+        assert!(block.starts_with(GUIDANCE_BEGIN));
+        assert!(block.ends_with(&format!("{GUIDANCE_END}\n")));
     }
 }

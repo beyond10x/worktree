@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.11.0 — 2026-10-07
+
+- `worktree skill` without `--out` prints the generated skill (`SKILL.md`) to standard output and
+  writes no file. Before, it wrote `.agents/skills/worktree/` below the working directory, so an
+  agent that ran it to read the skill left an untracked copy in whichever checkout it stood in.
+  `worktree skill --out <dir>` writes `SKILL.md` and `agents/openai.yaml` as before; `--check` and
+  `--force` now require `--out`.
+- `worktree --json skill` without `--out` is refused as `operation-failed`; with `--out` its JSON
+  protocol 4 envelope is unchanged.
+- The guidance block `worktree activate --install-agent-guidance` writes now says that outside the
+  plugin `worktree skill` prints the skill to standard output and writes no file. Installed copies
+  change only when the command runs again.
+
 ## 0.10.0 — 2026-10-06
 
 - Add `worktree sweep [--repo <path> | --all-profiles] [--dry-run] [--idle-days N]

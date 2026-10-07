@@ -80,15 +80,23 @@ Persistent=true
 WantedBy=timers.target
 ```
 
-Generate portable agent guidance from the exact installed command surface:
+Print portable agent guidance from the exact installed command surface. Without `--out` it goes
+to standard output and no file is written:
 
 ```bash
-worktree skill --out .agents/skills/worktree
-worktree skill --out .agents/skills/worktree --check
+worktree skill
 ```
 
-The generated skill and its interface metadata are generator-owned; update them with `worktree
-skill`, not by hand.
+To install it as files (`SKILL.md` and `agents/openai.yaml`) or check an installed copy, name the
+directory:
+
+```bash
+worktree skill --out <dir>
+worktree skill --out <dir> --check
+```
+
+The written skill and its interface metadata are generator-owned; update them with `worktree skill
+--out <dir>`, not by hand.
 
 The agent plugin is `worktree@b10x` in [`beyond10x/agentplugins`](https://github.com/beyond10x/agentplugins).
 

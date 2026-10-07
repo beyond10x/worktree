@@ -187,6 +187,8 @@ in one transaction.
 | Lifecycle hooks | 1 | Session start, heartbeat, and session end remain wire-compatible. |
 | Configuration and workspace policy | 1 | Existing activated profiles remain on schema version 1. |
 
-Wire-shape changes require a new surface version. The checked-in agent skill and interface metadata
-are deterministic generator output from `worktree skill`; their source of truth is the CLI
-generator.
+Wire-shape changes require a new surface version. The agent skill and its interface metadata are
+deterministic generator output from `worktree skill`, whose source of truth is the CLI generator.
+Without `--out` it prints the skill to standard output and writes no file; `--out <dir>` writes
+`SKILL.md` and `agents/openai.yaml` below that directory, and `--check` compares them. This
+repository checks in no copy: the `worktree` agent plugin ships one.
