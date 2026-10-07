@@ -1,0 +1,13 @@
+{
+  "at": "2026-09-07T12:21:03Z",
+  "actor": "human:timo",
+  "artifact": "task:release-worktree-0-4-0",
+  "kind": "task",
+  "revision": 3,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "task check: formatting, Clippy, 70 tests and generated skill consistency passed",
+    "reference": "~/.cache/hygiene-release-20260907-4tts5tr9/worktree-check.log"
+  }
+}

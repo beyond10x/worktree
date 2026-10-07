@@ -1,0 +1,13 @@
+{
+  "at": "2026-09-07T11:48:13Z",
+  "actor": "human:timo",
+  "artifact": "task:stale-rebase-cleanup-correction",
+  "kind": "task",
+  "revision": 3,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "task check: 70 tests, including stale marker and real interrupted rebase; exit 0",
+    "reference": "~/.cache/disk-audit-20260907-414yqwj_/worktree-inspect-final-gate.log"
+  }
+}

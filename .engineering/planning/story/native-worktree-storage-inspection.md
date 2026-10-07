@@ -1,5 +1,5 @@
 ---
-format: aep.planning-md/1
+format: aep.planning-md/3
 id: story:native-worktree-storage-inspection
 kind: story
 status: implemented
@@ -8,6 +8,10 @@ relations:
 - informed_by: story:scope-flag-for-reporting-subcommands
 - informed_by: story:rebase-head-is-not-a-lock
 revision: 4
+transitions:
+- {from: "draft", to: "proposed", at: "2026-09-07T11:31:42Z", actor: "human:timo", revision: 2, imported: true}
+- {from: "proposed", to: "active", at: "2026-09-07T11:31:42Z", actor: "human:timo", revision: 3, imported: true}
+- {from: "active", to: "implemented", at: "2026-09-07T11:44:05Z", actor: "human:timo", revision: 4, decided_on: {"recorded":{"test_result":2}}, imported: true}
 ---
 ## Outcome
 

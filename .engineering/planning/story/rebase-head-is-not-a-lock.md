@@ -1,5 +1,5 @@
 ---
-format: aep.planning-md/1
+format: aep.planning-md/3
 id: story:rebase-head-is-not-a-lock
 kind: story
 status: draft

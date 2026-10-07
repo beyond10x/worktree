@@ -1,0 +1,13 @@
+{
+  "at": "2026-09-07T11:44:04Z",
+  "actor": "human:timo",
+  "artifact": "story:native-worktree-storage-inspection",
+  "kind": "story",
+  "revision": 3,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "Native workspace inspection completed against the real activated profile; exit 0",
+    "reference": "~/.cache/disk-audit-20260907-414yqwj_/native-inspection-b10x.json"
+  }
+}

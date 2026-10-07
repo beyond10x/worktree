@@ -1,5 +1,5 @@
 ---
-format: aep.planning-md/1
+format: aep.planning-md/3
 id: story:recognised-build-cache-is-discarded
 kind: story
 status: draft

@@ -1,5 +1,5 @@
 ---
-format: aep.planning-md/1
+format: aep.planning-md/3
 id: task:release-worktree-0-4-0
 kind: task
 status: implemented
@@ -8,6 +8,10 @@ owner: codex-hygiene-release
 relations:
 - delivers: story:native-worktree-storage-inspection
 revision: 4
+transitions:
+- {from: "draft", to: "proposed", at: "2026-09-07T12:16:30Z", actor: "human:timo", revision: 2, imported: true}
+- {from: "proposed", to: "active", at: "2026-09-07T12:16:30Z", actor: "human:timo", revision: 3, imported: true}
+- {from: "active", to: "implemented", at: "2026-09-07T12:21:04Z", actor: "human:timo", revision: 4, decided_on: {"recorded":{"test_result":1}}, imported: true}
 ---
 ## Intent
 

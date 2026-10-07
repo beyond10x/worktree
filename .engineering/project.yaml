@@ -1,8 +1,7 @@
-version: aep.project/1
-
-# Written by `protocol reverse init`. It points; it does not duplicate — a rule restated
-# here would be a second copy with no way to say which one is in force. Principles and
-# profiles of this project's own go under `principles/` and `profiles/` beside this file.
-protocol: adp/1
+planning_scope: worktree
 profile: development.standard
+protocol: adp/1
 protocols: git+https://github.com/beyond10x/aep.git#733dbea25c8db9e5a0b7d273c09c287db60bfac2
+store:
+  git: {}
+version: aep.project/5

@@ -1,10 +1,14 @@
 ---
-format: aep.planning-md/1
+format: aep.planning-md/3
 id: story:archived-tree-can-be-retired
 kind: story
 status: implemented
 title: A tree whose commits are archived locally can be retired
 revision: 4
+transitions:
+- {from: "draft", to: "proposed", at: "2026-09-26T21:34:24Z", actor: "human:timo", revision: 2, imported: true}
+- {from: "proposed", to: "active", at: "2026-09-26T21:34:25Z", actor: "human:timo", revision: 3, imported: true}
+- {from: "active", to: "implemented", at: "2026-09-26T21:34:26Z", actor: "human:timo", revision: 4, decided_on: {"recorded":{"test_result":1}}, imported: true}
 ---
 # A tree whose commits are archived locally can be retired
 

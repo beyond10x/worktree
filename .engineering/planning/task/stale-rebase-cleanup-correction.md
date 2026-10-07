@@ -1,5 +1,5 @@
 ---
-format: aep.planning-md/1
+format: aep.planning-md/3
 id: task:stale-rebase-cleanup-correction
 kind: task
 status: implemented
@@ -7,6 +7,10 @@ title: Allow retirement when only a historical REBASE_HEAD remains
 relations:
 - implements: story:rebase-head-is-not-a-lock
 revision: 4
+transitions:
+- {from: "draft", to: "proposed", at: "2026-09-07T11:46:32Z", actor: "human:timo", revision: 2, imported: true}
+- {from: "proposed", to: "active", at: "2026-09-07T11:46:32Z", actor: "human:timo", revision: 3, imported: true}
+- {from: "active", to: "implemented", at: "2026-09-07T11:48:13Z", actor: "human:timo", revision: 4, decided_on: {"recorded":{"test_result":1}}, imported: true}
 ---
 ## Bounded correction
 

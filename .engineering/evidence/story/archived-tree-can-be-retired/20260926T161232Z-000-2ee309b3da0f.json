@@ -1,0 +1,13 @@
+{
+  "at": "2026-09-26T16:12:32Z",
+  "actor": "human:timo",
+  "artifact": "story:archived-tree-can-be-retired",
+  "kind": "story",
+  "revision": 3,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "worktree 0.8.0 release gate (task check, 139 tests); 96 b10x trees archived and retired on 2026-09-26",
+    "reference": "https://github.com/beyond10x/worktree/actions/runs/36254403398"
+  }
+}
