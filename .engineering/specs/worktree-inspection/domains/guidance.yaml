@@ -1,0 +1,34 @@
+domain: worktree.guidance
+
+types:
+  # Where `worktree skill` puts the generated skill. StandardOutput when no `--out` is given:
+  # an agent reads the skill and no file is written. Directory only for an explicit `--out`.
+  - name: worktree.guidance.SkillDestination
+    kind: enum
+    variants: [StandardOutput, Directory]
+
+# A report of one `worktree skill` run, not a persisted lifecycle.
+entities:
+  - name: worktree.guidance.SkillRender
+    identity:
+      name: render_id
+      type: String
+    fields:
+      - name: destination
+        type: worktree.guidance.SkillDestination
+      # The `--out` directory; absent for StandardOutput.
+      - name: out
+        type: Optional<String>
+      # `--check` compares the files below `out` and writes nothing; it requires `out`.
+      - name: check
+        type: Boolean
+      # Files written below `out`: SKILL.md and agents/openai.yaml. Zero for StandardOutput and
+      # for `--check`.
+      - name: written_files
+        type: Integer
+    invariants:
+      - written_files >= 0
+    lifecycle:
+      initial: Observed
+      states: [Observed]
+      terminal: [Observed]

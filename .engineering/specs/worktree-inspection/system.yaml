@@ -5,3 +5,4 @@ version: v1
 domains:
   - worktree.inspection
   - worktree.cache
+  - worktree.guidance
