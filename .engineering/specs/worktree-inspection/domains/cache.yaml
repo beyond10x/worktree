@@ -1,5 +1,14 @@
 domain: worktree.cache
 
+types:
+  # Why an ignored directory was recognised as cache (crates/worktree-domain/src/cache.rs,
+  # CacheKind). A name alone never qualifies; each variant names a structure.
+  # CargoTargetTmp: `tmp/` directly below a tagged Cargo target that holds at least one profile,
+  # Cargo's CARGO_TARGET_TMPDIR, which test binaries fill with scratch whatever it holds.
+  - name: worktree.cache.CacheKind
+    kind: enum
+    variants: [CargoProfile, CargoTarget, CargoTargetTmp, NodeModules, PythonVirtualenv, ToolCache]
+
 # A report of one cache discard, not a new persisted lifecycle. The worktree it names is the
 # existing registry record (crates/worktree-domain/src/lib.rs, WorktreeRecord).
 entities:

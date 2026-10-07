@@ -6,3 +6,4 @@ domains:
   - worktree.inspection
   - worktree.cache
   - worktree.guidance
+  - worktree.archive

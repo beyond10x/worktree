@@ -1,0 +1,80 @@
+domain: worktree.archive
+
+types:
+  # What one entry of a nested repository image is. Fifos, sockets and devices are refused as
+  # archive-unsupported-entry; a hard link is imaged as an independent regular file.
+  - name: worktree.archive.ImageEntryKind
+    kind: enum
+    variants: [File, Directory, Symlink]
+
+# The manifest of one local archive (crates/worktree-domain/src/archive.rs, ArchiveManifest). It
+# stands in for remote recovery proof; no command deletes it. Its worktree is the existing
+# registry record (crates/worktree-domain/src/lib.rs, WorktreeRecord).
+entities:
+  - name: worktree.archive.Archive
+    identity:
+      name: worktree_id
+      type: String
+    fields:
+      # worktree.archive/1 when the archive images no nested repository; worktree.archive/2,
+      # which adds the images, when it images at least one. Readers accept both.
+      - name: format
+        type: String
+      - name: head
+        type: String
+      # Commits HEAD adds over every advertised remote ref; commits.bundle carries them.
+      - name: unique_commits
+        type: Integer
+      # Git tree id of the tree's on-disk content outside every imaged nested repository.
+      - name: worktree_tree
+        type: String
+      - name: created_at
+        type: Integer
+    invariants:
+      - unique_commits >= 0
+    relations:
+      - name: nested_repositories
+        kind: owns
+        target: worktree.archive.NestedRepositoryImage
+        cardinality: many
+        via: worktree_id
+    lifecycle:
+      initial: Written
+      states: [Written]
+      terminal: [Written]
+
+  # A byte image of one Git repository nested in the tree, typically a test fixture kept in an
+  # ignored evidence directory. Git lists such a directory only as `<path>/` and indexes nothing
+  # below it, so the patch cannot hold it; the image holds the directory and everything below
+  # it, its `.git` included, so committed, staged, unstaged, untracked and stashed state all
+  # return with `tar -xf <image> -C <tree>`.
+  - name: worktree.archive.NestedRepositoryImage
+    identity:
+      name: image_file
+      type: String
+    fields:
+      - name: worktree_id
+        type: String
+      # Repository root relative to the tree root.
+      - name: path
+        type: String
+      # SHA-256 of the image file's bytes.
+      - name: image_sha256
+        type: String
+      # SHA-256 of the canonical listing of every entry below `path`: relative path, entry kind,
+      # permission bits, size and the SHA-256 of a file's content or a symlink's target, sorted
+      # by path bytes. The image read back and the directory on disk must both produce it.
+      - name: fingerprint
+        type: String
+      - name: entries
+        type: Integer
+    invariants:
+      - entries >= 1
+    lifecycle:
+      initial: Imaged
+      states: [Imaged]
+      terminal: [Imaged]
+    # Refused rather than imaged, because the repository depends on state outside the tree: a
+    # `.git` that is a file or a symlink (a submodule or a linked worktree), a `.git` holding
+    # `commondir`, non-empty `objects/info/alternates` or any `worktrees/` entry, and a path HEAD
+    # records as a submodule.
