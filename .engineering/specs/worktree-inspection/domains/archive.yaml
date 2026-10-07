@@ -58,23 +58,27 @@ entities:
       # Repository root relative to the tree root.
       - name: path
         type: String
-      # SHA-256 of the image file's bytes.
+      # SHA-256 and size of the image file's bytes (the manifest's `image`, an ArchiveFile).
       - name: image_sha256
         type: String
-      # SHA-256 of the canonical listing of every entry below `path`: relative path, entry kind,
-      # permission bits, size and the SHA-256 of a file's content or a symlink's target, sorted
-      # by path bytes. The image read back and the directory on disk must both produce it.
+      - name: image_bytes
+        type: Integer
+      # SHA-256 of the canonical listing of the root directory and every entry below it: relative
+      # path, entry kind, permission bits, size and the SHA-256 of a file's content or a symlink's
+      # target, sorted by path bytes. The image read back and the directory on disk must both
+      # produce it.
       - name: fingerprint
         type: String
       - name: entries
         type: Integer
     invariants:
       - entries >= 1
+      - image_bytes >= 0
     lifecycle:
       initial: Imaged
       states: [Imaged]
       terminal: [Imaged]
     # Refused rather than imaged, because the repository depends on state outside the tree: a
     # `.git` that is a file or a symlink (a submodule or a linked worktree), a `.git` holding
-    # `commondir`, non-empty `objects/info/alternates` or any `worktrees/` entry, and a path HEAD
-    # records as a submodule.
+    # `commondir`, non-empty `objects/info/alternates`, any `worktrees/` entry or any symlink, and a
+    # root at or below which HEAD or the index tracks any path (a submodule's gitlink included).
