@@ -18,6 +18,20 @@ pub const CACHEDIR_TAG_SIGNATURE: &[u8] = b"Signature: 8a477f597d28d172789f06886
 /// The directory Cargo writes into every profile directory and nowhere else.
 pub const CARGO_PROFILE_MARKER: &str = ".fingerprint";
 
+/// The directory Cargo writes compiled crates into, in every profile directory. A target
+/// without a valid tag counts only through a profile holding both this and
+/// [`CARGO_PROFILE_MARKER`] as real directories.
+pub const CARGO_PROFILE_DEPS: &str = "deps";
+
+/// The one name a Cargo target without a valid tag may carry to count as tagged.
+///
+/// Cargo writes `CACHEDIR.TAG` only when it creates the target directory itself, so a `target/`
+/// made before Cargo's first build there has none.
+pub const CARGO_UNTAGGED_TARGET: &str = "target";
+
+/// The manifest that must be tracked beside an untagged [`CARGO_UNTAGGED_TARGET`].
+pub const CARGO_MANIFEST: &str = "Cargo.toml";
+
 /// Cargo's `CARGO_TARGET_TMPDIR`, directly below a target. Cargo reserves the name, so no
 /// profile is ever called this.
 pub const CARGO_TARGET_TMP: &str = "tmp";
@@ -63,6 +77,11 @@ pub fn is_cache_tag(contents: &[u8]) -> bool {
 }
 
 /// Why an ignored directory was recognised as cache.
+///
+/// A Cargo target is tagged by a valid `CACHEDIR.TAG`. One without a valid tag counts as tagged
+/// when it is named [`CARGO_UNTAGGED_TARGET`], a tracked [`CARGO_MANIFEST`] sits beside it, and a
+/// direct child is a profile holding both [`CARGO_PROFILE_MARKER`] and [`CARGO_PROFILE_DEPS`] as
+/// real directories. The Cargo kinds below then apply to it unchanged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum CacheKind {
