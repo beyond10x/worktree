@@ -1,7 +1,5 @@
 # Hand-over: agentplugins-improvements, 2026-10-06
 
-Dispatch DSP-20261006-12 (decisions DEC-20261006-06 and DEC-20261006-07) closes this session.
-
 ## Shipped
 
 | Release | What | Where |
