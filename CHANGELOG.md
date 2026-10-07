@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.12.0 — 2026-10-07
+
+- `worktree archive` (and `finish --archive`, `sweep`) images each nested Git repository in a
+  tree's files, such as a test fixture kept in an ignored evidence directory, as
+  `nested-<n>.tar`: the root and every entry below it, `.git` included, with permission bits,
+  modification times and symlink targets. `tar -xpf <archive>/nested-<n>.tar -C <tree>` restores
+  it with its committed, staged, unstaged, untracked and stashed state. Before, such a tree was
+  refused as `archive-unsupported-entry` and could never be retired
+  (https://github.com/beyond10x/worktree/issues/23).
+- Each image records a fingerprint, the SHA-256 of a canonical listing of the root and every entry
+  below it. The image read back and the directory before and after writing must all give it;
+  removal re-verifies image digests, the set of nested roots and each fingerprint, and `gc --apply`
+  deletes an imaged root bottom-up, re-checking each entry against the image immediately before
+  deleting it.
+- Still refused as `archive-unsupported-entry`: a nested `.git` that is a file or a symlink
+  (submodules, linked worktrees), `commondir`, non-empty `objects/info/alternates`, `worktrees/`
+  entries or a symlink inside a nested `.git`, and a root at or below which HEAD or the index
+  tracks anything.
+- An archive that images a nested repository is `worktree.archive/2`, adding
+  `nested_repositories`; every other archive is still `worktree.archive/1` byte for byte. A 0.11
+  reader refuses `/2` as `archive-invalid`.
+- `gc --apply` on an archived tree makes a directory it must empty owner-writable before deleting
+  its verified entries, as Git's own removal already did. Before, a read-only ignored directory
+  made the discard stop with `archive-discard-failed` after deleting part of the tree.
+- `discard-cache` and `finish --discard-cache` delete a Cargo target's real `tmp/`
+  (`CARGO_TARGET_TMPDIR`) whatever it holds when the tagged target holds a profile: a target of
+  profiles and test scratch goes whole as `cargo-target`, and beside retained content `tmp/` is
+  listed as `cargo-target-tmp`. A tree whose tests wrote there no longer needs `--archive`.
+- Library: `GitPort::hidden_state` takes the archive a caller verified in the same flow;
+  `ArchiveManifest` gains `nested_repositories`; `CacheKind` gains `CargoTargetTmp`.
+- The planning store moved to `aep.project/5`.
+
 ## 0.11.0 — 2026-10-07
 
 - `worktree skill` without `--out` prints the generated skill (`SKILL.md`) to standard output and

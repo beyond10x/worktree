@@ -30,7 +30,9 @@ independent policy: every decision must come from the public façade.
   alone.
 - Every removal also refuses state Git status does not report: assume-unchanged and skip-worktree
   entries, staged content that differs from both HEAD and the working copy, any `.git` below the
-  tree's root, and per-worktree refs. No proof, remote or archived, covers it.
+  tree's root, and per-worktree refs. No proof, remote or archived, covers it, with one exception:
+  a `.git` at or below a nested repository root that the archive the removal relies on images,
+  re-verified against the tree in the same flow.
 - The one substitute for that remote proof is a verified local archive of the same record and
   HEAD: its files keep their recorded SHA-256, the bundle's own pack holds every object HEAD adds
   over freshly advertised refs, and the tree's complete on-disk content still has the archived
@@ -38,10 +40,19 @@ independent policy: every decision must come from the public façade.
   a tree is returned to HEAD by resetting the index, then restoring or deleting each file only after
   re-hashing it against the archive, before the non-forced removal. Archiving never modifies the
   tree, and no command deletes an archive.
+- A nested repository (Git lists it only as `<path>/`, and its `.git` is a real directory) is
+  archived as a byte image, `nested-<n>.tar`, whose canonical listing's SHA-256 is recorded; the
+  image read back, and the root on disk before and after writing, must give that fingerprint.
+  Removal deletes an imaged root bottom-up, re-observing each entry against the image's listing
+  immediately before deleting it. A gitfile or symlinked `.git`, `commondir`, non-empty
+  `objects/info/alternates`, `worktrees/` entries or a symlink inside any nested `.git`, a root at
+  or below which HEAD or the index tracks anything, and any entry that is not a file, directory or
+  symlink are refused, never imaged.
 - The only command that deletes files a tree's owner wrote is `discard-cache` (and `finish
   --discard-cache`), and it deletes only ignored, real directories recognised as build cache by
-  structure: a Cargo profile holding `.fingerprint/` inside a validly tagged target, `node_modules`
-  at or below a tracked lockfile, a virtual environment beside a tracked Python manifest, and a
+  structure: a Cargo profile holding `.fingerprint/` inside a validly tagged target, that target's
+  own real `tmp/` (Cargo's `CARGO_TARGET_TMPDIR`, whatever it holds) when the target holds a
+  profile, `node_modules` at or below a tracked lockfile, a virtual environment beside a tracked Python manifest, and a
   tagged `.pytest_cache`, `.mypy_cache` or `.ruff_cache`. A name alone never qualifies; anything
   unrecognised is retained and reported. It refuses for a live lease, a Git lock, or another
   process using the tree.
@@ -67,7 +78,8 @@ independent policy: every decision must come from the public façade.
   relocation lifecycle claims, final HEAD updates, and lease exclusions are atomic, and
   proof-bearing removal intent is durable.
 - CLI JSON protocol version 4, reconciliation version 4, inspection format
-  `worktree.inspection/2`, archive manifest format `worktree.archive/1`, hook protocol version 1,
+  `worktree.inspection/2`, archive manifest formats `worktree.archive/1` (no nested repository)
+  and `worktree.archive/2` (adds `nested_repositories`), hook protocol version 1,
   and configuration/workspace-policy version 1 are immutable after release. Cut a new surface
   version for a wire change.
 - Generated skill content comes from `worktree skill`; do not edit it by hand.

@@ -82,6 +82,12 @@ files without filters into a scratch object directory and a scratch index. The r
 ref and no object beyond the advertised objects the recovery check itself fetches, and the tree's
 index is not rewritten.
 
+A nested Git repository is listed by Git only as `<path>/` on the empty index, so neither the
+scratch index nor the patch holds it. The adapter walks each such root without following symlinks,
+writes its canonical listing as a GNU tar image with the `tar` crate, reads the image back and
+compares the listing, and records the listing's SHA-256 as the root's fingerprint. `worktree_tree`
+and `dirty.patch` cover everything outside the imaged roots.
+
 ```mermaid
 flowchart LR
     tree["dirty or local-only tree,<br/>no remote proof, no hidden state"] --> archived{"archive present<br/>for this record?"}
@@ -92,17 +98,19 @@ flowchart LR
     digests -->|no| mismatch["archive-digest-mismatch /<br/>archive-incomplete"]
     digests -->|yes| bundle{"bundle verify, and its own pack holds<br/>every object HEAD adds over freshly<br/>advertised refs?"}
     bundle -->|no| incomplete["archive-incomplete /<br/>archive-bundle-invalid"]
-    bundle -->|yes| state{"complete on-disk content equals<br/>the archived fingerprint, dirty or not?"}
+    bundle -->|yes| state{"on-disk content outside nested roots equals the archived<br/>fingerprint, and each nested root its image's?"}
     state -->|no| stale
     state -->|yes| proof["recovery kind archive"]
-    proof --> discard["after durable intent: reset the index,<br/>re-hash each file before restoring or deleting it"]
+    proof --> discard["after durable intent: reset the index, re-hash each file<br/>before restoring or deleting it; delete each imaged root<br/>entry by entry against its image"]
     discard --> remove["git worktree remove<br/>without --force"]
 ```
 
 Before either kind of proof counts, the adapter refuses state `git status` does not report but
 removal would destroy: assume-unchanged and skip-worktree entries (`ls-files -v`), staged content
 that differs from both HEAD and the working copy, any `.git` found by walking the tree's
-filesystem below its root, and refs in the per-worktree namespaces `refs/worktree/`,
+filesystem below its root except below a nested root the archive a removal relies on images (the
+port's `hidden_state` takes that archive and re-verifies its images before skipping a root), and
+refs in the per-worktree namespaces `refs/worktree/`,
 `refs/bisect/` and `refs/rewritten/`.
 
 The pack check indexes the bundle in an isolated bare repository and compares its object list with

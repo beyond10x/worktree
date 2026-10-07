@@ -47,7 +47,7 @@ entities:
   # ignored evidence directory. Git lists such a directory only as `<path>/` and indexes nothing
   # below it, so the patch cannot hold it; the image holds the directory and everything below
   # it, its `.git` included, so committed, staged, unstaged, untracked and stashed state all
-  # return with `tar -xf <image> -C <tree>`.
+  # return with `tar -xpf <image> -C <tree>` (`-p`, so the umask cannot change the permission bits).
   - name: worktree.archive.NestedRepositoryImage
     identity:
       name: image_file
