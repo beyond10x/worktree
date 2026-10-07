@@ -6,9 +6,10 @@
 
 use crate::ProcessGit;
 use b10x_worktree_domain::{
-    CACHEDIR_TAG_FILE, CACHEDIR_TAG_SIGNATURE, CARGO_PROFILE_MARKER, CARGO_TARGET_METADATA,
-    CARGO_TARGET_TMP, CacheClassification, CacheKind, DiscardedCache, NODE_LOCKFILES,
-    PYTHON_MANIFESTS, PYTHON_VIRTUALENV_MARKER, Refusal, TAGGED_TOOL_CACHES, is_cache_tag,
+    CACHEDIR_TAG_FILE, CACHEDIR_TAG_SIGNATURE, CARGO_MANIFEST, CARGO_PROFILE_DEPS,
+    CARGO_PROFILE_MARKER, CARGO_TARGET_METADATA, CARGO_TARGET_TMP, CARGO_UNTAGGED_TARGET,
+    CacheClassification, CacheKind, DiscardedCache, NODE_LOCKFILES, PYTHON_MANIFESTS,
+    PYTHON_VIRTUALENV_MARKER, Refusal, TAGGED_TOOL_CACHES, is_cache_tag,
 };
 use std::collections::BTreeSet;
 use std::io::Read as _;
@@ -149,7 +150,7 @@ fn classify(
         Some(CacheKind::PythonVirtualenv)
     } else if name.is_some_and(|name| TAGGED_TOOL_CACHES.contains(&name)) && cache_tagged(&path) {
         Some(CacheKind::ToolCache)
-    } else if cargo_profile(&path) && cache_tagged(&worktree.join(parent)) {
+    } else if cargo_profile(&path) && cargo_target_root(worktree, parent, tracked) {
         Some(CacheKind::CargoProfile)
     } else {
         None
@@ -158,7 +159,7 @@ fn classify(
         plan.discarded.push((relative.to_path_buf(), kind));
         return Ok(());
     }
-    if cache_tagged(&path) {
+    if cargo_target_root(worktree, relative, tracked) {
         match cargo_target(worktree, relative, true)? {
             TargetShape::Whole => plan
                 .discarded
@@ -176,6 +177,26 @@ fn classify(
     }
     plan.retained.push(relative.to_path_buf());
     Ok(())
+}
+
+/// Whether `relative` is a Cargo target classified as tagged: it carries a valid `CACHEDIR.TAG`,
+/// or Cargo did not create it and so wrote none, in which case it must be a real directory named
+/// `target`, beside a tracked `Cargo.toml`, with a direct child holding both `.fingerprint/` and
+/// `deps/` as real directories. An unreadable directory does not qualify.
+fn cargo_target_root(worktree: &Path, relative: &Path, tracked: &BTreeSet<PathBuf>) -> bool {
+    let directory = worktree.join(relative);
+    if cache_tagged(&directory) {
+        return true;
+    }
+    let parent = relative.parent().unwrap_or(Path::new(""));
+    relative.file_name().and_then(|name| name.to_str()) == Some(CARGO_UNTAGGED_TARGET)
+        && real_directory(&directory)
+        && tracked.contains(&parent.join(CARGO_MANIFEST))
+        && std::fs::read_dir(&directory).is_ok_and(|entries| {
+            entries
+                .flatten()
+                .any(|entry| full_cargo_profile(&directory.join(entry.file_name())))
+        })
 }
 
 /// Classify the children of a tagged target, or of a target-triple directory below one.
@@ -274,6 +295,11 @@ fn regular_file(path: &Path) -> bool {
 
 fn cargo_profile(path: &Path) -> bool {
     real_directory(path) && real_directory(&path.join(CARGO_PROFILE_MARKER))
+}
+
+/// A profile as only Cargo leaves one: `.fingerprint/` and `deps/`, both real directories.
+fn full_cargo_profile(path: &Path) -> bool {
+    cargo_profile(path) && real_directory(&path.join(CARGO_PROFILE_DEPS))
 }
 
 /// Whether any direct child is a Cargo profile, as in `target/<triple>/debug`.
