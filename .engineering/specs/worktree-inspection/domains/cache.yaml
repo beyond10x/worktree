@@ -5,6 +5,11 @@ types:
   # CacheKind). A name alone never qualifies; each variant names a structure.
   # CargoTargetTmp: `tmp/` directly below a tagged Cargo target that holds at least one profile,
   # Cargo's CARGO_TARGET_TMPDIR, which test binaries fill with scratch whatever it holds.
+  # A Cargo target is tagged by a valid CACHEDIR.TAG. Cargo writes the tag only when it creates
+  # the directory, so a `target/` made before Cargo's first build has none. Such a directory
+  # counts as tagged when it is named `target`, a tracked `Cargo.toml` sits beside it, and it
+  # holds a profile with both `.fingerprint/` and `deps/` as real directories. The same three
+  # kinds then apply; no new variant.
   - name: worktree.cache.CacheKind
     kind: enum
     variants: [CargoProfile, CargoTarget, CargoTargetTmp, NodeModules, PythonVirtualenv, ToolCache]
