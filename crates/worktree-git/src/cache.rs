@@ -181,8 +181,8 @@ fn classify(
 
 /// Whether `relative` is a Cargo target classified as tagged: it carries a valid `CACHEDIR.TAG`,
 /// or Cargo did not create it and so wrote none, in which case it must be a real directory named
-/// `target`, beside a tracked `Cargo.toml`, with a direct child holding both `.fingerprint/` and
-/// `deps/` as real directories. An unreadable directory does not qualify.
+/// `target`, beside a tracked `Cargo.toml`, with a direct child other than Cargo's `tmp` holding
+/// both `.fingerprint/` and `deps/` as real directories. An unreadable directory does not qualify.
 fn cargo_target_root(worktree: &Path, relative: &Path, tracked: &BTreeSet<PathBuf>) -> bool {
     let directory = worktree.join(relative);
     if cache_tagged(&directory) {
@@ -195,8 +195,21 @@ fn cargo_target_root(worktree: &Path, relative: &Path, tracked: &BTreeSet<PathBu
         && std::fs::read_dir(&directory).is_ok_and(|entries| {
             entries
                 .flatten()
-                .any(|entry| full_cargo_profile(&directory.join(entry.file_name())))
+                .map(|entry| entry.file_name())
+                // `tmp` is Cargo's test scratch, never a profile, whatever it holds.
+                .filter(|name| *name != CARGO_TARGET_TMP)
+                .any(|name| full_cargo_profile(&directory.join(name)))
         })
+}
+
+/// Whether `name`, a regular file at a target's root, is one Cargo writes there. A
+/// `CACHEDIR.TAG` is Cargo's only when its signature is valid: a target that counts as tagged
+/// without one may hold a file of that name Cargo did not write.
+fn cargo_metadata(directory: &Path, name: &std::ffi::OsStr) -> bool {
+    name.to_str().is_some_and(|name| {
+        CARGO_TARGET_METADATA.contains(&name)
+            && (name != CACHEDIR_TAG_FILE || cache_tagged(directory))
+    })
 }
 
 /// Classify the children of a tagged target, or of a target-triple directory below one.
@@ -241,12 +254,7 @@ fn cargo_target(worktree: &Path, relative: &Path, tagged: bool) -> Result<Target
             if !read_names(&path)?.is_empty() {
                 inner.retained.push(child);
             }
-        } else if !(tagged
-            && regular_file(&path)
-            && name
-                .to_str()
-                .is_some_and(|name| CARGO_TARGET_METADATA.contains(&name)))
-        {
+        } else if !(tagged && regular_file(&path) && cargo_metadata(&directory, &name)) {
             inner.retained.push(child);
         }
     }

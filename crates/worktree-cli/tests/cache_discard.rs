@@ -19,6 +19,10 @@ fn git(path: &Path, args: &[&str]) -> String {
             "user.email=fixture@example.invalid",
             "-c",
             "commit.gpgsign=false",
+            // A commit otherwise starts a detached `git maintenance run --auto`, which creates
+            // `objects/maintenance.lock` inside a nested repository after the command returns.
+            "-c",
+            "maintenance.auto=false",
         ])
         .args(args)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
