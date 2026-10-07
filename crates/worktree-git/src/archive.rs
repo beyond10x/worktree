@@ -672,8 +672,48 @@ fn require_images(
     Ok(())
 }
 
+/// Give the owner full access to the tree root and every directory from it down to the parent of
+/// `relative`, so that the discard can replace or delete `relative`.
+///
+/// This follows Git's own removal (`make_directories_owner_writable`, issue #16): a directory
+/// without the owner write bit would otherwise stop the discard after it had already changed part
+/// of the tree. Git tracks no directory mode, so no fingerprint outside a nested repository moves.
+/// No symlink is followed, and a directory on another filesystem or owned by another user than
+/// the tree root's is left alone. The walk stops at the first component that is missing or not a
+/// directory, leaving that case to the operation exactly as before.
+fn make_parents_owner_writable(worktree: &Path, relative: &[u8]) -> Result<(), Refusal> {
+    let failed =
+        |path: &Path, error: &std::io::Error| io_refusal("archive-discard-failed", path, error);
+    let root = std::fs::symlink_metadata(worktree).map_err(|error| failed(worktree, &error))?;
+    let (device, owner) = (root.dev(), root.uid());
+    let mut directory = worktree.to_path_buf();
+    let mut parents = relative.split(|byte| *byte == b'/').collect::<Vec<_>>();
+    parents.pop();
+    for component in std::iter::once(None).chain(parents.into_iter().map(Some)) {
+        if let Some(component) = component {
+            directory.push(OsStr::from_bytes(component));
+        }
+        let metadata = match std::fs::symlink_metadata(&directory) {
+            Ok(metadata) if metadata.is_dir() => metadata,
+            Ok(_) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(failed(&directory, &error)),
+        };
+        let mode = metadata.mode() & 0o7777;
+        if metadata.dev() == device && metadata.uid() == owner && mode & 0o700 != 0o700 {
+            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(mode | 0o700))
+                .map_err(|error| failed(&directory, &error))?;
+        }
+    }
+    Ok(())
+}
+
 /// Delete one imaged nested repository bottom-up, each entry only after re-observing it
 /// immediately before deletion and finding exactly its record in `expected`.
+///
+/// A directory is given owner `rwx` only after its record, mode included, has been re-verified;
+/// its final check before removal then leaves the mode out. The root's parents are made
+/// owner-writable as the discard does for every other entry.
 fn remove_imaged_root(
     worktree: &Path,
     root: &[u8],
@@ -697,6 +737,14 @@ fn remove_imaged_root(
             return Err(changed(relative));
         }
         if want.kind == Kind::Directory {
+            let opened = want.mode & 0o700 != 0o700;
+            if opened {
+                std::fs::set_permissions(
+                    &absolute,
+                    std::fs::Permissions::from_mode(want.mode | 0o700),
+                )
+                .map_err(failed)?;
+            }
             for entry in std::fs::read_dir(&absolute).map_err(failed)? {
                 let entry = entry.map_err(failed)?;
                 let mut child = relative.to_vec();
@@ -704,7 +752,13 @@ fn remove_imaged_root(
                 child.extend_from_slice(entry.file_name().as_bytes());
                 remove(worktree, &child, expected, removed, changed)?;
             }
-            if observe(worktree, relative)? != **want {
+            let again = observe(worktree, relative)?;
+            let unchanged = if opened {
+                again.kind == Kind::Directory
+            } else {
+                again == **want
+            };
+            if !unchanged {
                 return Err(changed(relative));
             }
             std::fs::remove_dir(&absolute).map_err(failed)?;
@@ -728,6 +782,7 @@ fn remove_imaged_root(
         .iter()
         .map(|record| (record.path.as_slice(), record))
         .collect::<BTreeMap<_, _>>();
+    make_parents_owner_writable(worktree, root)?;
     let mut removed = 0;
     remove(worktree, root, &by_path, &mut removed, &changed)?;
     if removed != expected.len() {
@@ -1440,7 +1495,9 @@ pub(crate) fn verify_state(
 ///
 /// The index is reset first and the working copy is left alone; each tracked file Git then
 /// reports as differing is re-hashed immediately before it is overwritten, so an edit made after
-/// the last fingerprint is refused, never overwritten.
+/// the last fingerprint is refused, never overwritten. Every entry is replaced or deleted only
+/// after the directories holding it are made owner-writable, so a directory without the owner
+/// write bit cannot stop the discard halfway.
 pub(crate) fn discard(record: &WorktreeRecord, archive: &Path, head: &str) -> Result<(), Refusal> {
     let (manifest, _) = read_manifest(record, archive, head)?;
     let worktree = record.path.as_path();
@@ -1502,6 +1559,7 @@ pub(crate) fn discard(record: &WorktreeRecord, archive: &Path, head: &str) -> Re
         if !unchanged {
             return Err(changed(path));
         }
+        make_parents_owner_writable(worktree, path)?;
         run(
             Command::new("git")
                 .arg("-C")
@@ -1531,6 +1589,7 @@ pub(crate) fn discard(record: &WorktreeRecord, archive: &Path, head: &str) -> Re
         if archived.get(&entry.path) != Some(&(entry.mode, entry.id.clone())) {
             return Err(changed(&entry.path));
         }
+        make_parents_owner_writable(worktree, &entry.path)?;
         let path = worktree.join(OsStr::from_bytes(&entry.path));
         std::fs::remove_file(&path)
             .map_err(|error| io_refusal("archive-discard-failed", &path, &error))?;
@@ -1692,6 +1751,59 @@ mod tests {
         assert!(!tree.path().join(OsStr::from_bytes(ROOT)).exists());
         assert!(tree.path().join("evidence").is_dir());
         assert!(image.is_file());
+    }
+
+    fn set_mode(path: &Path, mode: u32) {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[test]
+    fn removing_an_imaged_root_opens_read_only_directories_it_has_verified() {
+        let tree = awkward_root();
+        let root = tree.path().join(OsStr::from_bytes(ROOT));
+        std::fs::create_dir(root.join("sealed")).unwrap();
+        std::fs::write(root.join("sealed/kept.txt"), "kept\n").unwrap();
+        set_mode(&root.join("sealed"), 0o555);
+        set_mode(&root, 0o555);
+        set_mode(&tree.path().join("evidence"), 0o555);
+        let listing = list_root(tree.path(), ROOT).unwrap();
+
+        remove_imaged_root(tree.path(), ROOT, &listing, tree.path()).unwrap();
+        assert!(!root.exists());
+        let parent = std::fs::metadata(tree.path().join("evidence")).unwrap();
+        assert_eq!(parent.mode() & 0o777, 0o755);
+    }
+
+    #[test]
+    fn a_read_only_directory_whose_mode_changed_after_verification_is_stale_and_kept() {
+        let tree = awkward_root();
+        let root = tree.path().join(OsStr::from_bytes(ROOT));
+        std::fs::create_dir(root.join("sealed")).unwrap();
+        std::fs::write(root.join("sealed/kept.txt"), "kept\n").unwrap();
+        let listing = list_root(tree.path(), ROOT).unwrap();
+        set_mode(&root.join("sealed"), 0o555);
+
+        let refusal = remove_imaged_root(tree.path(), ROOT, &listing, tree.path()).unwrap_err();
+        assert_eq!(refusal.code, "archive-stale", "{refusal}");
+        assert!(root.join("sealed/kept.txt").is_file());
+        set_mode(&root.join("sealed"), 0o755);
+    }
+
+    #[test]
+    fn parents_are_opened_down_to_the_entry_and_the_walk_stops_at_a_missing_or_other_component() {
+        let tree = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tree.path().join("a/b")).unwrap();
+        std::fs::write(tree.path().join("a/file"), "x").unwrap();
+        set_mode(&tree.path().join("a/b"), 0o555);
+        set_mode(&tree.path().join("a"), 0o500);
+
+        make_parents_owner_writable(tree.path(), b"a/b/c.txt").unwrap();
+        for (path, mode) in [("a", 0o700), ("a/b", 0o755)] {
+            let metadata = std::fs::metadata(tree.path().join(path)).unwrap();
+            assert_eq!(metadata.mode() & 0o777, mode, "{path}");
+        }
+        make_parents_owner_writable(tree.path(), b"a/missing/deeper/c.txt").unwrap();
+        make_parents_owner_writable(tree.path(), b"a/file/c.txt").unwrap();
     }
 
     #[test]

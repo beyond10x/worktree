@@ -305,7 +305,7 @@ fn finish_archive_writes_an_image_that_tar_restores_with_every_repository_state(
     let restored = fixture.root.path().join("restored");
     std::fs::create_dir(&restored).unwrap();
     let extracted = Command::new("tar")
-        .arg("-xf")
+        .arg("-xpf")
         .arg(fixture.archive_dir().join("nested-1.tar"))
         .arg("-C")
         .arg(&restored)
@@ -504,4 +504,58 @@ fn a_tree_without_nested_repositories_keeps_the_version_1_manifest() {
     let mut files = fixture.archive_bytes().into_keys().collect::<Vec<_>>();
     files.sort();
     assert_eq!(files, ["commits.bundle", "dirty.patch", "manifest.json"]);
+}
+
+/// Gives a directory its owner write bit back when a case ends, so a failed case can be cleaned.
+struct Unseal(PathBuf);
+
+impl Drop for Unseal {
+    fn drop(&mut self) {
+        let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+    }
+}
+
+/// Directories without the owner write bit inside a nested repository, beside it in an ignored
+/// directory, and as the nested root's own parent: the tree retires, never stopping halfway.
+#[test]
+fn read_only_directories_in_and_around_a_nested_repository_retire_with_the_tree() {
+    let fixture = Fixture::with_nested_repository();
+    let inner = fixture.nested().join("sealed");
+    let beside = fixture.tree.join("evidence/sealed");
+    let parent = fixture.tree.join("evidence/run-1");
+    for directory in [&inner, &beside] {
+        std::fs::create_dir(directory).unwrap();
+        std::fs::write(directory.join("kept.txt"), "kept\n").unwrap();
+    }
+    let mut guards = Vec::new();
+    for directory in [inner, beside, parent] {
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o555)).unwrap();
+        guards.push(Unseal(directory));
+    }
+    fixture.ok(&["finish", "--archive", fixture.tree_str()]);
+    assert_eq!(fixture.manifest()["format"], "worktree.archive/2");
+
+    let applied = fixture.gc("--apply");
+    assert!(applied["evidence"].is_object(), "{applied}");
+    assert!(!fixture.tree.exists());
+}
+
+/// The discard restores tracked edits as well as deleting untracked files and nested images; a
+/// directory without the owner write bit must not stop that restore either.
+#[test]
+fn a_tracked_edit_in_a_read_only_directory_is_restored_and_the_tree_retires() {
+    let fixture = Fixture::new();
+    let sealed = fixture.tree.join("sealed");
+    std::fs::create_dir(&sealed).unwrap();
+    std::fs::write(sealed.join("tracked.txt"), "committed\n").unwrap();
+    git_ok(&fixture.tree, &["add", "sealed/tracked.txt"]);
+    git_ok(&fixture.tree, &["commit", "--quiet", "-m", "sealed"]);
+    std::fs::write(sealed.join("tracked.txt"), "edited\n").unwrap();
+    std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let _unseal = Unseal(sealed);
+    fixture.ok(&["finish", "--archive", fixture.tree_str()]);
+
+    let applied = fixture.gc("--apply");
+    assert!(applied["evidence"].is_object(), "{applied}");
+    assert!(!fixture.tree.exists());
 }

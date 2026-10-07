@@ -49,7 +49,8 @@ pub struct ArchiveFile {
 ///
 /// The image is a tar file holding the repository's root directory and every entry below it,
 /// its `.git` included, with permission bits, modification times and symlink targets; entry names
-/// are relative to the tree root, so `tar -xf <image> -C <tree>` restores it.
+/// are relative to the tree root, so `tar -xpf <image> -C <tree>` restores it. `-p` keeps the
+/// recorded permission bits; without it an unprivileged tar narrows them by the umask.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NestedRepositoryImage {
