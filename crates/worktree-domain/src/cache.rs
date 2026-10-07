@@ -18,6 +18,10 @@ pub const CACHEDIR_TAG_SIGNATURE: &[u8] = b"Signature: 8a477f597d28d172789f06886
 /// The directory Cargo writes into every profile directory and nowhere else.
 pub const CARGO_PROFILE_MARKER: &str = ".fingerprint";
 
+/// Cargo's `CARGO_TARGET_TMPDIR`, directly below a target. Cargo reserves the name, so no
+/// profile is ever called this.
+pub const CARGO_TARGET_TMP: &str = "tmp";
+
 /// Files Cargo writes at the root of a target directory.
 pub const CARGO_TARGET_METADATA: [&str; 3] = [
     CACHEDIR_TAG_FILE,
@@ -64,8 +68,11 @@ pub fn is_cache_tag(contents: &[u8]) -> bool {
 pub enum CacheKind {
     /// A directory holding `.fingerprint/` inside a tagged Cargo target.
     CargoProfile,
-    /// A tagged Cargo target holding nothing but profiles and Cargo's own metadata.
+    /// A tagged Cargo target holding nothing but profiles, Cargo's own metadata and its `tmp/`.
     CargoTarget,
+    /// `tmp/` directly below a tagged Cargo target that holds a profile: Cargo's
+    /// `CARGO_TARGET_TMPDIR`, which test binaries fill with scratch, whatever it holds.
+    CargoTargetTmp,
     /// `node_modules` at or below a directory holding a tracked lockfile.
     NodeModules,
     /// A directory holding `pyvenv.cfg` beside, or at the root of, a tracked Python manifest.
