@@ -314,13 +314,14 @@ pub struct TreeSelection {
 }
 
 /// Resolve `reference` against `records`. `canonical` is the canonical path of the directory
-/// the value names, if any; `scope` limits the records a directory name may match.
+/// the value names, if any; `scope` limits the records a directory name may match. `None` when
+/// no form names a record; the only refusal is `ambiguous-worktree-reference`.
 fn select_reference(
     records: &[WorktreeRecord],
     reference: &str,
     canonical: Option<&Path>,
     scope: Option<&WorkspacePolicy>,
-) -> Result<TreeSelection, Refusal> {
+) -> Result<Option<TreeSelection>, Refusal> {
     let live = |record: &&WorktreeRecord| record.lifecycle != Lifecycle::Removed;
     let mut matches: Vec<(ReferenceForm, &WorktreeRecord)> = Vec::new();
     if let Ok(id) = WorktreeId::new(reference) {
@@ -366,19 +367,13 @@ fn select_reference(
         }
     }
     match (matches.first(), ids.len()) {
-        (Some((form, record)), 1) => Ok(TreeSelection {
+        (Some((form, record)), 1) => Ok(Some(TreeSelection {
             reference: reference.to_owned(),
             form: *form,
             worktree_id: record.id.clone(),
             path: record.path.clone(),
-        }),
-        (None, _) => Err(Refusal::new(
-            "unknown-worktree-reference",
-            format!(
-                "`{reference}` names no registered worktree: it is not a registered id, a path \
-                 to a registered tree, or the directory name of one; see `worktree status`"
-            ),
-        )),
+        })),
+        (None, _) => Ok(None),
         _ => Err(Refusal::new(
             "ambiguous-worktree-reference",
             format!(
@@ -1202,13 +1197,41 @@ where
     /// With `scope`, a directory name matches only records whose repository lies below the
     /// policy's workspace root; an id or a path is resolved whatever the scope, so callers keep
     /// their own scope refusal. Removed records answer to their id only. Different records
-    /// named by the value refuse as `ambiguous-worktree-reference`; none as
-    /// `unknown-worktree-reference`.
+    /// named by the value refuse as `ambiguous-worktree-reference`. A value naming none keeps
+    /// the released codes: `unknown-worktree-id` when it is a well-formed id,
+    /// `invalid-worktree-id` otherwise.
     pub fn resolve_reference(
         &self,
         reference: &str,
         scope: Option<&WorkspacePolicy>,
     ) -> Result<TreeSelection, Refusal> {
+        if let Some(selection) = self.find_reference(reference, scope)? {
+            return Ok(selection);
+        }
+        Err(if WorktreeId::new(reference).is_ok() {
+            Refusal::new(
+                "unknown-worktree-id",
+                format!(
+                    "{reference} is not registered, and names no registered tree path or \
+                     directory name; see `worktree status`"
+                ),
+            )
+        } else {
+            Refusal::new(
+                "invalid-worktree-id",
+                format!(
+                    "`{reference}` is neither a valid worktree id nor a registered tree path or \
+                     directory name; see `worktree status`"
+                ),
+            )
+        })
+    }
+
+    fn find_reference(
+        &self,
+        reference: &str,
+        scope: Option<&WorkspacePolicy>,
+    ) -> Result<Option<TreeSelection>, Refusal> {
         let records = self.registry.list()?;
         let canonical = std::fs::canonicalize(reference)
             .ok()
@@ -1235,37 +1258,28 @@ where
 
     /// Resolve the tree argument of `finish`, `discard-cache` or `archive` to a path.
     ///
-    /// An existing directory that is no registered tree's path is returned unchanged, so the
-    /// command's own path refusal applies as before. A registered tree's path, or a value that
-    /// names no existing directory, is resolved as a reference. A value naming nothing keeps
-    /// this argument's `worktree-not-found` code; an ambiguous one refuses as ambiguous.
+    /// The value is resolved as a reference first, so `finish docs` finishes the tree whose id
+    /// is `docs` even where the working directory holds an unrelated `docs/`. A value that
+    /// names no registered tree but exists is returned unchanged, so the command's own path
+    /// refusal applies as before; one that does not exist refuses as `worktree-not-found`. An
+    /// ambiguous value refuses as ambiguous.
     pub fn resolve_tree_path(&self, reference: &Path) -> Result<PathBuf, Refusal> {
         let Some(text) = reference.to_str() else {
             return Ok(reference.to_path_buf());
         };
-        if let Some(canonical) = std::fs::canonicalize(reference)
-            .ok()
-            .filter(|path| path.is_dir())
-        {
-            let registered = self
-                .registry
-                .find_by_path(&canonical)?
-                .is_some_and(|record| record.lifecycle != Lifecycle::Removed);
-            if !registered {
-                return Ok(reference.to_path_buf());
-            }
+        if let Some(selection) = self.find_reference(text, None)? {
+            return Ok(selection.path);
         }
-        match self.resolve_reference(text, None) {
-            Ok(selection) => Ok(selection.path),
-            Err(refusal) if refusal.code == "unknown-worktree-reference" => Err(Refusal::new(
-                "worktree-not-found",
-                format!(
-                    "`{text}` is neither an existing path nor a registered id or tree directory \
-                     name; see `worktree status`"
-                ),
-            )),
-            Err(refusal) => Err(refusal),
+        if reference.exists() {
+            return Ok(reference.to_path_buf());
         }
+        Err(Refusal::new(
+            "worktree-not-found",
+            format!(
+                "`{text}` is neither an existing path nor a registered id or tree directory name; \
+                 see `worktree status`"
+            ),
+        ))
     }
 
     fn owned_record(&self, path: &Path) -> Result<WorktreeRecord, Refusal> {
@@ -5531,10 +5545,22 @@ mod tests {
     fn an_unknown_reference_names_the_value() {
         let world = ReferenceWorld::new();
         let manager = world.manager(vec![world.record("alpha", &world.alpha, Lifecycle::Active)]);
-        for value in ["missing", "missing-0.1.0", "/no/such/tree", "Upper"] {
+        // A well-formed id keeps the released `unknown-worktree-id` code.
+        let refusal = manager.resolve_reference("missing", None).unwrap_err();
+        assert_eq!(refusal.code, "unknown-worktree-id");
+        assert!(refusal.message.contains("missing"), "{}", refusal.message);
+        // Anything else keeps `invalid-worktree-id`, and says it named no tree either.
+        for value in ["missing-0.1.0", "/no/such/tree", "Upper"] {
             let refusal = manager.resolve_reference(value, None).unwrap_err();
-            assert_eq!(refusal.code, "unknown-worktree-reference", "{value}");
+            assert_eq!(refusal.code, "invalid-worktree-id", "{value}");
             assert!(refusal.message.contains(value), "{}", refusal.message);
+            assert!(
+                refusal.message.contains(
+                    "neither a valid worktree id nor a registered tree path or directory name"
+                ),
+                "{}",
+                refusal.message
+            );
         }
     }
 
@@ -5564,7 +5590,7 @@ mod tests {
         // A removed record answers to its id only.
         assert_eq!(
             manager.resolve_reference("gone", None).unwrap_err().code,
-            "unknown-worktree-reference"
+            "unknown-worktree-id"
         );
         assert_eq!(
             manager
@@ -5597,7 +5623,8 @@ mod tests {
             world.record("alpha", &world.alpha, Lifecycle::Active),
             world.record("release", &world.dotted, Lifecycle::Active),
         ]);
-        // An existing directory that is no registered tree passes through unchanged.
+        // An existing directory that names no registered tree in any form passes through
+        // unchanged.
         assert_eq!(
             manager.resolve_tree_path(&world.repository).unwrap(),
             world.repository

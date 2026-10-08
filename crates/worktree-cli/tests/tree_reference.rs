@@ -389,12 +389,14 @@ fn an_unknown_reference_refuses_and_names_the_value() {
             "--id",
             "nothing-here.1",
         ]);
-        assert_eq!(refusal["code"], "unknown-worktree-reference", "{refusal}");
+        // Not a valid id and no tree: the released `invalid-worktree-id` code.
+        assert_eq!(refusal["code"], "invalid-worktree-id", "{refusal}");
+        let message = refusal["message"].as_str().unwrap();
+        assert!(message.contains("nothing-here.1"), "{refusal}");
         assert!(
-            refusal["message"]
-                .as_str()
-                .unwrap()
-                .contains("nothing-here.1"),
+            message.contains(
+                "neither a valid worktree id nor a registered tree path or directory name"
+            ),
             "{refusal}"
         );
     }
@@ -454,4 +456,140 @@ fn the_skill_says_one_reference_works_everywhere() {
         ),
         "{skill}"
     );
+}
+
+// Adversary cases (6f9f5ae).
+
+#[test]
+fn finish_by_id_is_not_shadowed_by_an_unrelated_directory_of_that_name() {
+    let fixture = Fixture::new();
+    let tree = fixture.create("docs");
+    // An ordinary working directory that happens to hold a plain `docs/` directory, such as a
+    // repository root. `docs` is a registered id and names no registered path from here.
+    let cwd = fixture.outside();
+    std::fs::create_dir_all(cwd.join("docs")).unwrap();
+
+    // gc resolves the same reference from the same directory as the id.
+    let review = fixture.ok_in(
+        &cwd,
+        &["gc", "--repo", fixture.repo(), "--dry-run", "--id", "docs"],
+    );
+    assert_eq!(review["assessments"], serde_json::json!([]), "{review}");
+
+    let output = fixture.run(&cwd, true, &["finish", "docs"]);
+    assert!(
+        output.status.success(),
+        "finish <registered id> must finish that tree: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let finished: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(finished["evidence"]["id"], "docs");
+    assert_eq!(finished["evidence"]["path"], tree.to_str().unwrap());
+}
+
+#[test]
+fn gc_id_naming_no_record_keeps_the_released_unknown_worktree_id_code() {
+    let fixture = Fixture::new();
+    fixture.create("present");
+    // 0.12.1 refused a well-formed but unregistered `--id` as `unknown-worktree-id`
+    // (validate_selected_records); protocol version 4 refusal codes are a wire contract.
+    for command in ["gc", "reconcile"] {
+        let refusal = fixture.refused(&[
+            command,
+            "--repo",
+            fixture.repo(),
+            "--dry-run",
+            "--id",
+            "absent",
+        ]);
+        assert_eq!(
+            refusal["code"], "unknown-worktree-id",
+            "{command}: {refusal}"
+        );
+    }
+}
+
+#[test]
+fn finish_and_discard_cache_by_id_from_outside_keep_the_lease_check() {
+    let fixture = Fixture::new();
+    let tree = fixture.create("leased");
+    fixture.ok(&[
+        "hook",
+        "session-start",
+        "--path",
+        tree.to_str().unwrap(),
+        "--session",
+        "other-session",
+    ]);
+    let refusal = fixture.refused(&["finish", "leased"]);
+    assert_eq!(refusal["code"], "live-session", "{refusal}");
+    let refusal = fixture.refused(&["finish", "--discard-cache", "--archive", "leased"]);
+    assert_eq!(refusal["code"], "live-session", "{refusal}");
+    let refusal = fixture.refused(&["discard-cache", "leased"]);
+    assert_eq!(refusal["code"], "live-session", "{refusal}");
+    let status = fixture.ok(&["status"]);
+    assert_eq!(status["records"][0]["lifecycle"], "active", "{status}");
+}
+
+#[test]
+fn gc_apply_by_reference_never_reaches_a_tree_outside_the_workspace() {
+    let fixture = Fixture::new();
+    fixture.create("inside");
+    // A second workspace with its own repository and a finished tree named `stranger`.
+    let other_workspace = fixture.root.path().join("second");
+    let other = other_workspace.join("two");
+    std::fs::create_dir_all(&other).unwrap();
+    git(&other, &["init", "-b", "main"]);
+    write(&other.join("file"), "x\n");
+    git(&other, &["add", "."]);
+    git(&other, &["commit", "-m", "two"]);
+    let profile = fixture.root.path().join("profile-two.toml");
+    write(
+        &profile,
+        "version = 1\nname = 'second'\nexpire_after_seconds = 604800\nprotect_workspace_root = false\n",
+    );
+    fixture.ok(&[
+        "activate",
+        "--profile",
+        profile.to_str().unwrap(),
+        "--workspace",
+        other_workspace.to_str().unwrap(),
+    ]);
+    let created = fixture.ok(&[
+        "create",
+        "--repo",
+        other.to_str().unwrap(),
+        "--id",
+        "stranger",
+        "--purpose",
+        "x",
+    ]);
+    let stranger = PathBuf::from(created["evidence"]["path"].as_str().unwrap());
+    fixture.ok(&["finish", "stranger"]);
+
+    for reference in ["stranger", stranger.to_str().unwrap()] {
+        let refusal =
+            fixture.refused(&["gc", "--repo", fixture.repo(), "--apply", "--id", reference]);
+        assert_eq!(
+            refusal["code"], "selected-worktree-outside-policy",
+            "{reference}: {refusal}"
+        );
+    }
+    // From the tree's parent, the bare directory name is a path to it.
+    let refusal = fixture.refused_in(
+        stranger.parent().unwrap(),
+        &[
+            "gc",
+            "--repo",
+            fixture.repo(),
+            "--apply",
+            "--id",
+            "stranger/",
+        ],
+    );
+    assert_eq!(
+        refusal["code"], "selected-worktree-outside-policy",
+        "{refusal}"
+    );
+    assert!(stranger.exists());
 }
