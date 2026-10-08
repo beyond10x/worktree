@@ -106,7 +106,8 @@ struct CreateArgs {
 
 #[derive(Debug, Args)]
 struct ArchiveArgs {
-    /// Managed worktree path; defaults to the current directory.
+    /// Managed tree: its path, registered id or unique directory name; defaults to the current
+    /// directory.
     #[arg(default_value = ".")]
     path: PathBuf,
     /// Move an existing archive aside (never deleted) and write a new one.
@@ -116,7 +117,8 @@ struct ArchiveArgs {
 
 #[derive(Debug, Args)]
 struct FinishArgs {
-    /// Managed worktree path; defaults to the current directory.
+    /// Managed tree: its path, registered id or unique directory name; defaults to the current
+    /// directory.
     #[arg(default_value = ".")]
     path: PathBuf,
     /// First delete the recognised build cache, as `worktree discard-cache` does.
@@ -129,7 +131,8 @@ struct FinishArgs {
 
 #[derive(Debug, Args)]
 struct DiscardCacheArgs {
-    /// Managed worktree path; defaults to the current directory.
+    /// Managed tree: its path, registered id or unique directory name; defaults to the current
+    /// directory.
     #[arg(default_value = ".")]
     path: PathBuf,
     /// Classify and report without deleting anything.
@@ -161,7 +164,8 @@ struct GcArgs {
     /// Repository used to select its activated workspace policy.
     #[arg(long, default_value = ".")]
     repo: PathBuf,
-    /// Exact registered id reviewed in a dry-run; repeat for multiple records.
+    /// Tree reviewed in a dry-run: its registered id, path or unique directory name; repeat for
+    /// multiple records.
     #[arg(long = "id")]
     ids: Vec<String>,
     /// Apply eligible removals. Without this flag, GC is a dry-run.
@@ -196,7 +200,8 @@ struct ReconcileArgs {
     /// Repository used to select its activated workspace policy.
     #[arg(long, default_value = ".")]
     repo: PathBuf,
-    /// Exact registered id to assess or apply; repeat for multiple records.
+    /// Tree to assess or apply: its registered id, path or unique directory name; repeat for
+    /// multiple records.
     #[arg(long = "id")]
     ids: Vec<String>,
     /// Apply reviewed reconciliation actions. Requires at least one id.
@@ -402,8 +407,12 @@ struct ArchivePayload<'a> {
 }
 
 fn archive(args: &ArchiveArgs, json: bool) -> Result<()> {
-    let evidence = manager()?
-        .archive(&args.path, args.replace)
+    let service = manager()?;
+    let path = service
+        .resolve_tree_path(&args.path)
+        .map_err(anyhow::Error::new)?;
+    let evidence = service
+        .archive(&path, args.replace)
         .map_err(anyhow::Error::new)?;
     emit_success(
         json,
@@ -465,8 +474,12 @@ fn finish(args: &FinishArgs, json: bool) -> Result<()> {
         discard_cache: args.discard_cache,
         archive: args.archive,
     };
-    let finished = manager()?
-        .finish_with(&args.path, options)
+    let service = manager()?;
+    let path = service
+        .resolve_tree_path(&args.path)
+        .map_err(anyhow::Error::new)?;
+    let finished = service
+        .finish_with(&path, options)
         .map_err(anyhow::Error::new)?;
     emit_success(
         json,
@@ -484,15 +497,23 @@ fn finish(args: &FinishArgs, json: bool) -> Result<()> {
             if let Some(archive) = &finished.archive {
                 lines.push(format!("archived to {}", archive.path.display()));
             }
-            lines.push(format!("finished {}", finished.evidence.path.display()));
+            lines.push(format!(
+                "finished {} {}",
+                finished.evidence.id,
+                finished.evidence.path.display()
+            ));
             lines.join("\n")
         },
     )
 }
 
 fn discard_cache(args: &DiscardCacheArgs, json: bool) -> Result<()> {
-    let cache = manager()?
-        .discard_cache(&args.path, !args.dry_run)
+    let service = manager()?;
+    let path = service
+        .resolve_tree_path(&args.path)
+        .map_err(anyhow::Error::new)?;
+    let cache = service
+        .discard_cache(&path, !args.dry_run)
         .map_err(anyhow::Error::new)?;
     emit_success(
         json,
@@ -798,8 +819,11 @@ fn gc(args: &GcArgs, json: bool) -> Result<()> {
     let config =
         load_config(&config_path().map_err(anyhow::Error::new)?).map_err(anyhow::Error::new)?;
     let policy = resolve_policy(&config, &repository.root).map_err(anyhow::Error::new)?;
-    let ids = parse_ids(&args.ids)?;
-    let assessments = manager()?
+    let service = manager()?;
+    let ids = service
+        .resolve_references(&args.ids, Some(policy))
+        .map_err(anyhow::Error::new)?;
+    let assessments = service
         .gc(policy, &ids, args.apply)
         .map_err(anyhow::Error::new)?;
     emit_success(
@@ -855,9 +879,12 @@ fn reconcile(args: &ReconcileArgs, json: bool) -> Result<()> {
     let config =
         load_config(&config_path().map_err(anyhow::Error::new)?).map_err(anyhow::Error::new)?;
     let policy = resolve_policy(&config, &repository.root).map_err(anyhow::Error::new)?;
-    let ids = parse_ids(&args.ids)?;
+    let service = manager()?;
+    let ids = service
+        .resolve_references(&args.ids, Some(policy))
+        .map_err(anyhow::Error::new)?;
     let unrecoverable = parse_revisions(&args.unrecoverable)?;
-    let assessments = manager()?
+    let assessments = service
         .reconcile(
             policy,
             &ids,
@@ -1147,12 +1174,6 @@ fn generated_id() -> String {
     format!("wt-{}", &compact[..12])
 }
 
-fn parse_ids(ids: &[String]) -> Result<Vec<WorktreeId>> {
-    ids.iter()
-        .map(|id| WorktreeId::new(id.clone()).map_err(anyhow::Error::new))
-        .collect()
-}
-
 fn parse_revisions(revisions: &[String]) -> Result<Vec<GitRevision>> {
     revisions
         .iter()
@@ -1294,6 +1315,8 @@ Before a large build, inspect free space and `worktree inspect --repo <primary> 
 After verification, preserve the small logs, reports, or deliverables needed for review in their intended durable location, never only below an ignored build directory such as `target/`. Delete build output with `worktree discard-cache [<tree>]`; run it with `--dry-run` first to see the classification. It deletes only ignored directories it recognises as cache by their structure: Cargo profiles inside a tagged target (an untagged `target/` beside a tracked `Cargo.toml` whose profile holds `.fingerprint/` and `deps/` counts as tagged) and that target's `tmp/` test scratch, `node_modules` at or below a tracked lockfile, a virtual environment beside a tracked Python manifest, and tagged `.pytest_cache`, `.mypy_cache` and `.ruff_cache`. Every other ignored entry is kept and named. It refuses while a lease is live or another process uses the tree. Ignored files can contain valuable work: never blanket-delete them or use `git clean -fdx`. A worktree saves duplicate Git history; its build output still consumes disk until it is discarded.
 
 ## Finish and clean up
+
+One tree reference works in `finish`, `discard-cache`, `archive`, `gc --id` and `reconcile --id`: the tree's registered id, its path (relative paths resolve against the current directory), or its directory name when exactly one registered tree has it, so `finish <id>` works from outside the tree. A reference that names two different trees is refused as `ambiguous-worktree-reference` and lists their ids; pass one of them. One that names no registered tree is refused as `unknown-worktree-reference` by `gc --id` and `reconcile --id`, and as `worktree-not-found` by `finish`, `discard-cache` and `archive`. `finish` prints `finished <id> <path>`, and either value is a valid `gc --id`. An id never contains a dot: `create --id` refuses one, so use hyphens; a dotted directory name still resolves as a path or directory name.
 
 1. Commit and publish every wanted change. A local-only commit is deliberately not cleanup-safe. Work merged as rebased or cherry-picked copies also qualifies when an advertised ref carries every unique commit's exact patch; GC reports that proof as `patch-equivalent`.
    When work must not be published, run `worktree archive <tree>` instead. It never modifies the tree; it writes `commits.bundle` (every commit no advertised ref holds), `dirty.patch` (tracked, untracked and ignored changes over HEAD), one `nested-<n>.tar` byte image per nested Git repository in the tree's files (such as a test fixture in an ignored directory), and a `worktree.archive/1` (or `/2` with images) `manifest.json` below the state directory's `worktree/archives/<repository>/<id>/`, and verifies them. GC then accepts that archive as `archive` proof while HEAD and every file still match it exactly; any later commit or edit is refused as `archive-stale` until `worktree archive --replace <tree>` writes a new one. `--replace` moves the old archive aside and never deletes it.
@@ -1451,6 +1474,12 @@ mod tests {
         assert!(markdown.contains("worktree-hidden-state"));
         assert!(markdown.contains("worktree-local-refs"));
         assert!(markdown.contains("repository-missing"));
+        assert!(markdown.contains(
+            "One tree reference works in `finish`, `discard-cache`, `archive`, `gc --id` and `reconcile --id`"
+        ));
+        assert!(markdown.contains("ambiguous-worktree-reference"));
+        assert!(markdown.contains("unknown-worktree-reference"));
+        assert!(markdown.contains("`finished <id> <path>`"));
         assert!(interface.contains("$worktree"));
         assert!(interface.contains("Generated by `worktree skill`"));
     }

@@ -50,7 +50,7 @@ impl WorktreeId {
         {
             return Err(Refusal::new(
                 "invalid-worktree-id",
-                "worktree id must be 1-128 lowercase letters, digits or hyphens and cannot start with a dot",
+                "worktree id must be 1-128 lowercase letters, digits or hyphens; use hyphens instead of dots (`release-0-7-0`, not `release-0.7.0`)",
             ));
         }
         Ok(Self(value))

@@ -287,6 +287,108 @@ pub trait RegistryPort: Send + Sync {
     ) -> Result<(), Refusal>;
 }
 
+/// How one tree reference named its registered record (`worktree.selection.ReferenceForm`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReferenceForm {
+    /// The value is a registered worktree id.
+    Id,
+    /// The value names a directory whose canonical path is a registered record's path.
+    Path,
+    /// The value contains no `/` and is the final path component of exactly one in-scope,
+    /// non-removed record's path.
+    DirectoryName,
+}
+
+/// One resolved tree reference (`worktree.selection.TreeSelection`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TreeSelection {
+    /// The value as the caller gave it.
+    pub reference: String,
+    /// The form that named the record; `Id` before `Path` before `DirectoryName` when several
+    /// forms name the same record.
+    pub form: ReferenceForm,
+    /// The registered record's id.
+    pub worktree_id: WorktreeId,
+    /// The registered record's path.
+    pub path: PathBuf,
+}
+
+/// Resolve `reference` against `records`. `canonical` is the canonical path of the directory
+/// the value names, if any; `scope` limits the records a directory name may match.
+fn select_reference(
+    records: &[WorktreeRecord],
+    reference: &str,
+    canonical: Option<&Path>,
+    scope: Option<&WorkspacePolicy>,
+) -> Result<TreeSelection, Refusal> {
+    let live = |record: &&WorktreeRecord| record.lifecycle != Lifecycle::Removed;
+    let mut matches: Vec<(ReferenceForm, &WorktreeRecord)> = Vec::new();
+    if let Ok(id) = WorktreeId::new(reference) {
+        matches.extend(
+            records
+                .iter()
+                .find(|record| record.id == id)
+                .map(|record| (ReferenceForm::Id, record)),
+        );
+    }
+    if let Some(canonical) = canonical {
+        matches.extend(
+            records
+                .iter()
+                .filter(live)
+                .find(|record| record.path == canonical)
+                .map(|record| (ReferenceForm::Path, record)),
+        );
+    }
+    if !reference.is_empty() && !reference.contains('/') && reference != "." && reference != ".." {
+        matches.extend(
+            records
+                .iter()
+                .filter(live)
+                .filter(|record| {
+                    scope.is_none_or(|policy| {
+                        record.repository_root.starts_with(&policy.workspace_root)
+                    })
+                })
+                .filter(|record| {
+                    record
+                        .path
+                        .file_name()
+                        .is_some_and(|name| name == std::ffi::OsStr::new(reference))
+                })
+                .map(|record| (ReferenceForm::DirectoryName, record)),
+        );
+    }
+    let mut ids: Vec<&str> = Vec::new();
+    for (_, record) in &matches {
+        if !ids.contains(&record.id.as_str()) {
+            ids.push(record.id.as_str());
+        }
+    }
+    match (matches.first(), ids.len()) {
+        (Some((form, record)), 1) => Ok(TreeSelection {
+            reference: reference.to_owned(),
+            form: *form,
+            worktree_id: record.id.clone(),
+            path: record.path.clone(),
+        }),
+        (None, _) => Err(Refusal::new(
+            "unknown-worktree-reference",
+            format!(
+                "`{reference}` names no registered worktree: it is not a registered id, a path \
+                 to a registered tree, or the directory name of one; see `worktree status`"
+            ),
+        )),
+        _ => Err(Refusal::new(
+            "ambiguous-worktree-reference",
+            format!(
+                "`{reference}` names more than one registered worktree ({}); pass one of these ids",
+                ids.join(", ")
+            ),
+        )),
+    }
+}
+
 /// Policy-driven worktree lifecycle service suitable for embedding in Harness.
 pub struct WorktreeManager<G, R, C> {
     git: G,
@@ -1092,6 +1194,78 @@ where
             recovery: None,
             recorded_at: now,
         })
+    }
+
+    /// Resolve one tree reference — a registered id, a path to a registered tree, or the
+    /// directory name of exactly one registered tree — to its record.
+    ///
+    /// With `scope`, a directory name matches only records whose repository lies below the
+    /// policy's workspace root; an id or a path is resolved whatever the scope, so callers keep
+    /// their own scope refusal. Removed records answer to their id only. Different records
+    /// named by the value refuse as `ambiguous-worktree-reference`; none as
+    /// `unknown-worktree-reference`.
+    pub fn resolve_reference(
+        &self,
+        reference: &str,
+        scope: Option<&WorkspacePolicy>,
+    ) -> Result<TreeSelection, Refusal> {
+        let records = self.registry.list()?;
+        let canonical = std::fs::canonicalize(reference)
+            .ok()
+            .filter(|path| path.is_dir());
+        select_reference(&records, reference, canonical.as_deref(), scope)
+    }
+
+    /// Resolve each reference to its record's id, in order and without duplicates. This is the
+    /// selection `gc --id` and `reconcile --id` pass on as the reviewed ids.
+    pub fn resolve_references(
+        &self,
+        references: &[String],
+        scope: Option<&WorkspacePolicy>,
+    ) -> Result<Vec<WorktreeId>, Refusal> {
+        let mut ids = Vec::with_capacity(references.len());
+        for reference in references {
+            let id = self.resolve_reference(reference, scope)?.worktree_id;
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+        Ok(ids)
+    }
+
+    /// Resolve the tree argument of `finish`, `discard-cache` or `archive` to a path.
+    ///
+    /// An existing directory that is no registered tree's path is returned unchanged, so the
+    /// command's own path refusal applies as before. A registered tree's path, or a value that
+    /// names no existing directory, is resolved as a reference. A value naming nothing keeps
+    /// this argument's `worktree-not-found` code; an ambiguous one refuses as ambiguous.
+    pub fn resolve_tree_path(&self, reference: &Path) -> Result<PathBuf, Refusal> {
+        let Some(text) = reference.to_str() else {
+            return Ok(reference.to_path_buf());
+        };
+        if let Some(canonical) = std::fs::canonicalize(reference)
+            .ok()
+            .filter(|path| path.is_dir())
+        {
+            let registered = self
+                .registry
+                .find_by_path(&canonical)?
+                .is_some_and(|record| record.lifecycle != Lifecycle::Removed);
+            if !registered {
+                return Ok(reference.to_path_buf());
+            }
+        }
+        match self.resolve_reference(text, None) {
+            Ok(selection) => Ok(selection.path),
+            Err(refusal) if refusal.code == "unknown-worktree-reference" => Err(Refusal::new(
+                "worktree-not-found",
+                format!(
+                    "`{text}` is neither an existing path nor a registered id or tree directory \
+                     name; see `worktree status`"
+                ),
+            )),
+            Err(refusal) => Err(refusal),
+        }
     }
 
     fn owned_record(&self, path: &Path) -> Result<WorktreeRecord, Refusal> {
@@ -5201,5 +5375,277 @@ mod tests {
             readiness_failures(broken_config),
             vec![ReadinessFailure::ConfigUnavailable]
         );
+    }
+
+    /// A workspace with a repository, a managed root and two real tree directories:
+    /// `<managed>/alpha` (id `alpha`) and `<legacy>/release-0.7.0` (id `release`).
+    struct ReferenceWorld {
+        _root: TempDir,
+        workspace: PathBuf,
+        managed: PathBuf,
+        repository: PathBuf,
+        alpha: PathBuf,
+        dotted: PathBuf,
+    }
+
+    impl ReferenceWorld {
+        fn new() -> Self {
+            let root = tempdir().unwrap();
+            let base = std::fs::canonicalize(root.path()).unwrap();
+            let workspace = base.join("workspace");
+            let repository = workspace.join("repo");
+            let managed = base.join("managed");
+            let alpha = managed.join("repo/alpha");
+            let dotted = base.join("legacy/release-0.7.0");
+            for directory in [&repository, &alpha, &dotted] {
+                std::fs::create_dir_all(directory).unwrap();
+            }
+            Self {
+                _root: root,
+                workspace,
+                managed,
+                repository,
+                alpha,
+                dotted,
+            }
+        }
+
+        fn record(&self, id: &str, path: &Path, lifecycle: Lifecycle) -> WorktreeRecord {
+            named_record(id, self.repository.clone(), path.to_path_buf(), lifecycle)
+        }
+
+        fn manager(
+            &self,
+            records: Vec<WorktreeRecord>,
+        ) -> WorktreeManager<FakeGit, FakeRegistry, FixedClock> {
+            WorktreeManager::new(
+                fake_git(self.repository.clone()),
+                fake_registry(records),
+                FixedClock,
+            )
+        }
+
+        fn policy(&self) -> WorkspacePolicy {
+            policy(self.workspace.clone(), self.managed.clone())
+        }
+    }
+
+    #[test]
+    fn a_reference_resolves_as_an_id_a_path_or_a_directory_name() {
+        let world = ReferenceWorld::new();
+        let manager = world.manager(vec![
+            world.record("alpha", &world.alpha, Lifecycle::Finished),
+            world.record("release", &world.dotted, Lifecycle::Active),
+        ]);
+        let scope = world.policy();
+
+        let by_id = manager.resolve_reference("release", Some(&scope)).unwrap();
+        assert_eq!(by_id.form, ReferenceForm::Id);
+        assert_eq!(by_id.worktree_id.as_str(), "release");
+        assert_eq!(by_id.path, world.dotted);
+        assert_eq!(by_id.reference, "release");
+
+        let by_path = manager
+            .resolve_reference(world.dotted.to_str().unwrap(), Some(&scope))
+            .unwrap();
+        assert_eq!(by_path.form, ReferenceForm::Path);
+        assert_eq!(by_path.worktree_id.as_str(), "release");
+
+        let by_name = manager
+            .resolve_reference("release-0.7.0", Some(&scope))
+            .unwrap();
+        assert_eq!(by_name.form, ReferenceForm::DirectoryName);
+        assert_eq!(by_name.worktree_id.as_str(), "release");
+        assert_eq!(by_name.path, world.dotted);
+
+        // A directory name equal to the id is one record named twice, not an ambiguity.
+        let same = manager.resolve_reference("alpha", None).unwrap();
+        assert_eq!(same.form, ReferenceForm::Id);
+        assert_eq!(same.worktree_id.as_str(), "alpha");
+    }
+
+    #[test]
+    fn a_relative_path_resolves_against_the_working_directory() {
+        let world = ReferenceWorld::new();
+        let manager = world.manager(vec![world.record("alpha", &world.alpha, Lifecycle::Active)]);
+        let relative = pathdiff(&world.alpha);
+        let selection = manager
+            .resolve_reference(relative.to_str().unwrap(), None)
+            .unwrap();
+        assert_eq!(selection.form, ReferenceForm::Path);
+        assert_eq!(selection.worktree_id.as_str(), "alpha");
+    }
+
+    /// A relative path from the current directory to `target`, through the filesystem root.
+    fn pathdiff(target: &Path) -> PathBuf {
+        let current = std::fs::canonicalize(std::env::current_dir().unwrap()).unwrap();
+        let mut relative = PathBuf::new();
+        for _ in current.components().skip(1) {
+            relative.push("..");
+        }
+        relative.join(target.strip_prefix("/").unwrap())
+    }
+
+    #[test]
+    fn two_records_sharing_a_directory_name_are_ambiguous() {
+        let world = ReferenceWorld::new();
+        let twin = world.dotted.parent().unwrap().join("alpha");
+        std::fs::create_dir_all(&twin).unwrap();
+        let manager = world.manager(vec![
+            world.record("first", &world.alpha, Lifecycle::Finished),
+            world.record("second", &twin, Lifecycle::Finished),
+        ]);
+
+        let refusal = manager
+            .resolve_reference("alpha", Some(&world.policy()))
+            .unwrap_err();
+        assert_eq!(refusal.code, "ambiguous-worktree-reference");
+        assert!(refusal.message.contains("first"), "{}", refusal.message);
+        assert!(refusal.message.contains("second"), "{}", refusal.message);
+    }
+
+    #[test]
+    fn an_id_and_a_directory_name_naming_different_records_are_ambiguous() {
+        let world = ReferenceWorld::new();
+        let manager = world.manager(vec![
+            world.record("release-0", &world.alpha, Lifecycle::Active),
+            world.record("other", &world.dotted, Lifecycle::Active),
+        ]);
+        // `alpha` is the directory of `release-0` and also, below, the id of another record.
+        let manager_with_id = world.manager(vec![
+            world.record("alpha", &world.dotted, Lifecycle::Active),
+            world.record("named", &world.alpha, Lifecycle::Active),
+        ]);
+        assert_eq!(
+            manager.resolve_reference("alpha", None).unwrap().form,
+            ReferenceForm::DirectoryName
+        );
+        let refusal = manager_with_id
+            .resolve_reference("alpha", None)
+            .unwrap_err();
+        assert_eq!(refusal.code, "ambiguous-worktree-reference");
+        assert!(refusal.message.contains("alpha") && refusal.message.contains("named"));
+    }
+
+    #[test]
+    fn an_unknown_reference_names_the_value() {
+        let world = ReferenceWorld::new();
+        let manager = world.manager(vec![world.record("alpha", &world.alpha, Lifecycle::Active)]);
+        for value in ["missing", "missing-0.1.0", "/no/such/tree", "Upper"] {
+            let refusal = manager.resolve_reference(value, None).unwrap_err();
+            assert_eq!(refusal.code, "unknown-worktree-reference", "{value}");
+            assert!(refusal.message.contains(value), "{}", refusal.message);
+        }
+    }
+
+    #[test]
+    fn a_directory_name_counts_only_records_in_scope_and_never_removed_ones() {
+        let world = ReferenceWorld::new();
+        let elsewhere = world.dotted.parent().unwrap().join("alpha");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let mut outside = world.record("outside", &elsewhere, Lifecycle::Active);
+        outside.repository_root = PathBuf::from("/elsewhere/repo");
+        let removed_path = world.managed.join("repo/gone");
+        let manager = world.manager(vec![
+            world.record("first", &world.alpha, Lifecycle::Active),
+            outside,
+            world.record("gone-tree", &removed_path, Lifecycle::Removed),
+        ]);
+
+        // Out of the policy's workspace, the twin directory name does not count.
+        let selection = manager
+            .resolve_reference("alpha", Some(&world.policy()))
+            .unwrap();
+        assert_eq!(selection.worktree_id.as_str(), "first");
+        assert_eq!(
+            manager.resolve_reference("alpha", None).unwrap_err().code,
+            "ambiguous-worktree-reference"
+        );
+        // A removed record answers to its id only.
+        assert_eq!(
+            manager.resolve_reference("gone", None).unwrap_err().code,
+            "unknown-worktree-reference"
+        );
+        assert_eq!(
+            manager
+                .resolve_reference("gone-tree", None)
+                .unwrap()
+                .worktree_id
+                .as_str(),
+            "gone-tree"
+        );
+    }
+
+    #[test]
+    fn a_record_whose_path_is_gone_still_resolves_by_id() {
+        let world = ReferenceWorld::new();
+        let missing = world.managed.join("repo/missing");
+        let manager = world.manager(vec![world.record("missing", &missing, Lifecycle::Active)]);
+        let ids = manager
+            .resolve_references(
+                &["missing".to_owned(), "missing".to_owned()],
+                Some(&world.policy()),
+            )
+            .unwrap();
+        assert_eq!(ids, vec![WorktreeId::new("missing").unwrap()]);
+    }
+
+    #[test]
+    fn a_tree_argument_keeps_existing_directories_and_resolves_registered_names() {
+        let world = ReferenceWorld::new();
+        let manager = world.manager(vec![
+            world.record("alpha", &world.alpha, Lifecycle::Active),
+            world.record("release", &world.dotted, Lifecycle::Active),
+        ]);
+        // An existing directory that is no registered tree passes through unchanged.
+        assert_eq!(
+            manager.resolve_tree_path(&world.repository).unwrap(),
+            world.repository
+        );
+        assert_eq!(
+            manager.resolve_tree_path(&world.alpha).unwrap(),
+            world.alpha
+        );
+        assert_eq!(
+            manager.resolve_tree_path(Path::new("release")).unwrap(),
+            world.dotted
+        );
+        assert_eq!(
+            manager
+                .resolve_tree_path(Path::new("release-0.7.0"))
+                .unwrap(),
+            world.dotted
+        );
+        let refusal = manager
+            .resolve_tree_path(Path::new("not-registered"))
+            .unwrap_err();
+        assert_eq!(refusal.code, "worktree-not-found");
+        assert!(refusal.message.contains("not-registered"));
+        assert!(
+            refusal
+                .message
+                .contains("neither an existing path nor a registered id or tree directory name")
+        );
+        // An ambiguity is not a missing tree and keeps its own code.
+        let twin = world.repository.parent().unwrap().join("alpha");
+        std::fs::create_dir_all(&twin).unwrap();
+        let ambiguous = world.manager(vec![
+            world.record("first", &world.alpha, Lifecycle::Active),
+            world.record("second", &twin, Lifecycle::Active),
+        ]);
+        assert_eq!(
+            ambiguous
+                .resolve_tree_path(Path::new("alpha"))
+                .unwrap_err()
+                .code,
+            "ambiguous-worktree-reference"
+        );
+    }
+
+    #[test]
+    fn a_dotted_id_is_refused_with_hyphen_guidance() {
+        let refusal = WorktreeId::new("hard-defects-0.7.0").unwrap_err();
+        assert_eq!(refusal.code, "invalid-worktree-id");
+        assert!(refusal.message.contains("hyphens instead of dots"));
     }
 }
