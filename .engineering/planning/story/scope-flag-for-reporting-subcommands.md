@@ -2,7 +2,7 @@
 format: aep.planning-md/3
 id: story:scope-flag-for-reporting-subcommands
 kind: story
-status: active
+status: implemented
 title: gc assesses only the current repository by default
 summary: gc without --id assesses only the records of the repository --repo resolves to; --scope profile keeps the old profile-wide selection
 scope:
@@ -12,10 +12,11 @@ scope:
   path: crates/worktree-cli/tests/gc_scope.rs
 - confidence: cited
   path: crates/worktree/src/lib.rs
-revision: 7
+revision: 8
 transitions:
 - {from: "draft", to: "proposed", at: "2026-10-08T09:10:11Z", actor: "human:timo", revision: 6}
 - {from: "proposed", to: "active", at: "2026-10-08T09:10:11Z", actor: "human:timo", revision: 7}
+- {from: "active", to: "implemented", at: "2026-10-08T09:26:39Z", actor: "human:timo", revision: 8, decided_on: {"recorded":{"test_result":1}}}
 ---
 ## Outcome
 

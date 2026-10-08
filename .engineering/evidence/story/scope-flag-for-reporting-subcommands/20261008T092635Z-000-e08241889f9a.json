@@ -1,0 +1,13 @@
+{
+  "at": "2026-10-08T09:26:35Z",
+  "actor": "human:timo",
+  "artifact": "story:scope-flag-for-reporting-subcommands",
+  "kind": "story",
+  "revision": 7,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "cargo test -p b10x-worktree -p b10x-worktree-cli -p b10x-worktree-domain --locked --no-fail-fast",
+    "reference": "commit 83c7ce7 (wave head): exit 0; 21 suites, 195 passed; gc_scope 4 passed; gc --dry-run here 36.7 s (0.11.0, 9 records) -> 0.04 s (default scope, 0 records)"
+  }
+}

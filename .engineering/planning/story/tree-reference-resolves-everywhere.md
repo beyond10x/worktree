@@ -2,7 +2,7 @@
 format: aep.planning-md/3
 id: story:tree-reference-resolves-everywhere
 kind: story
-status: active
+status: implemented
 title: One tree reference works in finish, gc and reconcile
 summary: finish, discard-cache, archive and the --id of gc and reconcile accept an id, a tree path or a unique tree directory name; finish prints the id
 scope:
@@ -12,10 +12,11 @@ scope:
   path: crates/worktree-cli/tests/tree_reference.rs
 - confidence: cited
   path: crates/worktree/src/lib.rs
-revision: 6
+revision: 7
 transitions:
 - {from: "draft", to: "proposed", at: "2026-10-08T09:10:11Z", actor: "human:timo", revision: 4}
 - {from: "proposed", to: "active", at: "2026-10-08T09:10:11Z", actor: "human:timo", revision: 5}
+- {from: "active", to: "implemented", at: "2026-10-08T09:26:39Z", actor: "human:timo", revision: 7, decided_on: {"recorded":{"test_result":1,"review_outcome":2}}}
 ---
 ## Outcome
 

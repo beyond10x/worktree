@@ -1,0 +1,13 @@
+{
+  "at": "2026-10-08T09:26:35Z",
+  "actor": "human:timo",
+  "artifact": "story:tree-reference-resolves-everywhere",
+  "kind": "story",
+  "revision": 6,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "cargo test -p b10x-worktree -p b10x-worktree-cli -p b10x-worktree-domain --locked --no-fail-fast",
+    "reference": "commit 83c7ce7 (wave head): exit 0; 21 suites, 195 passed; tree_reference 14 passed"
+  }
+}
