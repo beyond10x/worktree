@@ -1,0 +1,45 @@
+domain: worktree.selection
+
+types:
+  # How one tree reference given to `finish`, `discard-cache`, `archive`, `gc --id` or
+  # `reconcile --id` named its registered record. Every command that takes one tree accepts the
+  # same three forms; when two forms name different records the reference is refused as
+  # ambiguous and both ids are listed:
+  #   Id: the value is a registered worktree id.
+  #   Path: the value names a directory whose canonical path is a registered record's path.
+  #   DirectoryName: the value contains no `/` and is the final path component of exactly one
+  #     registered record's path in scope; two or more such records refuse and list their ids.
+  # The worktree id grammar does not change: 1-128 lowercase letters, digits or hyphens. A value
+  # with a dot is never an id, because a registry holding one cannot be loaded by a release
+  # whose grammar refuses it; it can still name a tree as Path or DirectoryName.
+  - name: worktree.selection.ReferenceForm
+    kind: enum
+    variants: [Id, Path, DirectoryName]
+
+  # Which registered records `gc` assesses when no `--id` is given.
+  #   Repository: records whose repository_root is the repository `--repo` resolves to. Default.
+  #   Profile: every record below the selected profile's workspace_root, the behaviour of 0.12.1.
+  # With `--id`, the selection is the named records whatever the scope.
+  - name: worktree.selection.CleanupScope
+    kind: enum
+    variants: [Repository, Profile]
+
+entities:
+  # A report of one resolution, not a persisted lifecycle. The record it names is the existing
+  # registry record (crates/worktree-domain/src/lib.rs, WorktreeRecord). `finish` reports the id
+  # and the path it finished, so its output is a valid `gc --id` value.
+  - name: worktree.selection.TreeSelection
+    identity:
+      name: reference
+      type: String
+    fields:
+      - name: form
+        type: worktree.selection.ReferenceForm
+      - name: worktree_id
+        type: String
+      - name: path
+        type: String
+    lifecycle:
+      initial: Observed
+      states: [Observed]
+      terminal: [Observed]
