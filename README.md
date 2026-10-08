@@ -36,6 +36,9 @@ worktree discard-cache <tree> --dry-run
 worktree finish --discard-cache --archive <tree>
 worktree gc --repo /path/to/repository --dry-run --id <reviewed-id>
 worktree gc --repo /path/to/repository --apply --id <reviewed-id>
+# Archives a remote now fully holds; refused ones say why and are kept.
+worktree prune-archives --repo /path/to/repository --dry-run
+worktree prune-archives --repo /path/to/repository --apply --id <reviewed-archive-directory>
 worktree reconcile --repo /path/to/repository --dry-run
 worktree reconcile --repo /path/to/repository --apply --id <reviewed-id>
 worktree doctor --check
@@ -210,6 +213,33 @@ The bundle's prerequisites are the advertised commits it was cut against, so res
 remote that still has them. Submodules, nested repositories that depend on state outside their
 directory, special files and paths containing a newline are refused as `archive-unsupported-entry`. Every ignored file is archived; there is no
 policy for disposable output yet, so remove build output first.
+
+An archive outlives its tree, and only `worktree prune-archives` deletes one. It lists each archive
+directory below `$XDG_STATE_HOME/worktree/archives/<repository>/` (`<id>` and superseded
+`<id>.superseded-<n>`) as `directory, worktree id, bytes, verdict, reason`, then the totals of bytes
+removable and refused. Without `--id` it assesses the archives whose manifest names the repository
+`--repo` resolves to; `--scope profile` assesses every archive. Files there that are not archive
+directories (a `.tsv`, a `.bundle`) and directories whose name starts with `.` are listed as
+skipped and never deleted. Verdicts are checked in this order:
+
+| Verdict | When |
+|---|---|
+| `InvalidManifest` | `manifest.json` is missing, unreadable or of an unknown format |
+| `UnrecordedContent` | the directory holds an entry the manifest does not name as a regular file |
+| `TreeStillPresent` | the registered tree path exists; the archive may still be its recovery proof |
+| `NestedRepositories` | the archive images a nested repository |
+| `UncommittedState` | the archive holds `dirty.patch` |
+| `RemoteProofUnavailable` | the repository is gone, has no remote, or a remote does not answer |
+| `CommitsNotOnRemote` | HEAD or a unique commit is an ancestor of no freshly advertised ref; a rebased or cherry-picked copy does not count |
+| `Removable` | none of the above |
+
+Dry-run is the default. `--apply` requires `--id <directory>` (or `<repository>/<directory>` when
+two repositories hold the same name) copied from a dry-run. Each is re-assessed immediately before
+deletion; a removable one loses the files its manifest names, then the manifest, then the empty
+directory, never recursively, and prints `removed <directory> <bytes>` and `freed <bytes> bytes`. A
+refused one is kept, its verdict printed, and the run exits non-zero after the others. No flag makes
+a refused archive removable: an archive whose commits no remote holds is the only copy of them, and
+deleting it stays the operator's decision, by hand.
 
 Use `worktree repo list --repo <path>` to inventory linked trees without adopting or deleting them.
 Existing trees only become manager-owned through the explicit `repo adopt` command. Hook integrations

@@ -113,14 +113,28 @@ entities:
   # Without `--id` the selection is worktree.selection.CleanupScope, as for gc: Repository (default)
   # is the archives whose manifest repository_root is the repository `--repo` resolves to; Profile
   # is every archive below the activated profile's archive root.
+  # Archives live at `<archive root>/<repository name>/<directory>`. Every directory there whose
+  # name does not start with `.` is an archive directory and is assessed; a name starting with `.`
+  # (an archive being written) and every file, at either level, is not an archive: it is reported
+  # as skipped with its size and never deleted. In Repository scope the skipped entries reported
+  # are those below `<archive root>/<repository name>/`. `--id` takes `<directory>` or
+  # `<repository name>/<directory>`; a bare directory name two repositories hold is refused as
+  # ambiguous, and a name that is no archive directory is refused.
   - name: worktree.archive.ArchivePruneAssessment
     identity:
       name: archive_directory
       type: String
     fields:
-      - name: worktree_id
+      # Absolute path of the archive directory.
+      - name: path
         type: String
+      # From the manifest; absent when the verdict is InvalidManifest.
+      - name: worktree_id
+        type: Optional<String>
       - name: repository_root
+        type: Optional<String>
+      # Why the verdict was given, in words; for Removable, the refs that hold HEAD.
+      - name: reason
         type: String
       # Bytes of the regular files in the directory.
       - name: bytes

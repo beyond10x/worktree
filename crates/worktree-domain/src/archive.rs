@@ -117,7 +117,8 @@ impl ArchiveManifest {
 
     /// Refuse a manifest whose format does not match what it holds: [`ARCHIVE_FORMAT`] names no
     /// image and [`ARCHIVE_FORMAT_V2`] at least one, each `nested-<n>.tar` in strictly increasing
-    /// path-byte order, with a relative path and at least one entry.
+    /// path-byte order, with a relative path and at least one entry, and whose bundle and
+    /// patch are not [`ARCHIVE_BUNDLE_FILE`] and [`ARCHIVE_PATCH_FILE`].
     pub fn require_format(&self) -> Result<(), Refusal> {
         let invalid = |message: String| Err(Refusal::new("archive-invalid", message));
         if !matches!(self.format.as_str(), ARCHIVE_FORMAT | ARCHIVE_FORMAT_V2) {
@@ -133,6 +134,18 @@ impl ArchiveManifest {
                 self.format,
                 self.nested_repositories.len()
             ));
+        }
+        // Every writer names these exact files; any other name could reach outside the archive.
+        for (recorded, expected) in [
+            (self.bundle.as_ref(), ARCHIVE_BUNDLE_FILE),
+            (self.patch.as_ref(), ARCHIVE_PATCH_FILE),
+        ] {
+            if let Some(recorded) = recorded.filter(|recorded| recorded.file != expected) {
+                return invalid(format!(
+                    "archive file {:?} must be named {expected}",
+                    recorded.file
+                ));
+            }
         }
         let mut previous: Option<&str> = None;
         for (index, image) in self.nested_repositories.iter().enumerate() {
@@ -244,6 +257,340 @@ pub struct ArchiveEvidence {
     pub superseded: Option<PathBuf>,
     /// State no archive can hold that will still make cleanup refuse this tree.
     pub blocker: Option<Refusal>,
+}
+
+impl ArchiveManifest {
+    /// Every file this manifest names inside its archive directory, itself included.
+    pub fn recorded_files(&self) -> Vec<&str> {
+        let mut files = vec![ARCHIVE_MANIFEST_FILE];
+        files.extend(self.bundle.as_ref().map(|file| file.file.as_str()));
+        files.extend(self.patch.as_ref().map(|file| file.file.as_str()));
+        files.extend(
+            self.nested_repositories
+                .iter()
+                .map(|image| image.image.file.as_str()),
+        );
+        files
+    }
+
+    /// HEAD followed by every unique commit, each once: the commits pruning must find on a remote.
+    pub fn recorded_commits(&self) -> Vec<String> {
+        let mut commits = vec![self.head.clone()];
+        for commit in &self.unique_commits {
+            if !commits.contains(commit) {
+                commits.push(commit.clone());
+            }
+        }
+        commits
+    }
+}
+
+/// The verdict `prune-archives` gives one archive directory (`worktree.archive.PruneVerdict`).
+///
+/// Only [`PruneVerdict::Removable`] permits deletion; every other variant is a refusal that names
+/// why, and nothing turns a refusal into a removal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PruneVerdict {
+    /// HEAD and every unique commit are ancestors of a freshly advertised ref, the manifest
+    /// records no patch and no nested repository image, the registered tree path is absent, and
+    /// the directory holds only the files the manifest names.
+    Removable,
+    /// Some recorded commit is an ancestor of no freshly advertised ref; patch equivalence does
+    /// not count.
+    CommitsNotOnRemote,
+    /// The manifest records a patch: the tree's content differed from HEAD.
+    UncommittedState,
+    /// The manifest records at least one nested repository image.
+    NestedRepositories,
+    /// The registered tree path exists; the archive may be its recovery proof.
+    TreeStillPresent,
+    /// The repository is gone, has no configured remote, or no remote answered.
+    RemoteProofUnavailable,
+    /// The directory holds an entry the manifest does not name, or a named entry that is not a
+    /// regular file.
+    UnrecordedContent,
+    /// `manifest.json` is missing, unreadable or of an unknown format.
+    InvalidManifest,
+}
+
+impl PruneVerdict {
+    /// The variant's specification name, as human-readable output prints it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Removable => "Removable",
+            Self::CommitsNotOnRemote => "CommitsNotOnRemote",
+            Self::UncommittedState => "UncommittedState",
+            Self::NestedRepositories => "NestedRepositories",
+            Self::TreeStillPresent => "TreeStillPresent",
+            Self::RemoteProofUnavailable => "RemoteProofUnavailable",
+            Self::UnrecordedContent => "UnrecordedContent",
+            Self::InvalidManifest => "InvalidManifest",
+        }
+    }
+}
+
+/// What one entry directly inside an archive directory is, observed without following links.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArchiveEntryKind {
+    /// A regular file.
+    File,
+    /// A directory.
+    Directory,
+    /// A symbolic link.
+    Symlink,
+    /// Anything else: a fifo, socket or device.
+    Other,
+}
+
+/// One entry directly inside an archive directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArchiveDirectoryEntry {
+    /// Entry name; a name that is not UTF-8 is carried lossily and so names no recorded file.
+    pub name: String,
+    /// What the entry is.
+    pub kind: ArchiveEntryKind,
+    /// Size in bytes for a regular file, otherwise 0.
+    pub bytes: u64,
+}
+
+/// One observation of an archive directory: its parsed manifest and every entry in it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArchiveContents {
+    /// The parsed manifest, or why it is missing, unreadable or of an unknown format.
+    pub manifest: Result<ArchiveManifest, String>,
+    /// Every entry directly in the directory.
+    pub entries: Vec<ArchiveDirectoryEntry>,
+}
+
+impl ArchiveContents {
+    /// Bytes of the regular files directly in the directory.
+    pub fn bytes(&self) -> u64 {
+        self.entries
+            .iter()
+            .filter(|entry| entry.kind == ArchiveEntryKind::File)
+            .map(|entry| entry.bytes)
+            .sum()
+    }
+}
+
+/// What the configured remotes hold of an archive's recorded commits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemoteObservation {
+    /// No remote proof could be observed, and why.
+    Unavailable(String),
+    /// The remotes answered; these recorded commits are held by no freshly advertised ref.
+    Observed {
+        /// Recorded commits that are an ancestor of no freshly advertised ref.
+        not_on_remote: Vec<String>,
+    },
+}
+
+/// The decision for one archive directory, before any deletion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PruneDecision {
+    /// The verdict.
+    pub verdict: PruneVerdict,
+    /// Why, in words.
+    pub reason: String,
+    /// Recorded commits no freshly advertised ref holds; 0 when the remotes were not asked.
+    pub commits_not_on_remote: u64,
+}
+
+/// Decide whether one archive may be pruned, checking in the specification's order:
+/// [`PruneVerdict::InvalidManifest`], [`PruneVerdict::UnrecordedContent`],
+/// [`PruneVerdict::TreeStillPresent`], [`PruneVerdict::NestedRepositories`],
+/// [`PruneVerdict::UncommittedState`], [`PruneVerdict::RemoteProofUnavailable`],
+/// [`PruneVerdict::CommitsNotOnRemote`], else [`PruneVerdict::Removable`].
+///
+/// The observations are injected: `tree_present` reports whether the manifest's registered tree
+/// path exists (an inspection failure is an `Err` and refuses as present), and `remote` is asked
+/// only once every local check has passed.
+pub fn decide_archive_prune(
+    contents: &ArchiveContents,
+    tree_present: impl FnOnce(&ArchiveManifest) -> Result<bool, String>,
+    remote: impl FnOnce(&ArchiveManifest) -> RemoteObservation,
+) -> PruneDecision {
+    let decision = |verdict, reason: String| PruneDecision {
+        verdict,
+        reason,
+        commits_not_on_remote: 0,
+    };
+    let manifest = match &contents.manifest {
+        Ok(manifest) => manifest,
+        Err(reason) => return decision(PruneVerdict::InvalidManifest, reason.clone()),
+    };
+    let recorded = manifest.recorded_files();
+    let mut unrecorded = contents
+        .entries
+        .iter()
+        .filter(|entry| {
+            entry.kind != ArchiveEntryKind::File || !recorded.contains(&entry.name.as_str())
+        })
+        .map(|entry| entry.name.as_str())
+        .collect::<Vec<_>>();
+    if !unrecorded.is_empty() {
+        unrecorded.sort_unstable();
+        return decision(
+            PruneVerdict::UnrecordedContent,
+            format!(
+                "holds {} that the manifest does not record as a file",
+                unrecorded.join(", ")
+            ),
+        );
+    }
+    match tree_present(manifest) {
+        Ok(false) => {}
+        Ok(true) => {
+            return decision(
+                PruneVerdict::TreeStillPresent,
+                format!(
+                    "the registered tree {} still exists",
+                    manifest.path.display()
+                ),
+            );
+        }
+        Err(error) => {
+            return decision(
+                PruneVerdict::TreeStillPresent,
+                format!(
+                    "the registered tree {} could not be observed absent: {error}",
+                    manifest.path.display()
+                ),
+            );
+        }
+    }
+    if !manifest.nested_repositories.is_empty() {
+        let paths = manifest
+            .nested_repositories
+            .iter()
+            .map(|image| image.path.as_str())
+            .collect::<Vec<_>>();
+        return decision(
+            PruneVerdict::NestedRepositories,
+            format!("images nested repositories {}", paths.join(", ")),
+        );
+    }
+    if manifest.patch.is_some() {
+        return decision(
+            PruneVerdict::UncommittedState,
+            "records uncommitted content no remote holds".into(),
+        );
+    }
+    match remote(manifest) {
+        RemoteObservation::Unavailable(reason) => {
+            decision(PruneVerdict::RemoteProofUnavailable, reason)
+        }
+        RemoteObservation::Observed { not_on_remote } if not_on_remote.is_empty() => decision(
+            PruneVerdict::Removable,
+            "every recorded commit is an ancestor of a freshly advertised ref".into(),
+        ),
+        RemoteObservation::Observed { not_on_remote } => PruneDecision {
+            verdict: PruneVerdict::CommitsNotOnRemote,
+            reason: format!(
+                "no freshly advertised ref holds {}; the archive is their only copy",
+                not_on_remote.join(", ")
+            ),
+            commits_not_on_remote: not_on_remote.len() as u64,
+        },
+    }
+}
+
+/// The report of one archive directory assessed by `prune-archives`
+/// (`worktree.archive.ArchivePruneAssessment`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArchivePruneAssessment {
+    /// Directory name: `<id>` or a superseded `<id>.superseded-<n>`.
+    pub archive_directory: String,
+    /// Absolute path of the archive directory.
+    pub path: PathBuf,
+    /// The manifest's worktree id; absent when the manifest is invalid.
+    pub worktree_id: Option<String>,
+    /// The manifest's repository root; absent when the manifest is invalid.
+    pub repository_root: Option<PathBuf>,
+    /// Bytes of the regular files directly in the directory.
+    pub bytes: u64,
+    /// The verdict.
+    pub verdict: PruneVerdict,
+    /// Why, in words; under `--apply`, a deletion that was refused says so here.
+    pub reason: String,
+    /// Recorded commits no freshly advertised ref holds; 0 when the remotes were not asked.
+    pub commits_not_on_remote: u64,
+    /// True only under `--apply`, for a removable archive that was deleted.
+    pub removed: bool,
+}
+
+/// An entry below the archive root that is not an archive directory: reported, never deleted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkippedArchiveEntry {
+    /// Absolute path.
+    pub path: PathBuf,
+    /// Size in bytes for a regular file, otherwise 0.
+    pub bytes: u64,
+}
+
+/// Totals of one `prune-archives` run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ArchivePruneTotals {
+    /// Archive directories assessed.
+    pub archives: u64,
+    /// Bytes of the archives assessed removable.
+    pub removable_bytes: u64,
+    /// Bytes of the archives refused.
+    pub refused_bytes: u64,
+    /// Bytes deleted under `--apply`.
+    pub removed_bytes: u64,
+}
+
+/// The report of one `prune-archives` run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArchivePruneReport {
+    /// Whether this was an `--apply` run.
+    pub applied: bool,
+    /// One assessment per archive directory in the selection.
+    pub archives: Vec<ArchivePruneAssessment>,
+    /// Entries below the archive root that are not archive directories.
+    pub skipped: Vec<SkippedArchiveEntry>,
+    /// Totals over [`Self::archives`].
+    pub totals: ArchivePruneTotals,
+}
+
+impl ArchivePruneReport {
+    /// Build a report and its totals.
+    pub fn new(
+        applied: bool,
+        archives: Vec<ArchivePruneAssessment>,
+        skipped: Vec<SkippedArchiveEntry>,
+    ) -> Self {
+        let mut totals = ArchivePruneTotals {
+            archives: archives.len() as u64,
+            ..ArchivePruneTotals::default()
+        };
+        for item in &archives {
+            if item.removed {
+                totals.removed_bytes += item.bytes;
+            }
+            if item.verdict == PruneVerdict::Removable {
+                totals.removable_bytes += item.bytes;
+            } else {
+                totals.refused_bytes += item.bytes;
+            }
+        }
+        Self {
+            applied,
+            archives,
+            skipped,
+            totals,
+        }
+    }
+
+    /// Archives an `--apply` run selected but did not delete.
+    pub fn refused(&self) -> Vec<&ArchivePruneAssessment> {
+        if !self.applied {
+            return Vec::new();
+        }
+        self.archives.iter().filter(|item| !item.removed).collect()
+    }
 }
 
 #[cfg(test)]
@@ -399,5 +746,136 @@ mod tests {
         let mut value = serde_json::to_value(manifest()).unwrap();
         value["extra"] = serde_json::Value::Bool(true);
         assert!(serde_json::from_value::<ArchiveManifest>(value).is_err());
+    }
+
+    fn file(name: &str) -> ArchiveDirectoryEntry {
+        ArchiveDirectoryEntry {
+            name: name.into(),
+            kind: ArchiveEntryKind::File,
+            bytes: 10,
+        }
+    }
+
+    fn contents(manifest: ArchiveManifest) -> ArchiveContents {
+        let entries = manifest.recorded_files().into_iter().map(file).collect();
+        ArchiveContents {
+            manifest: Ok(manifest),
+            entries,
+        }
+    }
+
+    fn held() -> RemoteObservation {
+        RemoteObservation::Observed {
+            not_on_remote: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn prune_verdicts_are_checked_in_the_specified_order() {
+        let absent = |_: &ArchiveManifest| Ok(false);
+        let unasked = |_: &ArchiveManifest| -> RemoteObservation { panic!("remote asked") };
+
+        let invalid = ArchiveContents {
+            manifest: Err("missing".into()),
+            entries: vec![file("stray")],
+        };
+        let verdict = |contents: &ArchiveContents| {
+            decide_archive_prune(contents, |_| Ok(true), unasked).verdict
+        };
+        assert_eq!(verdict(&invalid), PruneVerdict::InvalidManifest);
+
+        let mut everything = with_images(vec![image(1, "evidence/a")]);
+        everything.patch = Some(ArchiveFile {
+            file: ARCHIVE_PATCH_FILE.into(),
+            sha256: "f".repeat(64),
+            bytes: 1,
+        });
+        let mut stray = contents(everything.clone());
+        stray.entries.push(file("notes.txt"));
+        assert_eq!(verdict(&stray), PruneVerdict::UnrecordedContent);
+        let mut linked = contents(everything.clone());
+        linked.entries[0].kind = ArchiveEntryKind::Symlink;
+        assert_eq!(verdict(&linked), PruneVerdict::UnrecordedContent);
+
+        assert_eq!(
+            verdict(&contents(everything.clone())),
+            PruneVerdict::TreeStillPresent
+        );
+        assert_eq!(
+            decide_archive_prune(
+                &contents(everything.clone()),
+                |_| Err("denied".into()),
+                unasked
+            )
+            .verdict,
+            PruneVerdict::TreeStillPresent
+        );
+        assert_eq!(
+            decide_archive_prune(&contents(everything.clone()), absent, unasked).verdict,
+            PruneVerdict::NestedRepositories
+        );
+        everything.nested_repositories.clear();
+        everything.format = ARCHIVE_FORMAT.into();
+        assert_eq!(
+            decide_archive_prune(&contents(everything.clone()), absent, unasked).verdict,
+            PruneVerdict::UncommittedState
+        );
+        everything.patch = None;
+        assert_eq!(
+            decide_archive_prune(&contents(everything.clone()), absent, |_| {
+                RemoteObservation::Unavailable("offline".into())
+            })
+            .verdict,
+            PruneVerdict::RemoteProofUnavailable
+        );
+        let missing = decide_archive_prune(&contents(everything.clone()), absent, |manifest| {
+            RemoteObservation::Observed {
+                not_on_remote: manifest.recorded_commits(),
+            }
+        });
+        assert_eq!(missing.verdict, PruneVerdict::CommitsNotOnRemote);
+        assert_eq!(missing.commits_not_on_remote, 1);
+        assert_eq!(
+            decide_archive_prune(&contents(everything), absent, |_| held()).verdict,
+            PruneVerdict::Removable
+        );
+    }
+
+    #[test]
+    fn recorded_commits_start_with_head_and_hold_each_commit_once() {
+        let mut manifest = manifest();
+        manifest.unique_commits = vec!["a".repeat(40), "b".repeat(40)];
+        assert_eq!(
+            manifest.recorded_commits(),
+            vec!["a".repeat(40), "b".repeat(40)]
+        );
+    }
+
+    #[test]
+    fn report_totals_split_removable_and_refused_bytes() {
+        let item = |verdict, bytes, removed| ArchivePruneAssessment {
+            archive_directory: "tree".into(),
+            path: "/archives/repo/tree".into(),
+            worktree_id: Some("tree".into()),
+            repository_root: None,
+            bytes,
+            verdict,
+            reason: String::new(),
+            commits_not_on_remote: 0,
+            removed,
+        };
+        let report = ArchivePruneReport::new(
+            true,
+            vec![
+                item(PruneVerdict::Removable, 5, true),
+                item(PruneVerdict::CommitsNotOnRemote, 7, false),
+            ],
+            Vec::new(),
+        );
+        assert_eq!(report.totals.archives, 2);
+        assert_eq!(report.totals.removable_bytes, 5);
+        assert_eq!(report.totals.refused_bytes, 7);
+        assert_eq!(report.totals.removed_bytes, 5);
+        assert_eq!(report.refused().len(), 1);
     }
 }

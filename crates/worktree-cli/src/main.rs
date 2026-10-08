@@ -50,6 +50,8 @@ enum Command {
     Sweep(SweepArgs),
     /// Assess or safely remove finished and expired worktrees.
     Gc(GcArgs),
+    /// List archives with their size and verdict; delete only reviewed ones a remote fully holds.
+    PruneArchives(PruneArchivesArgs),
     /// Reconcile interrupted provisioning, adopted paths, and missing records.
     Reconcile(ReconcileArgs),
     /// Check configuration, registry and Git prerequisites.
@@ -173,6 +175,28 @@ struct GcArgs {
     #[arg(long, value_enum, default_value_t = GcScope::Repo)]
     scope: GcScope,
     /// Apply eligible removals. Without this flag, GC is a dry-run.
+    #[arg(long, conflicts_with = "dry_run")]
+    apply: bool,
+    /// Explicitly document dry-run intent.
+    #[arg(long)]
+    dry_run: bool,
+}
+
+#[derive(Debug, Args)]
+struct PruneArchivesArgs {
+    /// Repository used to select its activated workspace policy and, by default, its archives.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Archive directory reviewed in a dry-run: `<directory>` or `<repository>/<directory>`;
+    /// repeat for multiple archives. Required with --apply.
+    #[arg(long = "id")]
+    ids: Vec<String>,
+    /// Archives assessed without `--id`: those whose manifest names the repository `--repo`
+    /// resolves to, or every archive below the archive root. `--id` names archives whatever the
+    /// scope.
+    #[arg(long, value_enum, default_value_t = GcScope::Repo)]
+    scope: GcScope,
+    /// Delete the selected archives that are removable. Without this flag nothing is deleted.
     #[arg(long, conflicts_with = "dry_run")]
     apply: bool,
     /// Explicitly document dry-run intent.
@@ -400,6 +424,7 @@ fn run(cli: &Cli) -> Result<()> {
         Command::Sweep(args) => sweep(args, cli.json),
         Command::Archive(args) => archive(args, cli.json),
         Command::Gc(args) => gc(args, cli.json),
+        Command::PruneArchives(args) => prune_archives(args, cli.json),
         Command::Reconcile(args) => reconcile(args, cli.json),
         Command::Doctor { check } => doctor(*check, cli.json),
         Command::Repo { command } => repo(command, cli.json),
@@ -894,6 +919,82 @@ fn gc(args: &GcArgs, json: bool) -> Result<()> {
     )
 }
 
+fn prune_archives(args: &PruneArchivesArgs, json: bool) -> Result<()> {
+    if args.apply && args.ids.is_empty() {
+        return Err(anyhow::Error::new(Refusal::new(
+            "explicit-archive-selection-required",
+            "prune-archives --apply requires at least one archive directory reviewed in a \
+             dry-run, named with --id",
+        )));
+    }
+    let repository = ProcessGit
+        .repository_snapshot(&args.repo)
+        .map_err(anyhow::Error::new)?;
+    let config =
+        load_config(&config_path().map_err(anyhow::Error::new)?).map_err(anyhow::Error::new)?;
+    resolve_policy(&config, &repository.root).map_err(anyhow::Error::new)?;
+    let report = manager()?
+        .prune_archives(&repository.root, args.scope.into(), &args.ids, args.apply)
+        .map_err(anyhow::Error::new)?;
+    emit_success(json, CLI_PROTOCOL_VERSION, &report, || {
+        prune_archives_lines(&report)
+    })?;
+    let refused = report.refused();
+    if refused.is_empty() {
+        return Ok(());
+    }
+    Err(anyhow::Error::new(Refusal::new(
+        "archive-prune-refused",
+        format!(
+            "kept {}",
+            refused
+                .iter()
+                .map(|item| format!("{} ({})", item.archive_directory, item.verdict.name()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    )))
+}
+
+fn prune_archives_lines(report: &b10x_worktree_domain::ArchivePruneReport) -> String {
+    let mut lines = Vec::new();
+    for item in &report.archives {
+        lines.push(format!(
+            "{}\t{}\t{}\t{}\t{}",
+            item.archive_directory,
+            item.worktree_id.as_deref().unwrap_or("-"),
+            item.bytes,
+            item.verdict.name(),
+            item.reason
+        ));
+        if item.removed {
+            lines.push(format!("removed {} {}", item.archive_directory, item.bytes));
+        }
+    }
+    for entry in &report.skipped {
+        lines.push(format!(
+            "skipped {}\t{}\tnot an archive directory; never deleted",
+            entry.path.display(),
+            entry.bytes
+        ));
+    }
+    let totals = &report.totals;
+    lines.push(format!(
+        "{} archive(s): {} bytes removable, {} bytes refused",
+        totals.archives, totals.removable_bytes, totals.refused_bytes
+    ));
+    if report.applied {
+        lines.push(format!("freed {} bytes", totals.removed_bytes));
+    } else {
+        lines.push(
+            "Nothing was deleted; pass reviewed directories to `worktree prune-archives --apply \
+             --id <directory>`."
+                .into(),
+        );
+    }
+    lines.join("\n")
+}
+
 fn reconcile(args: &ReconcileArgs, json: bool) -> Result<()> {
     if args.apply && args.ids.is_empty() {
         return Err(anyhow!(
@@ -1367,6 +1468,7 @@ One tree reference works in `finish`, `discard-cache`, `archive`, `gc --id` and 
 - Only once you have established that such a record's recorded commit is gone for good, abandon it with `worktree reconcile --repo <path> --apply --id <reviewed-id> --acknowledge-unrecoverable <recorded-commit>`. That acknowledgement asserts one exact commit named by the immediately preceding dry-run; the command still checks it and refuses while any local branch, tag, remote-tracking ref, or remote advertisement contains it. It deletes nothing from disk or from Git, and records the tombstone with no recovery proof, because there is none to record.
 - A record whose repository was deleted (its root is gone, or has no `.git`) is reported as `repository-missing`, naming the repository, the tree path and the recorded commit. Git cannot check anything for it, so the dry-run's own `--acknowledge-unrecoverable <recorded-commit>` apply, run from any live repository of the same workspace as `--repo`, is the only way to retire it; select it with `--id`. It is refused as `worktree-path-exists` while the tree path, or a relocation or removal intent's path, still exists: deal with that tree yourself first. Never recreate the repository just to make reconciliation run.
 - An archive outlives the tree it retired. Restore it from a `--no-checkout` clone that has the advertised refs: first write `* -text -eol -filter -ident -working-tree-encoding` to `.git/info/attributes` so that attributes cannot rewrite the archived bytes, then `git fetch <archive>/commits.bundle refs/worktree-archive/head:refs/heads/<name>`, and run both `switch <name>` and, when the archive has one, `apply --binary --whitespace=nowarn <archive>/dirty.patch` as `git -c core.autocrlf=false -c core.fileMode=true -c core.symlinks=true …`. Never use `--attr-source` for this: Git 2.55 `apply` crashes with it. Restore each `nested-<n>.tar` with `tar -xpf <archive>/nested-<n>.tar -C <restored tree>`; it recreates the nested repository with its committed, staged, unstaged, untracked and stashed state, permission bits included. Never delete an archive to make GC pass; `archive-digest-mismatch` and `archive-incomplete` mean it no longer proves recovery.
+- Reclaim archive space only with `worktree prune-archives --repo <primary> --dry-run` (add `--scope profile` for every archive). It lists each archive directory with its bytes and verdict; only `Removable` (the tree is gone, no `dirty.patch`, no nested image, nothing the manifest does not name, and HEAD and every unique commit are ancestors of a freshly advertised ref; a rebased copy does not count) may be deleted, with `worktree prune-archives --repo <primary> --apply --id <reviewed-directory>`. Every other verdict (`CommitsNotOnRemote`, `UncommittedState`, `NestedRepositories`, `TreeStillPresent`, `RemoteProofUnavailable`, `UnrecordedContent`, `InvalidManifest`) is kept, and no flag overrides it; deleting such an archive by hand loses the only copy of its work and is the operator's decision, never an agent's. Loose files in the archive root are listed as skipped and never deleted.
 - `worktree-hidden-state` (assume-unchanged or skip-worktree entries, staged content only the index holds, a nested `.git` no archive images) and `worktree-local-refs` (refs under `refs/worktree/`, `refs/bisect/`, `refs/rewritten/`) retain a tree whether or not it is archived, because Git status does not show that state and removal would destroy it. Resolve the named state yourself; never clear it just to make GC pass.
 - Run `worktree doctor --check` for prerequisites and configuration. It exits non-zero and names each failure, including `no active profile` when no workspace profile is activated.
 - Only after a human explicitly decides an existing linked tree should become manager-owned, run `worktree repo adopt --repo <primary> --path <linked-tree> --id <stable-id> --purpose <purpose>`. Then review `reconcile --dry-run` and use exact-id apply only if migration is intended.
@@ -1514,6 +1616,10 @@ mod tests {
         assert!(markdown.contains("ambiguous-worktree-reference"));
         assert!(markdown.contains("`unknown-worktree-id` when it is a well-formed id"));
         assert!(markdown.contains("`finished <id> <path>`"));
+        assert!(markdown.contains(
+            "worktree prune-archives --repo <primary> --apply --id <reviewed-directory>"
+        ));
+        assert!(markdown.contains("no flag overrides it"));
         assert!(interface.contains("$worktree"));
         assert!(interface.contains("Generated by `worktree skill`"));
     }

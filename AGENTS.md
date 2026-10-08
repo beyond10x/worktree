@@ -39,7 +39,17 @@ independent policy: every decision must come from the public façade.
   fingerprint, whether or not Git reports it dirty; remote refs never cover uncommitted state. Such
   a tree is returned to HEAD by resetting the index, then restoring or deleting each file only after
   re-hashing it against the archive, before the non-forced removal. Archiving never modifies the
-  tree, and no command deletes an archive.
+  tree, and only `prune-archives --apply` deletes an archive, and only under its rule.
+- `prune-archives --apply` deletes only archive directories named by exact `--id`, each
+  re-assessed immediately before deletion and deleted only when `Removable`: a valid manifest,
+  nothing in the directory the manifest does not name as a regular file, the registered tree path
+  absent, no nested repository image, no patch, and HEAD and every unique commit an ancestor of a
+  ref freshly advertised by a configured remote of the manifest's repository (no local ref,
+  replacement or graft counts; patch equivalence does not count). Offline, a missing repository or
+  no remote refuses. It deletes the files the manifest names, then the manifest, then the empty
+  directory without recursion. No flag, environment variable or configuration makes a refused
+  archive removable, and files below the archive root that are not archive directories are never
+  deleted.
 - A nested repository (Git lists it only as `<path>/`, and its `.git` is a real directory) is
   archived as a byte image, `nested-<n>.tar`, whose canonical listing's SHA-256 is recorded; the
   image read back, and the root on disk before and after writing, must give that fingerprint.

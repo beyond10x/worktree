@@ -3,7 +3,8 @@
 use b10x_worktree::GitPort;
 #[cfg(unix)]
 use b10x_worktree_domain::{
-    ArchiveEvidence, ArchiveReference, ArchiveRequest, ArchiveStateCheck, WorktreeRecord,
+    ArchiveContents, ArchiveEvidence, ArchiveManifest, ArchiveReference, ArchiveRequest,
+    ArchiveStateCheck, WorktreeRecord,
 };
 use b10x_worktree_domain::{
     CacheClassification, CreatePlan, DiscoveredWorktree, RecoveryEvidence, RecoveryKind, Refusal,
@@ -903,6 +904,51 @@ impl GitPort for ProcessGit {
         Self::observe_recovery(repository, head).map(|(refs, _)| refs)
     }
 
+    fn commits_not_on_remote(
+        &self,
+        repository: &Path,
+        commits: &[String],
+    ) -> Result<Vec<String>, Refusal> {
+        if Self::remote_names(repository)?.is_empty() {
+            return Err(Refusal::new(
+                "no-remote-configured",
+                format!("{} has no configured remote", repository.display()),
+            ));
+        }
+        for commit in commits {
+            Self::validate_object_id(commit)?;
+        }
+        // The removal proof's own observation, anchored at the first recorded commit present
+        // here: it refreshes every remote's advertisement and confirms the tips it reports.
+        let mut anchor = None;
+        for commit in commits {
+            if Self::commitish_exists(repository, commit)? {
+                anchor = Some(commit);
+                break;
+            }
+        }
+        let Some(anchor) = anchor else {
+            return Ok(commits.to_vec());
+        };
+        let (_, tips) = Self::observe_recovery(repository, anchor)?;
+        let mut missing = Vec::new();
+        for commit in commits {
+            let mut held = false;
+            if Self::commitish_exists(repository, commit)? {
+                for tip in tips.keys() {
+                    if Self::contains_commit(repository, commit, tip)? {
+                        held = true;
+                        break;
+                    }
+                }
+            }
+            if !held {
+                missing.push(commit.clone());
+            }
+        }
+        Ok(missing)
+    }
+
     fn recovery_evidence(
         &self,
         repository: &Path,
@@ -1071,6 +1117,16 @@ impl GitPort for ProcessGit {
         head: &str,
     ) -> Result<(), Refusal> {
         archive::discard(record, archive, head)
+    }
+
+    #[cfg(unix)]
+    fn read_archive_contents(&self, archive: &Path) -> Result<ArchiveContents, Refusal> {
+        archive::contents(archive)
+    }
+
+    #[cfg(unix)]
+    fn delete_archive(&self, archive: &Path, manifest: &ArchiveManifest) -> Result<u64, Refusal> {
+        archive::delete(archive, manifest)
     }
 
     fn list_worktrees(&self, repository: &Path) -> Result<Vec<DiscoveredWorktree>, Refusal> {
