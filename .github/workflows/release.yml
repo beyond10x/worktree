@@ -109,8 +109,8 @@ jobs:
           sha256sum worktree-*.tar.gz > SHA256SUMS
           sha256sum --check SHA256SUMS
           cat SHA256SUMS
-      # A release written by hand before the tag keeps its notes; otherwise the annotated tag's
-      # message becomes them. Either way the archives are attached, idempotently.
+      # A release written by hand before the tag keeps its notes; otherwise the tag's dated
+      # CHANGELOG.md section becomes them. Either way the archives are attached, idempotently.
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
@@ -118,7 +118,16 @@ jobs:
           set -euo pipefail
           if ! gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
             notes="${RUNNER_TEMP}/notes.md"
-            git for-each-ref --format='%(contents)' "refs/tags/$GITHUB_REF_NAME" > "$notes"
+            awk -v heading="## ${GITHUB_REF_NAME} — " '
+              index($0, heading) == 1 { found = 1; next }
+              found && /^## / { exit }
+              found { lines[++n] = $0 }
+              END {
+                first = 1; while (first <= n && lines[first] ~ /^[[:space:]]*$/) first++
+                last = n; while (last >= first && lines[last] ~ /^[[:space:]]*$/) last--
+                for (i = first; i <= last; i++) print lines[i]
+              }' CHANGELOG.md > "$notes"
+            test -s "$notes" || { echo "::error::CHANGELOG.md has no ${GITHUB_REF_NAME} notes" >&2; exit 1; }
             gh release create "$GITHUB_REF_NAME" --verify-tag --title "Worktree $GITHUB_REF_NAME" --notes-file "$notes"
           fi
           gh release upload "$GITHUB_REF_NAME" dist/* --clobber
