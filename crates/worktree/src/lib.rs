@@ -1,11 +1,13 @@
 //! Embeddable lifecycle service. The policy engine depends only on injected ports.
 
 use b10x_worktree_domain::{
-    ArchiveEvidence, ArchiveReference, ArchiveRequest, ArchiveStateCheck, CacheClassification,
-    CacheDiscard, CleanupAssessment, CreatePlan, CreateRequest, DiscoveredWorktree, GitRevision,
-    Lifecycle, OperationEvidence, ReconciliationAction, ReconciliationAssessment, RecoveryEvidence,
-    RecoveryKind, RecoveryProof, Refusal, RelocationIntent, RemovalIntent, RepositorySnapshot,
-    SweepItem, WorkspacePolicy, WorktreeId, WorktreeRecord, WorktreeSnapshot, require_child,
+    ArchiveContents, ArchiveEvidence, ArchiveManifest, ArchivePruneAssessment, ArchivePruneReport,
+    ArchiveReference, ArchiveRequest, ArchiveStateCheck, CacheClassification, CacheDiscard,
+    CleanupAssessment, CreatePlan, CreateRequest, DiscoveredWorktree, GitRevision, Lifecycle,
+    OperationEvidence, PruneVerdict, ReconciliationAction, ReconciliationAssessment,
+    RecoveryEvidence, RecoveryKind, RecoveryProof, Refusal, RelocationIntent, RemoteObservation,
+    RemovalIntent, RepositorySnapshot, SkippedArchiveEntry, SweepItem, WorkspacePolicy, WorktreeId,
+    WorktreeRecord, WorktreeSnapshot, decide_archive_prune, require_child,
 };
 use std::path::{Path, PathBuf};
 
@@ -206,6 +208,35 @@ pub trait GitPort: Send + Sync {
     /// assessed through Git. The default never observes an absent repository.
     fn repository_absent(&self, _repository: &Path) -> Result<bool, Refusal> {
         Ok(false)
+    }
+    /// Refresh advertisements and return which of `commits` no freshly advertised ref holds by
+    /// ancestry, using the same advertised-ref observation the removal proof uses. Patch
+    /// equivalence never counts. Refuses when no remote is configured or a remote does not
+    /// answer. The default refuses.
+    fn commits_not_on_remote(
+        &self,
+        repository: &Path,
+        _commits: &[String],
+    ) -> Result<Vec<String>, Refusal> {
+        Err(Refusal::new(
+            "remote-proof-unsupported",
+            format!(
+                "this Git adapter cannot observe the remotes of {}",
+                repository.display()
+            ),
+        ))
+    }
+    /// Observe one archive directory: its parsed manifest and every entry directly in it, links
+    /// not followed. The default refuses.
+    fn read_archive_contents(&self, archive: &Path) -> Result<ArchiveContents, Refusal> {
+        Err(archive_unsupported(archive))
+    }
+    /// Delete an archive assessed removable: each file `manifest` names, then the manifest, then
+    /// the empty directory, never recursively. The manifest on disk must still be `manifest`, and
+    /// an entry that appeared since refuses and is kept. Returns the bytes deleted. The default
+    /// refuses.
+    fn delete_archive(&self, archive: &Path, _manifest: &ArchiveManifest) -> Result<u64, Refusal> {
+        Err(archive_unsupported(archive))
     }
 }
 
@@ -561,6 +592,166 @@ where
         };
         self.git
             .verify_archived_state(record, &archive, &snapshot.head)
+    }
+
+    /// Assess every archive in scope and, with `apply`, delete the selected ones a remote fully
+    /// holds (`worktree.archive.ArchivePruneAssessment`).
+    ///
+    /// Without `selected`, `scope` chooses the archives: [`CleanupScope::Repository`] those whose
+    /// manifest names the canonical `repository`, [`CleanupScope::Profile`] every archive below
+    /// the archive root. `selected` names archive directories as `<directory>` or
+    /// `<repository name>/<directory>` whatever the scope; `apply` requires it. Each selected
+    /// archive is assessed immediately before deletion and deleted only when
+    /// [`b10x_worktree_domain::PruneVerdict::Removable`]; nothing makes a refusal removable.
+    pub fn prune_archives(
+        &self,
+        repository: &Path,
+        scope: CleanupScope,
+        selected: &[String],
+        apply: bool,
+    ) -> Result<ArchivePruneReport, Refusal> {
+        if apply && selected.is_empty() {
+            return Err(Refusal::new(
+                "explicit-archive-selection-required",
+                "prune-archives --apply requires at least one archive directory reviewed in a \
+                 dry-run, named with --id",
+            ));
+        }
+        let root = self.archive_root.as_ref().ok_or_else(|| {
+            Refusal::new(
+                "archive-root-unconfigured",
+                "this manager has no archive root",
+            )
+        })?;
+        let repository = std::fs::canonicalize(repository).map_err(|error| {
+            Refusal::new(
+                "repository-not-found",
+                format!("{}: {error}", repository.display()),
+            )
+        })?;
+        let repository_name = repository.file_name().map(std::ffi::OsStr::to_os_string);
+        let listing = list_archive_root(root)?;
+        let skipped = listing
+            .skipped
+            .into_iter()
+            .filter(|(owner, _)| match scope {
+                CleanupScope::Profile => true,
+                CleanupScope::Repository => {
+                    owner.is_some() && owner.as_deref() == repository_name.as_deref()
+                }
+            })
+            .map(|(_, entry)| entry)
+            .collect::<Vec<_>>();
+
+        let mut chosen: Vec<&ArchiveDirectory> = Vec::new();
+        if selected.is_empty() {
+            for directory in &listing.archives {
+                let in_scope = match scope {
+                    CleanupScope::Profile => true,
+                    CleanupScope::Repository => self
+                        .read_archive(&directory.path)
+                        .manifest
+                        .as_ref()
+                        .is_ok_and(|manifest| manifest.repository_root == repository),
+                };
+                if in_scope {
+                    chosen.push(directory);
+                }
+            }
+        } else {
+            for reference in selected {
+                let directory = select_archive(&listing.archives, reference)?;
+                if !chosen.iter().any(|item| item.path == directory.path) {
+                    chosen.push(directory);
+                }
+            }
+        }
+
+        let mut archives = Vec::with_capacity(chosen.len());
+        for directory in chosen {
+            archives.push(self.assess_archive_prune(directory, apply)?);
+        }
+        Ok(ArchivePruneReport::new(apply, archives, skipped))
+    }
+
+    /// Assess one archive directory now and, with `apply`, delete it when removable.
+    fn assess_archive_prune(
+        &self,
+        directory: &ArchiveDirectory,
+        apply: bool,
+    ) -> Result<ArchivePruneAssessment, Refusal> {
+        let contents = self.read_archive(&directory.path);
+        let decision = decide_archive_prune(
+            &contents,
+            |manifest| {
+                path_absent(&manifest.path)
+                    .map(|absent| !absent)
+                    .map_err(|error| error.message)
+            },
+            |manifest| self.remote_observation(manifest),
+        );
+        let manifest = contents.manifest.as_ref().ok();
+        let mut assessment = ArchivePruneAssessment {
+            archive_directory: directory.name.clone(),
+            path: directory.path.clone(),
+            worktree_id: manifest.map(|manifest| manifest.id.as_str().to_owned()),
+            repository_root: manifest.map(|manifest| manifest.repository_root.clone()),
+            bytes: contents.bytes(),
+            verdict: decision.verdict,
+            reason: decision.reason,
+            commits_not_on_remote: decision.commits_not_on_remote,
+            removed: false,
+        };
+        if apply && assessment.verdict == PruneVerdict::Removable {
+            let manifest = manifest.ok_or_else(|| {
+                Refusal::new(
+                    "archive-invalid",
+                    "a removable archive has a manifest; refusing to delete without one",
+                )
+            })?;
+            match self.git.delete_archive(&directory.path, manifest) {
+                Ok(bytes) => {
+                    assessment.bytes = bytes;
+                    assessment.removed = true;
+                }
+                Err(refusal) => {
+                    assessment.reason = format!("deletion refused: {refusal}");
+                }
+            }
+        }
+        Ok(assessment)
+    }
+
+    /// Observe one archive directory; a directory that cannot be read is an invalid manifest.
+    fn read_archive(&self, archive: &Path) -> ArchiveContents {
+        self.git
+            .read_archive_contents(archive)
+            .unwrap_or_else(|refusal| ArchiveContents {
+                manifest: Err(refusal.to_string()),
+                entries: Vec::new(),
+            })
+    }
+
+    /// What the configured remotes of the manifest's repository hold of its recorded commits.
+    fn remote_observation(&self, manifest: &ArchiveManifest) -> RemoteObservation {
+        let repository = manifest.repository_root.as_path();
+        match self.git.repository_absent(repository) {
+            Ok(false) => {}
+            Ok(true) => {
+                return RemoteObservation::Unavailable(format!(
+                    "repository {} is gone",
+                    repository.display()
+                ));
+            }
+            Err(refusal) => return RemoteObservation::Unavailable(refusal.to_string()),
+        }
+        match self
+            .git
+            .commits_not_on_remote(repository, &manifest.recorded_commits())
+        {
+            Ok(not_on_remote) => RemoteObservation::Observed { not_on_remote },
+            Err(refusal) => RemoteObservation::Unavailable(refusal.to_string()),
+        }
     }
 
     /// Access the registry port for status-oriented integrations.
@@ -2422,6 +2613,113 @@ where
         };
         self.registry.complete_removal(&intent, &evidence)?;
         Ok(evidence)
+    }
+}
+
+/// One archive directory, `<archive root>/<repository name>/<name>`.
+#[derive(Debug, Clone)]
+struct ArchiveDirectory {
+    repository: std::ffi::OsString,
+    name: String,
+    path: PathBuf,
+}
+
+/// The archive root's archive directories, and every other entry, each with the repository
+/// directory it sits in (`None` directly in the root).
+struct ArchiveRootListing {
+    archives: Vec<ArchiveDirectory>,
+    skipped: Vec<(Option<std::ffi::OsString>, SkippedArchiveEntry)>,
+}
+
+/// List `<root>/<repository name>/<directory>` without following links. Directories whose name
+/// starts with `.` are archives being written, and files are not archives: both are skipped.
+fn list_archive_root(root: &Path) -> Result<ArchiveRootListing, Refusal> {
+    fn entries(directory: &Path) -> Result<Vec<(std::ffi::OsString, std::fs::Metadata)>, Refusal> {
+        let failed = |error: std::io::Error| {
+            Refusal::new(
+                "archive-root-invalid",
+                format!("{}: {error}", directory.display()),
+            )
+        };
+        let mut entries = Vec::new();
+        for entry in std::fs::read_dir(directory).map_err(failed)? {
+            let entry = entry.map_err(failed)?;
+            let metadata = std::fs::symlink_metadata(entry.path()).map_err(failed)?;
+            entries.push((entry.file_name(), metadata));
+        }
+        entries.sort_by(|left, right| left.0.cmp(&right.0));
+        Ok(entries)
+    }
+    let skip = |path: PathBuf, metadata: &std::fs::Metadata| SkippedArchiveEntry {
+        path,
+        bytes: if metadata.is_file() {
+            metadata.len()
+        } else {
+            0
+        },
+    };
+    let hidden = |name: &std::ffi::OsStr| name.as_encoded_bytes().starts_with(b".");
+    let mut listing = ArchiveRootListing {
+        archives: Vec::new(),
+        skipped: Vec::new(),
+    };
+    if path_absent(root)? {
+        return Ok(listing);
+    }
+    for (repository, metadata) in entries(root)? {
+        let repository_path = root.join(&repository);
+        if !metadata.is_dir() || hidden(&repository) {
+            listing
+                .skipped
+                .push((None, skip(repository_path, &metadata)));
+            continue;
+        }
+        for (name, metadata) in entries(&repository_path)? {
+            let path = repository_path.join(&name);
+            match name.to_str() {
+                Some(text) if metadata.is_dir() && !hidden(&name) => {
+                    listing.archives.push(ArchiveDirectory {
+                        repository: repository.clone(),
+                        name: text.to_owned(),
+                        path,
+                    });
+                }
+                _ => listing
+                    .skipped
+                    .push((Some(repository.clone()), skip(path, &metadata))),
+            }
+        }
+    }
+    Ok(listing)
+}
+
+/// Resolve one `--id` value: `<directory>` or `<repository name>/<directory>`.
+fn select_archive<'a>(
+    archives: &'a [ArchiveDirectory],
+    reference: &str,
+) -> Result<&'a ArchiveDirectory, Refusal> {
+    let matches = archives
+        .iter()
+        .filter(|archive| match reference.split_once('/') {
+            Some((repository, name)) => {
+                archive.repository == std::ffi::OsStr::new(repository) && archive.name == name
+            }
+            None => archive.name == reference,
+        })
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [archive] => Ok(archive),
+        [] => Err(Refusal::new(
+            "unknown-archive-directory",
+            format!("`{reference}` names no archive directory below the archive root"),
+        )),
+        _ => Err(Refusal::new(
+            "ambiguous-archive-directory",
+            format!(
+                "`{reference}` names archives of {} repositories; pass <repository>/{reference}",
+                matches.len()
+            ),
+        )),
     }
 }
 

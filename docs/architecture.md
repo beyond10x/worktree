@@ -117,6 +117,47 @@ The pack check indexes the bundle in an isolated bare repository and compares it
 `rev-list --objects` over the same range, because `git bundle verify` and the bundle's head list
 both pass for a bundle that names HEAD but omits its parents' objects.
 
+## Archive pruning
+
+`prune-archives` is the one command that deletes an archive. The decision is the domain's
+I/O-free `decide_archive_prune`, which takes one observation of the directory (its parsed
+manifest and every entry, links not followed) and two injected observations, whether the
+registered tree path exists and what the remotes hold, and checks in a fixed order. The remotes
+are asked only once every local check has passed.
+
+```mermaid
+flowchart LR
+    dir["archive directory<br/>&lt;root&gt;/&lt;repository&gt;/&lt;name&gt;"] --> manifest{"manifest valid?"}
+    manifest -->|no| invalid["InvalidManifest"]
+    manifest -->|yes| recorded{"only files the<br/>manifest names?"}
+    recorded -->|no| unrecorded["UnrecordedContent"]
+    recorded -->|yes| tree{"registered tree<br/>path absent?"}
+    tree -->|no| present["TreeStillPresent"]
+    tree -->|yes| nested{"no nested<br/>repository image?"}
+    nested -->|no| images["NestedRepositories"]
+    nested -->|yes| patch{"no dirty.patch?"}
+    patch -->|no| dirty["UncommittedState"]
+    patch -->|yes| remote{"remotes configured<br/>and answering?"}
+    remote -->|no| offline["RemoteProofUnavailable"]
+    remote -->|yes| held{"HEAD and every unique commit an<br/>ancestor of a freshly advertised ref?"}
+    held -->|no| missing["CommitsNotOnRemote"]
+    held -->|yes| removable["Removable"]
+```
+
+The remote observation is the port's `commits_not_on_remote`. The Git adapter anchors the removal
+proof's own advertised-ref observation at the first recorded commit present locally, then asks plain
+ancestry, with replacement objects and grafts disabled, of each recorded commit against the
+confirmed tips. Patch equivalence, which removal accepts, is deliberately not consulted: an archive
+whose commits are on a remote only as rebased copies is the sole copy of those commit ids.
+
+The façade lists the archive root without following links. A directory below
+`<root>/<repository>/` whose name does not start with `.` is an archive directory; every other
+entry is reported as skipped. `--apply` takes exact directory names, re-reads and re-assesses each
+immediately before deleting it, and the adapter's `delete_archive` then requires the manifest on
+disk to equal the assessed one, removes each recorded regular file, the manifest last, and finally
+the directory with a non-recursive `remove_dir`, so an entry that appeared meanwhile is kept and
+refuses.
+
 ## Creation and membership
 
 Activated workspace and managed roots are canonical and disjoint, and profile names are a single

@@ -13,8 +13,9 @@ use crate::{AdvertisedTips, ProcessGit};
 use b10x_worktree::GitPort as _;
 use b10x_worktree_domain::{
     ARCHIVE_BUNDLE_FILE, ARCHIVE_HEAD_REF, ARCHIVE_MANIFEST_FILE, ARCHIVE_PATCH_FILE,
-    ArchiveEvidence, ArchiveFile, ArchiveManifest, ArchiveReference, ArchiveRequest,
-    ArchiveStateCheck, NestedRepositoryImage, Refusal, WorktreeRecord, archive_image_file,
+    ArchiveContents, ArchiveDirectoryEntry, ArchiveEntryKind, ArchiveEvidence, ArchiveFile,
+    ArchiveManifest, ArchiveReference, ArchiveRequest, ArchiveStateCheck, NestedRepositoryImage,
+    Refusal, WorktreeRecord, archive_image_file,
 };
 use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -1646,6 +1647,92 @@ fn prune_empty_directories(directory: &Path, root: bool) {
         // Fails on a non-empty directory, which is exactly what must stay.
         let _ = std::fs::remove_dir(directory);
     }
+}
+
+/// Observe one archive directory for pruning: every entry directly in it, links not followed,
+/// and its manifest, read only when `manifest.json` is a regular file.
+pub(crate) fn contents(archive: &Path) -> Result<ArchiveContents, Refusal> {
+    let mut entries = Vec::new();
+    let unreadable = |error: std::io::Error| io_refusal("archive-unreadable", archive, &error);
+    for entry in std::fs::read_dir(archive).map_err(unreadable)? {
+        let entry = entry.map_err(unreadable)?;
+        let metadata = std::fs::symlink_metadata(entry.path()).map_err(unreadable)?;
+        let kind = metadata.file_type();
+        entries.push(ArchiveDirectoryEntry {
+            name: entry.file_name().to_string_lossy().into_owned(),
+            kind: if kind.is_file() {
+                ArchiveEntryKind::File
+            } else if kind.is_dir() {
+                ArchiveEntryKind::Directory
+            } else if kind.is_symlink() {
+                ArchiveEntryKind::Symlink
+            } else {
+                ArchiveEntryKind::Other
+            },
+            bytes: if kind.is_file() { metadata.len() } else { 0 },
+        });
+    }
+    entries.sort_by(|left, right| left.name.cmp(&right.name));
+    let manifest = match entries
+        .iter()
+        .find(|entry| entry.name == ARCHIVE_MANIFEST_FILE)
+    {
+        None => Err(format!(
+            "{} is missing",
+            archive.join(ARCHIVE_MANIFEST_FILE).display()
+        )),
+        Some(entry) if entry.kind != ArchiveEntryKind::File => Err(format!(
+            "{} is not a regular file",
+            archive.join(ARCHIVE_MANIFEST_FILE).display()
+        )),
+        Some(_) => parse_manifest(archive)
+            .map(|(manifest, _)| manifest)
+            .map_err(|refusal| refusal.to_string()),
+    };
+    Ok(ArchiveContents { manifest, entries })
+}
+
+/// Delete an archive assessed removable: each file the manifest names, then the manifest, then
+/// the directory with a non-recursive remove. The manifest on disk must still be `manifest`; an
+/// entry that is no longer a regular file, or one that appeared, refuses and is kept.
+pub(crate) fn delete(archive: &Path, manifest: &ArchiveManifest) -> Result<u64, Refusal> {
+    let changed = |message: String| Refusal::new("archive-changed", message);
+    let (on_disk, _) = parse_manifest(archive)?;
+    if &on_disk != manifest {
+        return Err(changed(format!(
+            "{} changed after it was assessed",
+            archive.join(ARCHIVE_MANIFEST_FILE).display()
+        )));
+    }
+    let mut files = manifest.recorded_files();
+    // The manifest goes last, so an interrupted deletion still names what is left.
+    files.retain(|file| *file != ARCHIVE_MANIFEST_FILE);
+    files.push(ARCHIVE_MANIFEST_FILE);
+    let mut freed = 0;
+    for file in files {
+        let path = archive.join(file);
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(io_refusal("archive-unreadable", &path, &error)),
+        };
+        if !metadata.file_type().is_file() {
+            return Err(changed(format!(
+                "{} is no longer a regular file",
+                path.display()
+            )));
+        }
+        std::fs::remove_file(&path)
+            .map_err(|error| io_refusal("archive-delete-failed", &path, &error))?;
+        freed += metadata.len();
+    }
+    std::fs::remove_dir(archive).map_err(|error| {
+        changed(format!(
+            "{} was not empty after its recorded files were deleted, so it is kept: {error}",
+            archive.display()
+        ))
+    })?;
+    Ok(freed)
 }
 
 #[cfg(test)]
