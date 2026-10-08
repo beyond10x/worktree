@@ -117,7 +117,8 @@ impl ArchiveManifest {
 
     /// Refuse a manifest whose format does not match what it holds: [`ARCHIVE_FORMAT`] names no
     /// image and [`ARCHIVE_FORMAT_V2`] at least one, each `nested-<n>.tar` in strictly increasing
-    /// path-byte order, with a relative path and at least one entry.
+    /// path-byte order, with a relative path and at least one entry, and whose bundle and
+    /// patch are not [`ARCHIVE_BUNDLE_FILE`] and [`ARCHIVE_PATCH_FILE`].
     pub fn require_format(&self) -> Result<(), Refusal> {
         let invalid = |message: String| Err(Refusal::new("archive-invalid", message));
         if !matches!(self.format.as_str(), ARCHIVE_FORMAT | ARCHIVE_FORMAT_V2) {
@@ -133,6 +134,18 @@ impl ArchiveManifest {
                 self.format,
                 self.nested_repositories.len()
             ));
+        }
+        // Every writer names these exact files; any other name could reach outside the archive.
+        for (recorded, expected) in [
+            (self.bundle.as_ref(), ARCHIVE_BUNDLE_FILE),
+            (self.patch.as_ref(), ARCHIVE_PATCH_FILE),
+        ] {
+            if let Some(recorded) = recorded.filter(|recorded| recorded.file != expected) {
+                return invalid(format!(
+                    "archive file {:?} must be named {expected}",
+                    recorded.file
+                ));
+            }
         }
         let mut previous: Option<&str> = None;
         for (index, image) in self.nested_repositories.iter().enumerate() {
