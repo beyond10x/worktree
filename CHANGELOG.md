@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.14.0 — 2026-10-08
+
+- `worktree prune-archives` removes archives a remote fully holds. A dry-run, the default, lists
+  each archive directory with its bytes and verdict, then the bytes removable and refused.
+  `--apply --id <directory>` deletes an archive only when HEAD and every unique commit it records
+  are ancestors of a ref a configured remote freshly advertises, it holds no `dirty.patch` and no
+  nested repository image, its tree is gone, and its directory holds only the files its manifest
+  names. Every other archive is refused with its reason (`CommitsNotOnRemote`, `UncommittedState`,
+  `NestedRepositories`, `TreeStillPresent`, `RemoteProofUnavailable`, `UnrecordedContent`,
+  `InvalidManifest`) and kept; no flag forces a removal. Selection follows `gc`: `--repo`,
+  `--scope repo|profile`, `--id`.
+- An archive manifest that names a bundle or patch file other than `commits.bundle` and
+  `dirty.patch` is refused as `archive-invalid`; no release writes another name.
+- The GitHub Release body is the version's section of this changelog, not the tag message.
+
 ## 0.13.0 — 2026-10-08
 
 - One tree reference works everywhere: the tree argument of `finish`, `discard-cache` and
