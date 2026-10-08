@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.13.0 — 2026-10-08
+
+- One tree reference works everywhere: the tree argument of `finish`, `discard-cache` and
+  `archive`, and every `--id` of `gc` and `reconcile`, accept a registered id, a path to a
+  registered tree, or the directory name of exactly one registered tree (so a dotted directory
+  such as `hard-defects-0.7.0` resolves). Two forms naming different records, or two records
+  sharing a directory name, refuse as `ambiguous-worktree-reference`. An unmatched value keeps the
+  released code: `worktree-not-found` for the tree argument, `unknown-worktree-id` or
+  `invalid-worktree-id` for `--id`. The id grammar is unchanged; `create --id` with a dot says to
+  use hyphens, because 0.12.1 and earlier cannot load a registry holding a dotted id.
+- `finish` prints `finished <id> <path>`, so its output is a valid `gc --id` value.
+- `gc` without `--id` assesses only the records of the repository `--repo` resolves to. The new
+  `--scope profile` keeps the previous profile-wide selection. In this repository's checkout,
+  `gc --dry-run` took 36.7 s for 9 other repositories' trees with 0.11.0 and takes 0.04 s with
+  the default scope. With `--id`, the named records are assessed whatever the scope.
+
 ## 0.12.1 — 2026-10-08
 
 - `discard-cache` and `finish --discard-cache` recognise a Cargo target that has no
