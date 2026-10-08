@@ -7,9 +7,30 @@ types:
     kind: enum
     variants: [File, Directory, Symlink]
 
+  # The verdict `prune-archives` gives one archive directory. Removable only when every commit the
+  # archive records is on a remote and it holds no uncommitted state; each other variant is a
+  # refusal that names why, and no flag turns a refusal into a removal.
+  #   Removable: HEAD and every unique commit are ancestors of a ref freshly advertised by a
+  #     configured remote of repository_root, the manifest records no patch and no nested
+  #     repository image, the registered tree path is absent, and the directory holds only the
+  #     files the manifest names.
+  #   CommitsNotOnRemote: some recorded commit is an ancestor of no freshly advertised ref.
+  #     Patch equivalence does not count: the archive is then the only copy of those commits.
+  #   UncommittedState: the manifest records a patch (worktree_tree differs from HEAD's tree).
+  #   NestedRepositories: the manifest records at least one nested repository image.
+  #   TreeStillPresent: the registered tree path exists; the archive may be its recovery proof.
+  #   RemoteProofUnavailable: repository_root is gone, has no configured remote, or no remote
+  #     answered; offline is a refusal, never permission.
+  #   UnrecordedContent: the directory holds an entry the manifest does not name.
+  #   InvalidManifest: manifest.json is missing, unreadable or of an unknown format.
+  - name: worktree.archive.PruneVerdict
+    kind: enum
+    variants: [Removable, CommitsNotOnRemote, UncommittedState, NestedRepositories, TreeStillPresent, RemoteProofUnavailable, UnrecordedContent, InvalidManifest]
+
 # The manifest of one local archive (crates/worktree-domain/src/archive.rs, ArchiveManifest). It
-# stands in for remote recovery proof; no command deletes it. Its worktree is the existing
-# registry record (crates/worktree-domain/src/lib.rs, WorktreeRecord).
+# stands in for remote recovery proof. Only `prune-archives --apply` deletes one, and only an
+# archive assessed Removable (worktree.archive.PruneVerdict) in the same run. Its worktree is the
+# existing registry record (crates/worktree-domain/src/lib.rs, WorktreeRecord).
 entities:
   - name: worktree.archive.Archive
     identity:
@@ -82,3 +103,40 @@ entities:
     # `.git` that is a file or a symlink (a submodule or a linked worktree), a `.git` holding
     # `commondir`, non-empty `objects/info/alternates`, any `worktrees/` entry or any symlink, and a
     # root at or below which HEAD or the index tracks any path (a submodule's gitlink included).
+
+  # A report of one archive directory assessed by `prune-archives`, not a persisted lifecycle.
+  # The directory is `<id>` or a superseded `<id>.superseded-<n>`; `--id` names it. `--dry-run`
+  # (the default) deletes nothing. `--apply` takes only exact directory names reviewed in a
+  # dry-run, re-assesses each immediately before deleting it, deletes only a Removable one (the
+  # files the manifest names, then the manifest, then the empty directory, never recursively),
+  # and reports the bytes freed. Every refusal is reported and the archive kept.
+  # Without `--id` the selection is worktree.selection.CleanupScope, as for gc: Repository (default)
+  # is the archives whose manifest repository_root is the repository `--repo` resolves to; Profile
+  # is every archive below the activated profile's archive root.
+  - name: worktree.archive.ArchivePruneAssessment
+    identity:
+      name: archive_directory
+      type: String
+    fields:
+      - name: worktree_id
+        type: String
+      - name: repository_root
+        type: String
+      # Bytes of the regular files in the directory.
+      - name: bytes
+        type: Integer
+      - name: verdict
+        type: worktree.archive.PruneVerdict
+      # Commits the archive records that no freshly advertised ref holds.
+      - name: commits_not_on_remote
+        type: Integer
+      # true only under --apply, for a Removable archive that was deleted.
+      - name: removed
+        type: Boolean
+    invariants:
+      - bytes >= 0
+      - commits_not_on_remote >= 0
+    lifecycle:
+      initial: Assessed
+      states: [Assessed]
+      terminal: [Assessed]
