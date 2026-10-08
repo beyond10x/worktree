@@ -2,58 +2,53 @@
 format: aep.planning-md/3
 id: story:scope-flag-for-reporting-subcommands
 kind: story
-status: draft
-title: Scope reporting and cleanup subcommands to the repository by default
-summary: gc and status report every record in the whole workspace profile, so add a --scope flag with repo, profile and global, and default to repo.
-revision: 2
+status: active
+title: gc assesses only the current repository by default
+summary: gc without --id assesses only the records of the repository --repo resolves to; --scope profile keeps the old profile-wide selection
+scope:
+- confidence: cited
+  path: crates/worktree-cli/src/main.rs
+- confidence: cited
+  path: crates/worktree-cli/tests/gc_scope.rs
+- confidence: cited
+  path: crates/worktree/src/lib.rs
+revision: 7
+transitions:
+- {from: "draft", to: "proposed", at: "2026-10-08T09:10:11Z", actor: "human:timo", revision: 6}
+- {from: "proposed", to: "active", at: "2026-10-08T09:10:11Z", actor: "human:timo", revision: 7}
 ---
-## Problem
+## Outcome
 
-`worktree gc --repo <path>` and `worktree status` both report far more than the repository the
-operator is working in, and nothing in their output marks the difference.
+`worktree gc` without `--id` assesses only the records of the repository `--repo` resolves to.
+`--scope profile` restores the 0.12.1 behaviour (every record below the profile's
+`workspace_root`). A foreground `gc --dry-run` in a repository finishes in seconds.
 
-`--repo` is documented as "Repository used to select its activated workspace policy"
-(`worktree gc --help`), so it resolves a profile from `~/.config/worktree/config.toml` and then
-assesses every record under that profile's `workspace_root`. Observed on 2026-09-02 with
-`b10x-worktree-cli` 0.3.1:
+## Why
 
-- `worktree gc --repo /home/timo/beyond10x/agentplugins --dry-run` returned 31 assessments, 28 of
-  them eligible, spanning atlas, connectors, aep, ess, harness, todo, website, service-sdk and
-  devcenter. One belonged to agentplugins.
-- `worktree gc --repo /home/timo/acme/projects/tenant-one/acd --dry-run` returned 1 assessment, and
-  that record's `repository_root` was `/home/timo/acme/projects/devcenter` — a different
-  repository inside the same `acme` profile, an adopter's internal collection of repositories.
-- `worktree status --help` lists one option, `--json`. It returned all 297 records across the
-  `b10x`, `acme` and `default` tree roots.
+`gc --dry-run` on 0.11.0, measured 2026-10-08 in `beyond10x/worktree` with `--repo .`: 36.7 s
+for 9 assessments, none of them this repository's (llm-gateway 3, ess 2, connectors 2, loom-coder
+1, metaharness 1). Agents reported a median of 73 s over 16 calls and 5 hits of the 120 s tool
+timeout. Each assessment refreshes remote advertisements of its record's repository, so cost grows
+with the profile, not with the repository the agent works in.
 
-An agent following the generated skill's own step — run the dry-run and inspect every result —
-therefore reads a list dominated by other repositories' trees. An `--apply` issued without exact
-`--id` values would remove another repository's work.
+## Specification
 
-## Proposal
+`worktree.selection.CleanupScope` in
+`.engineering/specs/worktree-inspection/domains/selection.yaml`; validated with `ess` 0.56.0.
 
-1. Add a `--scope` flag with three values:
-   - `repo` — only records whose `repository_root` is the resolved repository.
-   - `profile` — every record under the resolved profile's `workspace_root`. This is today's
-     behaviour.
-   - `global` — every record in the registry, across every profile.
-2. Default `--scope` to `repo` when the command is invoked from inside a repository, so the common
-   case narrows without a flag.
-3. Apply it to `gc`, `status` and `reconcile` at least.
-4. Leave `--repo` meaning what it means today — profile resolution. `--scope` decides how much of
-   that profile is reported.
+## Contract
+
+- `gc --scope repo|profile`, default `repo`. `repo` keeps records whose `repository_root` equals
+  the canonical root of `--repo`. `profile` is the 0.12.1 selection, byte for byte.
+- With `--id`, the named records are assessed whatever the scope, still subject to the policy's
+  workspace check.
+- Recovery proof, apply revalidation and every removal gate are unchanged.
+- `status` and `reconcile` are out of scope for this story.
+- The generated skill states the default and the flag.
 
 ## Acceptance
 
-- `worktree gc --dry-run` from inside a repository assesses only that repository's records.
-- `--scope profile` reproduces today's output byte for byte on the same registry.
-- `--scope global` on `status` returns every record, matching today's unfiltered `status`.
-- `worktree status --scope repo` in a repository with no managed trees returns an empty set rather
-  than the whole registry.
-- The generated skill states the default and the flag.
-
-## Evidence
-
-Worktree 0.3.2 documents the current behaviour in the generated skill
-(`crates/worktree-cli/src/main.rs`, "Finish and clean up" step 3 and "Audit and recovery"). It
-records the limitation; it does not change it.
+- In a fixture with trees of two repositories under one profile, `gc --dry-run` in repository A
+  lists only A's candidates; `--scope profile` lists both.
+- `gc --dry-run` in `beyond10x/worktree` with the built binary: time before and after recorded in
+  the PR.

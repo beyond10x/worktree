@@ -8,3 +8,4 @@ domains:
   - worktree.guidance
   - worktree.archive
   - worktree.branches
+  - worktree.selection
