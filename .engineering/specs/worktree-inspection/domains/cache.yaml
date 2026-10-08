@@ -8,7 +8,8 @@ types:
   # A Cargo target is tagged by a valid CACHEDIR.TAG. Cargo writes the tag only when it creates
   # the directory, so a `target/` made before Cargo's first build has none. Such a directory
   # counts as tagged when it is named `target`, a tracked `Cargo.toml` sits beside it, and it
-  # holds a profile with both `.fingerprint/` and `deps/` as real directories. The same three
+  # holds a direct child other than `tmp/` with both `.fingerprint/` and `deps/` as real
+  # directories; a CACHEDIR.TAG with a bad signature inside it is kept. The same three
   # kinds then apply; no new variant.
   - name: worktree.cache.CacheKind
     kind: enum

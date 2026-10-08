@@ -52,8 +52,11 @@ independent policy: every decision must come from the public façade.
   --discard-cache`), and it deletes only ignored, real directories recognised as build cache by
   structure: a Cargo profile holding `.fingerprint/` inside a validly tagged target, that target's
   own real `tmp/` (Cargo's `CARGO_TARGET_TMPDIR`, whatever it holds) when the target holds a
-  profile, `node_modules` at or below a tracked lockfile, a virtual environment beside a tracked Python manifest, and a
-  tagged `.pytest_cache`, `.mypy_cache` or `.ruff_cache`. A name alone never qualifies; anything
+  profile, `node_modules` at or below a tracked lockfile, a virtual environment beside a tracked
+  Python manifest, and a tagged `.pytest_cache`, `.mypy_cache` or `.ruff_cache`. Cargo tags only a
+  target it creates, so a real directory named `target` without a valid tag counts as tagged when
+  a tracked `Cargo.toml` sits beside it and a direct child other than `tmp/` holds both
+  `.fingerprint/` and `deps/` as real directories. A name alone never qualifies; anything
   unrecognised is retained and reported. It refuses for a live lease, a Git lock, or another
   process using the tree.
 - `sweep` composes only `discard-cache` and `archive`. It never changes lifecycle, never removes a

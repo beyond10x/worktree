@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.12.1 — 2026-10-08
+
+- `discard-cache` and `finish --discard-cache` recognise a Cargo target that has no
+  `CACHEDIR.TAG`. Cargo writes the tag only when it creates the directory itself, so a `target/`
+  made before the first build (`mkdir -p target/<dir>`) has none and was retained whole. Such a
+  real directory now counts as tagged when it is named `target`, a tracked `Cargo.toml` sits
+  beside it, and a direct child other than `tmp/` holds both `.fingerprint/` and `deps/`; its
+  profiles go as `cargo-profile`, its `tmp/` as `cargo-target-tmp`, and every other child is kept.
+  A `CACHEDIR.TAG` with a bad signature inside it is kept. No new cache kind.
+- Tests: the `cache_discard` fixtures run Git with `maintenance.auto=false`, so a detached
+  `git maintenance` cannot write into a nested fixture repository after a commit returns.
+
 ## 0.12.0 — 2026-10-07
 
 - `worktree archive` (and `finish --archive`, `sweep`) images each nested Git repository in a

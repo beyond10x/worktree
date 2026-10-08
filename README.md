@@ -53,7 +53,10 @@ changing state.
 profile (it holds `.fingerprint/`) inside a target carrying a valid `CACHEDIR.TAG`, that target's
 `tmp/` test scratch (Cargo's `CARGO_TARGET_TMPDIR`, whatever it holds) when the target holds a
 profile, `node_modules` at or below a tracked npm, Yarn, pnpm or Bun lockfile, a virtual environment (`pyvenv.cfg`) beside
-a tracked Python manifest, and a tagged `.pytest_cache`, `.mypy_cache` or `.ruff_cache`. Every other
+a tracked Python manifest, and a tagged `.pytest_cache`, `.mypy_cache` or `.ruff_cache`. Cargo
+writes the tag only when it creates the target itself, so a `target/` made before the first build
+has none; such a directory counts as tagged when a tracked `Cargo.toml` sits beside it and a
+child other than `tmp/` holds both `.fingerprint/` and `deps/`. Every other
 ignored entry, including records written inside `target/`, is kept and named in the report. It
 follows no symbolic link, and it refuses while a session lease is live, Git locks the tree, or
 another process has its working directory, executable or an open file inside the tree (observed
