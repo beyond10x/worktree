@@ -299,6 +299,16 @@ pub enum ReferenceForm {
     DirectoryName,
 }
 
+/// Which registered records `gc` assesses when no id is selected
+/// (`worktree.selection.CleanupScope`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CleanupScope {
+    /// Records whose repository root is the repository the caller resolved.
+    Repository,
+    /// Every record below the selected profile's workspace root.
+    Profile,
+}
+
 /// One resolved tree reference (`worktree.selection.TreeSelection`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TreeSelection {
@@ -884,6 +894,9 @@ where
     }
 
     /// Assess cleanup candidates and optionally remove those with fresh recovery proof.
+    ///
+    /// Without selected ids this assesses every record below the policy's workspace root, as
+    /// [`CleanupScope::Profile`] does in [`Self::gc_scoped`].
     pub fn gc(
         &self,
         policy: &WorkspacePolicy,
@@ -891,6 +904,45 @@ where
         apply: bool,
     ) -> Result<Vec<CleanupAssessment>, Refusal> {
         require_canonical_policy(policy)?;
+        self.gc_selected(policy, None, selected_ids, apply)
+    }
+
+    /// Assess cleanup candidates in `scope` and optionally remove those with fresh recovery proof.
+    ///
+    /// `repository` is the repository root the caller resolved; with
+    /// [`CleanupScope::Repository`] only records whose `repository_root` equals its canonical
+    /// path are assessed. Selected ids are assessed whatever the scope, still subject to the
+    /// policy's workspace check.
+    pub fn gc_scoped(
+        &self,
+        policy: &WorkspacePolicy,
+        repository: &Path,
+        scope: CleanupScope,
+        selected_ids: &[WorktreeId],
+        apply: bool,
+    ) -> Result<Vec<CleanupAssessment>, Refusal> {
+        require_canonical_policy(policy)?;
+        let repository = match scope {
+            CleanupScope::Profile => None,
+            CleanupScope::Repository => {
+                Some(std::fs::canonicalize(repository).map_err(|error| {
+                    Refusal::new(
+                        "repository-not-found",
+                        format!("{}: {error}", repository.display()),
+                    )
+                })?)
+            }
+        };
+        self.gc_selected(policy, repository.as_deref(), selected_ids, apply)
+    }
+
+    fn gc_selected(
+        &self,
+        policy: &WorkspacePolicy,
+        repository: Option<&Path>,
+        selected_ids: &[WorktreeId],
+        apply: bool,
+    ) -> Result<Vec<CleanupAssessment>, Refusal> {
         if apply && selected_ids.is_empty() {
             return Err(Refusal::new(
                 "explicit-cleanup-selection-required",
@@ -904,6 +956,8 @@ where
         for record in records {
             if !record.repository_root.starts_with(&policy.workspace_root)
                 || (!selected_ids.is_empty() && !selected_ids.contains(&record.id))
+                || (selected_ids.is_empty()
+                    && repository.is_some_and(|root| record.repository_root != root))
             {
                 continue;
             }
@@ -3614,6 +3668,76 @@ mod tests {
                 .lifecycle,
             Lifecycle::Finished
         );
+    }
+
+    #[test]
+    fn gc_scope_selects_the_repository_unless_profile_or_ids_are_given() {
+        let temporary = tempdir().unwrap();
+        let workspace = temporary.path().join("workspace");
+        let alpha = workspace.join("alpha");
+        let beta = workspace.join("beta");
+        let managed_root = temporary.path().join("managed");
+        for path in [&alpha, &beta, &managed_root] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        let alpha_tree = named_record(
+            "alpha-tree",
+            alpha.clone(),
+            managed_root.join("alpha/alpha-tree"),
+            Lifecycle::Finished,
+        );
+        let beta_tree = named_record(
+            "beta-tree",
+            beta.clone(),
+            managed_root.join("beta/beta-tree"),
+            Lifecycle::Finished,
+        );
+        let manager = WorktreeManager::new(
+            fake_git(alpha.clone()),
+            fake_registry(vec![alpha_tree.clone(), beta_tree.clone()]),
+            FixedClock,
+        );
+        let policy = policy(workspace, managed_root);
+        let ids = |assessments: Vec<CleanupAssessment>| {
+            let mut ids: Vec<String> = assessments
+                .into_iter()
+                .map(|item| item.record.id.as_str().to_owned())
+                .collect();
+            ids.sort();
+            ids
+        };
+
+        let repository = manager
+            .gc_scoped(&policy, &alpha, CleanupScope::Repository, &[], false)
+            .unwrap();
+        assert_eq!(ids(repository), vec!["alpha-tree"]);
+        // A non-canonical spelling of the repository root selects the same records.
+        let spelled = alpha.join("..").join("alpha");
+        let repository = manager
+            .gc_scoped(&policy, &spelled, CleanupScope::Repository, &[], false)
+            .unwrap();
+        assert_eq!(ids(repository), vec!["alpha-tree"]);
+
+        let profile = manager
+            .gc_scoped(&policy, &alpha, CleanupScope::Profile, &[], false)
+            .unwrap();
+        assert_eq!(ids(profile), vec!["alpha-tree", "beta-tree"]);
+        // The unscoped method keeps its profile-wide selection for existing callers.
+        assert_eq!(
+            ids(manager.gc(&policy, &[], false).unwrap()),
+            vec!["alpha-tree", "beta-tree"]
+        );
+
+        let named = manager
+            .gc_scoped(
+                &policy,
+                &alpha,
+                CleanupScope::Repository,
+                std::slice::from_ref(&beta_tree.id),
+                false,
+            )
+            .unwrap();
+        assert_eq!(ids(named), vec!["beta-tree"]);
     }
 
     #[test]

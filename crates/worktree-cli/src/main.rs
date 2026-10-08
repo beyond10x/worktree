@@ -2,8 +2,8 @@
 
 use anyhow::{Context, Result, anyhow};
 use b10x_worktree::{
-    GitPort, ReadinessFailure, ReadinessObservation, RegistryPort, SystemClock, WorktreeManager,
-    readiness_failures,
+    CleanupScope, GitPort, ReadinessFailure, ReadinessObservation, RegistryPort, SystemClock,
+    WorktreeManager, readiness_failures,
 };
 use b10x_worktree_domain::{
     CLI_PROTOCOL_VERSION, CreateRequest, GitRevision, HOOK_PROTOCOL_VERSION,
@@ -14,7 +14,7 @@ use b10x_worktree_state::{
     ProfileTemplate, SqliteRegistry, config_path, load_config, registry_path, resolve_policy,
     save_config, state_home, upsert_profile,
 };
-use clap::{Args, Parser, Subcommand, error::ErrorKind};
+use clap::{Args, Parser, Subcommand, ValueEnum, error::ErrorKind};
 use serde::Serialize;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -168,6 +168,10 @@ struct GcArgs {
     /// multiple records.
     #[arg(long = "id")]
     ids: Vec<String>,
+    /// Records assessed without `--id`: those of the repository `--repo` resolves to, or every
+    /// record of its activated profile. `--id` names records whatever the scope.
+    #[arg(long, value_enum, default_value_t = GcScope::Repo)]
+    scope: GcScope,
     /// Apply eligible removals. Without this flag, GC is a dry-run.
     #[arg(long, conflicts_with = "dry_run")]
     apply: bool,
@@ -176,9 +180,26 @@ struct GcArgs {
     dry_run: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum GcScope {
+    /// Only the records of the repository `--repo` resolves to.
+    Repo,
+    /// Every record below the activated profile's workspace root.
+    Profile,
+}
+
+impl From<GcScope> for CleanupScope {
+    fn from(scope: GcScope) -> Self {
+        match scope {
+            GcScope::Repo => Self::Repository,
+            GcScope::Profile => Self::Profile,
+        }
+    }
+}
+
 #[derive(Debug, Args)]
 struct InspectArgs {
-    /// Inspect only this repository by default (unlike gc's profile-wide scope).
+    /// Inspect only this repository by default, as gc does.
     #[arg(long, default_value = ".")]
     repo: PathBuf,
     /// Explicitly include every repository in the selected activated workspace.
@@ -824,7 +845,13 @@ fn gc(args: &GcArgs, json: bool) -> Result<()> {
         .resolve_references(&args.ids, Some(policy))
         .map_err(anyhow::Error::new)?;
     let assessments = service
-        .gc(policy, &ids, args.apply)
+        .gc_scoped(
+            policy,
+            &repository.root,
+            args.scope.into(),
+            &ids,
+            args.apply,
+        )
         .map_err(anyhow::Error::new)?;
     emit_success(
         json,
@@ -1321,14 +1348,14 @@ One tree reference works in `finish`, `discard-cache`, `archive`, `gc --id` and 
 1. Commit and publish every wanted change. A local-only commit is deliberately not cleanup-safe. Work merged as rebased or cherry-picked copies also qualifies when an advertised ref carries every unique commit's exact patch; GC reports that proof as `patch-equivalent`.
    When work must not be published, run `worktree archive <tree>` instead. It never modifies the tree; it writes `commits.bundle` (every commit no advertised ref holds), `dirty.patch` (tracked, untracked and ignored changes over HEAD), one `nested-<n>.tar` byte image per nested Git repository in the tree's files (such as a test fixture in an ignored directory), and a `worktree.archive/1` (or `/2` with images) `manifest.json` below the state directory's `worktree/archives/<repository>/<id>/`, and verifies them. GC then accepts that archive as `archive` proof while HEAD and every file still match it exactly; any later commit or edit is refused as `archive-stale` until `worktree archive --replace <tree>` writes a new one. `--replace` moves the old archive aside and never deletes it.
 2. Preserve required evidence. Release your own lease, then run `worktree finish --discard-cache --archive <tree>`. It deletes the recognised build cache, archives whatever the tree still holds that no advertised ref recovers, and finishes, so nothing that is not cache is lost. Without `--archive` it refuses a tree that still differs from HEAD and names what was kept. Every form refuses locked, unmanaged, live, or mid-operation Git worktrees; plain `worktree finish <tree>` also refuses a dirty tree unless its archive holds exactly the current state.
-3. Run `worktree gc --repo <primary> --dry-run --id <id>` and inspect every result. Without exact ids, `--repo` selects the activated workspace profile, not just the repository: the assessment covers records under that profile's `workspace_root`, including other repositories.
+3. Run `worktree gc --repo <primary> --dry-run --id <id>` and inspect every result. Without exact ids, gc assesses only the records of the repository `--repo` resolves to (`--scope repo`, the default; a linked tree resolves to its primary). Add `--scope profile` to assess every record under the activated profile's `workspace_root`, including other repositories; that refreshes each repository's remote advertisements and takes correspondingly longer. `--id` assesses the named records whatever the scope.
 4. Run `worktree gc --repo <primary> --apply --id <reviewed-id>` with repeated `--id` values only for the exact results intended for removal. The command refreshes remote advertisements, fetches required objects, and revalidates immediately before non-forced removal. Check the result before reporting storage reclaimed.
 5. End with either verified cleanup or an explicit handoff: tree id and path, published branch/commit, related work-item references, retained evidence, remaining blockers, next owner and next action. Never leave a tree silently active or label work complete merely from its age or Git state.
 
 ## Audit and recovery
 
 - Run `worktree inspect --repo <path>` for actual Git state, separate ignored-file counts, storage, leases, and retention blockers. It defaults to that repository; add `--workspace` to expand to its profile and repeat `--id` to narrow the selection. Sizes are bounded observations, not promised reclaimable bytes. Add `--refresh` for fresh remote recovery evidence (which may fetch objects). Inspection never changes lifecycle or infers owner abandonment or story completion; review GC separately before removal.
-- Operators run `worktree sweep --all-profiles` daily from a timer. It discards the recognised build cache of every tree idle for a day or more without a live lease, and archives what an expired or finished tree still holds; it never changes lifecycle, removes a tree, or applies GC. A tree it archived shows as eligible in `worktree gc --dry-run`. Add `--dry-run` to see what it would do.
+- Operators run `worktree sweep --all-profiles` daily from a timer. It discards the recognised build cache of every tree idle for a day or more without a live lease, and archives what an expired or finished tree still holds; it never changes lifecycle, removes a tree, or applies GC. A tree it archived shows as eligible in `worktree gc --dry-run`, run from its repository or with `--scope profile`. Add `--dry-run` to see what it would do.
 - Run `worktree status` for durable lifecycle state. It accepts no filter and reports every record in every profile, so read `repository_root` on each one before acting.
 - Run `worktree repo list --repo <path>` to distinguish managed, unmanaged, primary, and linked checkouts.
 - Run `worktree reconcile --repo <path> --dry-run` to assess interrupted provisioning, adopted legacy paths, finished external trees, and missing records.
@@ -1463,6 +1490,13 @@ mod tests {
         let interface = skill_interface();
 
         assert!(markdown.contains("gc --repo <primary> --apply --id <reviewed-id>"));
+        assert!(markdown.contains(
+            "gc assesses only the records of the repository `--repo` resolves to (`--scope repo`, the default"
+        ));
+        assert!(markdown.contains("Add `--scope profile` to assess every record"));
+        assert!(
+            !markdown.contains("selects the activated workspace profile, not just the repository")
+        );
         assert!(markdown.contains("interrupted provisioning"));
         assert!(markdown.contains("--allow-external-retirement"));
         assert!(markdown.contains("--acknowledge-unrecoverable <recorded-commit>"));
@@ -1482,6 +1516,21 @@ mod tests {
         assert!(markdown.contains("`finished <id> <path>`"));
         assert!(interface.contains("$worktree"));
         assert!(interface.contains("Generated by `worktree skill`"));
+    }
+
+    #[test]
+    fn gc_scope_defaults_to_the_repository() {
+        let parse = |extra: &[&str]| {
+            let cli = Cli::try_parse_from(["worktree", "gc"].iter().chain(extra)).unwrap();
+            let Command::Gc(args) = cli.command else {
+                panic!("gc command");
+            };
+            CleanupScope::from(args.scope)
+        };
+        assert_eq!(parse(&[]), CleanupScope::Repository);
+        assert_eq!(parse(&["--scope", "repo"]), CleanupScope::Repository);
+        assert_eq!(parse(&["--scope", "profile"]), CleanupScope::Profile);
+        assert!(Cli::try_parse_from(["worktree", "gc", "--scope", "workspace"]).is_err());
     }
 
     #[test]

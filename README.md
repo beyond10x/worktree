@@ -225,8 +225,10 @@ remote recovery evidence. Storage scans are bounded and flag incomplete results;
 are observations, not guaranteed reclaimable space. Inspection does not change lifecycle or infer
 story completion or abandonment. Cleanup still requires a reviewed GC assessment.
 
-Dry-runs may assess all candidates or selected ids. Without ids, `gc --repo <path>` assesses every
-record under the activated profile that repository selects, not only that repository. Both
+Dry-runs may assess all candidates or selected ids. Without ids, `gc --repo <path>` assesses only
+the records of the repository that path resolves to (`--scope repo`, the default); add
+`--scope profile` to assess every record under the activated profile that repository selects.
+`--id` assesses the named records whatever the scope. Both
 `gc --apply` and `reconcile --apply` require one or more exact, reviewed `--id` values; repeat the
 option to apply more than one result. Ordinary GC remains restricted to the managed root.
 
