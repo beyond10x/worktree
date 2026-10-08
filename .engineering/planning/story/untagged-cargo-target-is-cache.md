@@ -2,7 +2,7 @@
 format: aep.planning-md/3
 id: story:untagged-cargo-target-is-cache
 kind: story
-status: active
+status: implemented
 title: A Cargo target made before Cargo's first build is still recognised as cache
 summary: an untagged target/ beside a tracked Cargo.toml, holding a full profile, is classified as a tagged target
 relations:
@@ -14,10 +14,11 @@ scope:
   path: crates/worktree-domain/src/cache.rs
 - confidence: cited
   path: crates/worktree-git/src/cache.rs
-revision: 4
+revision: 6
 transitions:
 - {from: "draft", to: "proposed", at: "2026-10-07T23:14:43Z", actor: "human:timo", revision: 3}
 - {from: "proposed", to: "active", at: "2026-10-07T23:14:44Z", actor: "human:timo", revision: 4}
+- {from: "active", to: "implemented", at: "2026-10-08T00:00:39Z", actor: "human:timo", revision: 6, decided_on: {"recorded":{"test_result":1,"review_outcome":3,"verification":1}}}
 ---
 ## Outcome
 
@@ -46,17 +47,20 @@ as a tagged Cargo target; validated with `ess` 0.55.0. No new variant: the exist
 
 - An ignored real directory without a valid `CACHEDIR.TAG` is classified as a tagged Cargo target
   when all three hold: it is named `target`; a tracked `Cargo.toml` sits beside it (in its parent
-  directory, the tree root included); and at least one direct child is a profile holding both
+  directory, the tree root included); and at least one direct child other than `tmp/` holds both
   `.fingerprint/` and `deps/` as real directories.
-- Classified that way, it behaves as a tagged target in every respect: profiles are discarded as
-  `cargo-profile`, `tmp/` beside a profile as `cargo-target-tmp`, Cargo's root metadata files are
-  Cargo's, and a target of nothing else goes whole as `cargo-target`; every other child is retained
-  and named.
+- Classified that way, it behaves as a tagged target, with one exception: profiles are discarded
+  as `cargo-profile`, `tmp/` beside a profile as `cargo-target-tmp`, Cargo's root metadata files
+  are Cargo's, and a target of nothing else goes whole as `cargo-target`; every other child is
+  retained and named. The exception: a `CACHEDIR.TAG` with a bad signature is not Cargo's and is
+  retained.
 - When Git reports a profile itself as the ignored entry, it is discarded as `cargo-profile` when
   its parent satisfies the three conditions above.
 - Still retained: the same layout under any other name, beside no tracked `Cargo.toml` (an
-  untracked one does not count), with no profile holding both markers, a profile or `target`
-  reached through a symlink, and every case already retained today.
+  untracked one does not count), with no child other than `tmp/` holding both markers, a profile
+  or `target` reached through a symlink, and every case already retained today.
+- Revised after adversary pass 1 (review-result:adversary-untagged-target-pass-1): `tmp/` no
+  longer qualifies a target, and a bad-signature tag is kept.
 
 ## Acceptance
 

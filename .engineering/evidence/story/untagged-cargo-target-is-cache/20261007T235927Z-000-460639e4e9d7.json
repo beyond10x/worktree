@@ -1,0 +1,14 @@
+{
+  "at": "2026-10-07T23:59:27Z",
+  "actor": "human:timo",
+  "artifact": "story:untagged-cargo-target-is-cache",
+  "kind": "story",
+  "revision": 5,
+  "change": {
+    "change": "evidence",
+    "kind": "review_outcome",
+    "source": "review-result:adversary-untagged-target-pass-1",
+    "review": "review-result:adversary-untagged-target-pass-1",
+    "outcome": "fixed"
+  }
+}

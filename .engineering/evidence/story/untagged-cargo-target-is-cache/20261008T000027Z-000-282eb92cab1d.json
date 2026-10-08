@@ -1,0 +1,13 @@
+{
+  "at": "2026-10-08T00:00:27Z",
+  "actor": "human:timo",
+  "artifact": "story:untagged-cargo-target-is-cache",
+  "kind": "story",
+  "revision": 5,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "cargo test -p b10x-worktree-cli -p b10x-worktree-git -p b10x-worktree-domain --locked --no-fail-fast",
+    "reference": "commit f2946e6 (wave head, unit merge 5129d79): exit 0; cache_discard 19 passed, untagged_target_adversary 10 passed, b10x_worktree_git 37 passed, b10x_worktree_domain 13 passed"
+  }
+}

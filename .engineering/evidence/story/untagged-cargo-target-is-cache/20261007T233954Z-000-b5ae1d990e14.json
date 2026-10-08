@@ -1,0 +1,13 @@
+{
+  "at": "2026-10-07T23:39:54Z",
+  "actor": "human:timo",
+  "artifact": "story:untagged-cargo-target-is-cache",
+  "kind": "story",
+  "revision": 4,
+  "change": {
+    "change": "evidence",
+    "kind": "verification",
+    "source": "worktree --json discard-cache --dry-run <unit tree> (its own untagged target/ beside tracked Cargo.toml)",
+    "reference": "base 0.12.0 build: discarded [], retained [target]; unit 690220c build: discarded target/debug cargo-profile 528105472 B, target/tmp cargo-target-tmp; retained target/unit-scratch"
+  }
+}
