@@ -1,0 +1,13 @@
+{
+  "at": "2026-10-08T21:33:43Z",
+  "actor": "human:timo",
+  "artifact": "story:release-notes-from-changelog",
+  "kind": "story",
+  "revision": 3,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "awk extraction of release.yml run over CHANGELOG.md",
+    "reference": "commit 98e3076: 0.13.0 section printed whole, 0.12.1 section 9 lines, unknown 9.9.9 empty (job fails)"
+  }
+}
