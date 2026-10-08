@@ -9,6 +9,9 @@ types:
   #   Path: the value names a directory whose canonical path is a registered record's path.
   #   DirectoryName: the value contains no `/` and is the final path component of exactly one
   #     registered record's path in scope; two or more such records refuse and list their ids.
+  # A reference nothing matches keeps the refusal code its command released: the tree argument
+  # of `finish`, `discard-cache` and `archive` refuses as worktree-not-found; `--id` refuses as
+  # unknown-worktree-id when the value is a valid id, and as invalid-worktree-id otherwise.
   # The worktree id grammar does not change: 1-128 lowercase letters, digits or hyphens. A value
   # with a dot is never an id, because a registry holding one cannot be loaded by a release
   # whose grammar refuses it; it can still name a tree as Path or DirectoryName.

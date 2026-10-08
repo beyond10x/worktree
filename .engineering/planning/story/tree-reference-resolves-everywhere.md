@@ -12,7 +12,7 @@ scope:
   path: crates/worktree-cli/tests/tree_reference.rs
 - confidence: cited
   path: crates/worktree/src/lib.rs
-revision: 5
+revision: 6
 transitions:
 - {from: "draft", to: "proposed", at: "2026-10-08T09:10:11Z", actor: "human:timo", revision: 4}
 - {from: "proposed", to: "active", at: "2026-10-08T09:10:11Z", actor: "human:timo", revision: 5}
@@ -41,8 +41,10 @@ valid id). `finish` prints only `finished <path>`, so its output cannot be paste
   whose canonical path equals a registered record's path; as `DirectoryName` when it contains no
   `/` and is the last component of exactly one in-scope record's path.
 - Two forms naming different records refuse as `ambiguous-worktree-reference` and list both ids.
-  Two records sharing a directory name refuse the same way. Nothing matching refuses as
-  `unknown-worktree-reference`, naming the value.
+  Two records sharing a directory name refuse the same way. Nothing matching keeps the released code: the tree argument of `finish`,
+  `discard-cache` and `archive` refuses as `worktree-not-found`; `--id` refuses as
+  `unknown-worktree-id` for a valid id and `invalid-worktree-id` otherwise. A directory in the
+  working directory that is not a registered tree never shadows a registered id.
 - The worktree id grammar is unchanged (no dots): a registry with a dotted id cannot be loaded by
   0.11.0-0.12.1 (`crates/worktree-state/src/lib.rs:491`). The `invalid-worktree-id` refusal of
   `create --id` says to use hyphens.
