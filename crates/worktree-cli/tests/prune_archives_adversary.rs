@@ -337,7 +337,10 @@ fn local_remote_tracking_ref_does_not_count() {
         &["update-ref", "refs/remotes/origin/tracking", &commit],
     );
 
-    assert_eq!(fixture.verdict("alpha", "tracking"), "commits-not-on-remote");
+    assert_eq!(
+        fixture.verdict("alpha", "tracking"),
+        "commits-not-on-remote"
+    );
     let output = fixture.apply_keeps("alpha", "tracking", &[&archive.join("commits.bundle")]);
     assert!(!output.status.success(), "{output:?}");
 }
@@ -365,7 +368,10 @@ fn replacement_ref_does_not_count() {
         "the replacement does not make the commit look held"
     );
 
-    assert_eq!(fixture.verdict("alpha", "replaced"), "commits-not-on-remote");
+    assert_eq!(
+        fixture.verdict("alpha", "replaced"),
+        "commits-not-on-remote"
+    );
     let output = fixture.apply_keeps("alpha", "replaced", &[&archive.join("commits.bundle")]);
     assert!(!output.status.success(), "{output:?}");
 }
@@ -417,7 +423,10 @@ fn one_unreachable_remote_of_two_refuses() {
         &["remote", "add", "backup", unreachable.to_str().unwrap()],
     );
 
-    assert_eq!(fixture.verdict("alpha", "split"), "remote-proof-unavailable");
+    assert_eq!(
+        fixture.verdict("alpha", "split"),
+        "remote-proof-unavailable"
+    );
     let output = fixture.apply_keeps("alpha", "split", &[&archive.join("commits.bundle")]);
     assert!(!output.status.success(), "{output:?}");
 }
