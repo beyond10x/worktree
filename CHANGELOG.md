@@ -3,10 +3,11 @@
 ## Unreleased
 
 - `worktree archive` (and `finish --archive`, and `sweep`) leaves cargo's own build layout out of
-  an archive. Below a target `discard-cache` recognises by structure, an untracked file whose first
-  component below the target is `debug`, `release`, `tmp`, `CACHEDIR.TAG`, `.rustc_info.json` or a
+  an archive. Below a target recognised by `discard-cache`'s structure (also when a tracked file
+  below it hides it from `discard-cache`), an untracked file whose first component below the
+  target is `debug`, `release`, `.rustc_info.json`, `tmp`, a Cargo-signed `CACHEDIR.TAG` or a
   profile directory (holding `.fingerprint/`; also `<target>/<triple>/<profile>/`) is neither in
-  `dirty.patch` nor in the fingerprint. Everything else below the target, such as
+  `dirty.patch` nor in the fingerprint. Tracked files below the target stay archived. Everything else below the target, such as
   `target/ess-conformance/`, stays archived. Such an archive is the new manifest format
   `worktree.archive/3`, which records per target the files and bytes left out as `build_output`;
   the command prints `left out <files> file(s), <bytes> bytes of cargo build output under
@@ -19,9 +20,11 @@
 - `worktree prune-archives --strip-build-output [--repo] [--scope repo|profile] [--id]...
   [--dry-run|--apply]` removes build layout from archives written before. A dry-run, the default,
   streams each `dirty.patch` and lists the bytes and sections it would strip, what stays, and the
-  prune verdict afterwards. Only whole `new file mode` sections whose C-unquoted path is build
-  layout below a directory the patch itself recognises as a cargo target are stripped; tracked
-  changes, undecodable paths and nested images stay. `--apply --id` verifies the new patch over
+  prune verdict afterwards. Only whole sections that purely add an untracked file (`new file
+  mode`, a C-unquoted path no other section names and HEAD's tree does not track) whose path is
+  build layout below a directory the patch itself recognises as a cargo target (a Cargo-signed
+  `CACHEDIR.TAG` or a profile's `.fingerprint/`; `tmp/` only beside a profile) are stripped; both
+  halves of a type change, other tracked changes, undecodable paths and nested images stay. `--apply --id` verifies the new patch over
   HEAD in a scratch index, recomputes `worktree_tree`, replaces the patch (or deletes it) and writes
   the format 3 manifest last, then prints the bytes freed. It refuses an invalid manifest,
   unrecorded content, a present tree, a gone repository or an unusable patch and leaves that

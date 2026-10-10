@@ -89,10 +89,14 @@ compares the listing, and records the listing's SHA-256 as the root's fingerprin
 and `dirty.patch` cover everything outside the imaged roots and the cargo build layout left out.
 
 Cargo build layout is decided in the domain, I/O-free: `is_build_layout` and `layout_target` take
-a path below a target and an injected "is this prefix a profile directory" observation. The Git
-adapter recognises the targets with `discard-cache`'s own structural classification (one walk of
-the ignored entries, which now also reports each target it recognised), excludes the paths HEAD
-or the index tracks, and observes profiles on disk. The capture leaves those files out of the
+a path below a target, the target's `TargetFacts` (a Cargo-signed tag; a profile, which `tmp/`
+needs) and an injected "is this prefix a profile directory" observation. The Git adapter
+recognises the targets with `discard-cache`'s own structural classification (one walk of the
+ignored entries, which now also reports each target it recognised) and, because a tracked file
+below a target keeps that walk from reaching it, also checks each directory a listed path places a
+`CACHEDIR.TAG` or a profile's `.fingerprint/` in against the same structure on disk
+(`cache::archive_target`, used only by archives; `discard-cache`'s deletions are unchanged). It
+excludes the paths HEAD or the index tracks and observes profiles on disk. The capture leaves those files out of the
 scratch index, so the patch and the fingerprint never see them, and the manifest records them per
 target as `build_output` in format `worktree.archive/3`. Verification leaves out the same layout
 only for a format 3 archive and refuses layout below a target the manifest does not name. The
@@ -179,9 +183,13 @@ for the patch's sections. The Git adapter's `scan_archive_patch` streams `dirty.
 line, hashing it against the recorded digest, and splits it at each `diff --git` line; a line
 in a hunk starts with ` `, `+`, `-` or `\`, and a base85 line holds no space, so neither can open
 a section. Each section carries its decoded path (`diff_git_path`, with Git's C-quoting undone),
-whether its extended header holds `new file mode`, its patch bytes and the size of the file it
-adds. The domain's `plan_patch_strip` recognises targets from the added paths alone and marks
-the sections to strip. The report's prune verdict afterwards is `decide_archive_prune` over the
+whether its extended header holds `new file mode`, whether the file it adds begins with Cargo's
+`CACHEDIR.TAG` signature, its patch bytes and the size of the file it adds; the adapter then marks
+each section whose path HEAD's tree, read with `git ls-tree` (from the archive's bundle when the
+repository lacks HEAD), holds as a file or directory or below a file. The domain's
+`plan_patch_strip` keeps every section of a path named twice, named by a section that is not
+`new file mode`, or tracked, recognises targets from the remaining pure additions alone (a signed
+tag or a profile) and marks the sections to strip. The report's prune verdict afterwards is `decide_archive_prune` over the
 directory as it would be (`contents_after_strip`).
 
 ```mermaid

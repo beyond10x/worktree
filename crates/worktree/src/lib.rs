@@ -241,7 +241,8 @@ pub trait GitPort: Send + Sync {
         Err(archive_unsupported(archive))
     }
     /// Stream an archive's `dirty.patch` into its `diff --git` sections, verifying the digest
-    /// `manifest` records. Writes nothing. The default refuses.
+    /// `manifest` records, and mark each section whose path HEAD's tree tracks, read from Git.
+    /// Writes nothing to the archive or the repository. The default refuses.
     fn scan_archive_patch(
         &self,
         archive: &Path,

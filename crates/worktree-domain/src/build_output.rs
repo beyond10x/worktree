@@ -7,17 +7,20 @@
 //! Git adapter observes the disk or streams the patch and asks.
 //!
 //! Inside a recognised cargo target `T` a path is build layout when its first component below `T`
-//! is one of [`CARGO_LAYOUT_NAMES`] or a profile directory (one holding `.fingerprint/` as a
+//! is `debug`, `release` or `.rustc_info.json`, `tmp` while `T` holds a profile, `CACHEDIR.TAG`
+//! while it carries Cargo's signature, or a profile directory (one holding `.fingerprint/` as a
 //! direct child; also `T/<triple>/<profile>/`). Every other path below `T` stays archived. On
-//! disk, `T` is a target `discard-cache` recognises by structure; in a patch, a directory for
-//! which the patch adds `T/CACHEDIR.TAG`, `T/.rustc_info.json` or `T/<p>/.fingerprint/…`.
+//! disk, `T` is recognised by `discard-cache`'s structural rule (a valid tag or the untagged-target
+//! rule, and at least one profile); in a patch, `T` is a directory for which the patch purely adds
+//! a Cargo-signed `T/CACHEDIR.TAG` or `T/<p>/.fingerprint/…`. A section that is not a pure addition
+//! of an untracked path, or whose path another section names too, is never stripped.
 
 use crate::{
     ARCHIVE_PATCH_FILE, ArchiveContents, ArchiveEntryKind, ArchiveManifest, CACHEDIR_TAG_FILE,
-    CARGO_PROFILE_MARKER, PruneVerdict, SkippedArchiveEntry,
+    CARGO_PROFILE_MARKER, CARGO_TARGET_TMP, PruneVerdict, SkippedArchiveEntry, is_cache_tag,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 /// Independent, immutable manifest format identifier of an archive that left cargo build layout
@@ -27,7 +30,9 @@ pub const ARCHIVE_FORMAT_V3: &str = "worktree.archive/3";
 /// The rustc metadata file Cargo writes at the root of a target.
 pub const CARGO_RUSTC_INFO: &str = ".rustc_info.json";
 
-/// First components below a cargo target that are build layout whatever they hold.
+/// First components below a cargo target that are build layout whatever they hold, given what is
+/// known of the target ([`TargetFacts`]): `tmp` only while the target holds a profile, and
+/// `CACHEDIR.TAG` only while it carries Cargo's signature.
 pub const CARGO_LAYOUT_NAMES: [&str; 5] = [
     "debug",
     "release",
@@ -153,15 +158,36 @@ pub fn path_below<'a>(path: &'a [u8], directory: &[u8]) -> Option<&'a [u8]> {
         .filter(|rest| !rest.is_empty())
 }
 
-/// Whether `rest`, a path relative to a recognised cargo target, is build layout.
+/// What is known of one recognised cargo target beyond its path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TargetFacts {
+    /// `T/CACHEDIR.TAG` carries Cargo's signature: only then is it Cargo's own file.
+    pub signed_tag: bool,
+    /// `T` holds at least one profile (`T/<p>/` or `T/<triple>/<p>/`): only then is `T/tmp/`
+    /// Cargo's test scratch, as `discard-cache` keeps a `tmp/` beside no profile.
+    pub holds_profile: bool,
+}
+
+/// Whether `rest`, a path relative to a recognised cargo target described by `facts`, is build
+/// layout.
 ///
 /// `profile(prefix)` reports whether `prefix`, one or two components below the target, is a
 /// profile directory: one holding `.fingerprint/` as a direct child.
-pub fn is_build_layout(rest: &[u8], mut profile: impl FnMut(&[u8]) -> bool) -> bool {
+pub fn is_build_layout(
+    rest: &[u8],
+    facts: TargetFacts,
+    mut profile: impl FnMut(&[u8]) -> bool,
+) -> bool {
     let components = rest.split(|byte| *byte == b'/').collect::<Vec<_>>();
     let Some(first) = components.first().filter(|first| !first.is_empty()) else {
         return false;
     };
+    if *first == CARGO_TARGET_TMP.as_bytes() {
+        return facts.holds_profile;
+    }
+    if *first == CACHEDIR_TAG_FILE.as_bytes() {
+        return facts.signed_tag;
+    }
     if CARGO_LAYOUT_NAMES
         .iter()
         .any(|name| name.as_bytes() == *first)
@@ -180,10 +206,12 @@ pub fn is_build_layout(rest: &[u8], mut profile: impl FnMut(&[u8]) -> bool) -> b
 
 /// The index of the outermost target in `targets` below which `path` is build layout.
 ///
-/// `profile(target, prefix)` reports whether `target/prefix` is a profile directory.
+/// `facts(target)` describes a target, and `profile(target, prefix)` reports whether
+/// `target/prefix` is a profile directory.
 pub fn layout_target(
     path: &[u8],
     targets: &[Vec<u8>],
+    mut facts: impl FnMut(&[u8]) -> TargetFacts,
     mut profile: impl FnMut(&[u8], &[u8]) -> bool,
 ) -> Option<usize> {
     let mut order = (0..targets.len()).collect::<Vec<_>>();
@@ -192,8 +220,9 @@ pub fn layout_target(
     });
     order.into_iter().find(|index| {
         let target = &targets[*index];
-        path_below(path, target)
-            .is_some_and(|rest| is_build_layout(rest, |prefix| profile(target, prefix)))
+        path_below(path, target).is_some_and(|rest| {
+            is_build_layout(rest, facts(target), |prefix| profile(target, prefix))
+        })
     })
 }
 
@@ -300,8 +329,15 @@ pub fn is_extended_header(line: &[u8]) -> bool {
 pub struct ScannedSection {
     /// The decoded path, or `None` when the header could not be decoded.
     pub path: Option<Vec<u8>>,
-    /// Whether its extended header holds `new file mode`: it adds a file HEAD does not have.
+    /// Whether its extended header holds `new file mode`. Alone this does not make the section a
+    /// pure addition: a type change is a `deleted file mode` and a `new file mode` section of one
+    /// path.
     pub new_file: bool,
+    /// Whether HEAD's tree, read from the repository rather than the patch, holds the decoded
+    /// path as a file or directory, or a file at one of its ancestors. Such a section is kept.
+    pub tracked: bool,
+    /// Whether the file the section adds begins with Cargo's `CACHEDIR.TAG` signature line.
+    pub signed_tag: bool,
     /// Bytes of the section in the patch, header included.
     pub patch_bytes: u64,
     /// Bytes of the file a `new file mode` section recreates.
@@ -309,7 +345,8 @@ pub struct ScannedSection {
 }
 
 /// Content bytes of the file one `new file mode` section adds, accumulated line by line: the
-/// `literal <n>` size of a binary section, or the added lines of a text one.
+/// `literal <n>` size of a binary section, or the added lines of a text one. It also notes
+/// whether a text file's first line is Cargo's `CACHEDIR.TAG` signature.
 #[derive(Debug, Clone, Default)]
 pub struct NewFileSize {
     binary: bool,
@@ -317,6 +354,9 @@ pub struct NewFileSize {
     in_hunk: bool,
     after_added: bool,
     text_bytes: u64,
+    /// Whether the first line of the first hunk was observed, and whether it was an added
+    /// signature line.
+    first_line: Option<bool>,
 }
 
 impl NewFileSize {
@@ -342,6 +382,9 @@ impl NewFileSize {
         if !self.in_hunk {
             return;
         }
+        if self.first_line.is_none() {
+            self.first_line = Some(line.strip_prefix(b"+").is_some_and(is_cache_tag));
+        }
         if line.starts_with(b"\\") {
             if self.after_added {
                 self.text_bytes = self.text_bytes.saturating_sub(1);
@@ -358,6 +401,12 @@ impl NewFileSize {
     /// The file's size.
     pub fn bytes(&self) -> u64 {
         self.literal.unwrap_or(self.text_bytes)
+    }
+
+    /// Whether the text the section adds begins with Cargo's `CACHEDIR.TAG` signature. A binary
+    /// section never does.
+    pub fn signed_tag(&self) -> bool {
+        !self.binary && self.first_line == Some(true)
     }
 }
 
@@ -378,42 +427,108 @@ pub struct PatchStripPlan {
     pub kept_bytes: u64,
 }
 
-/// Decide which sections of a patch are cargo build layout.
-///
-/// Only a `new file mode` section whose path decoded is stripped, and only below a directory the
-/// patch's own added files recognise as a cargo target. Every other section is kept whole.
-pub fn plan_patch_strip(sections: &[ScannedSection]) -> PatchStripPlan {
-    let added = sections
-        .iter()
-        .filter(|section| section.new_file)
-        .filter_map(|section| section.path.as_deref())
-        .collect::<Vec<_>>();
-    let mut profiles = BTreeSet::new();
-    let mut targets = BTreeSet::new();
-    for path in &added {
-        let components = path.split(|byte| *byte == b'/').collect::<Vec<_>>();
-        let prefix = |count: usize| components[..count].join(&b'/');
-        let last = components.len() - 1;
-        if last >= 1
-            && [CACHEDIR_TAG_FILE, CARGO_RUSTC_INFO]
-                .iter()
-                .any(|name| name.as_bytes() == components[last])
-        {
-            targets.insert(prefix(last));
-        }
-        for (index, component) in components.iter().enumerate() {
-            if *component == CARGO_PROFILE_MARKER.as_bytes() && index >= 1 && index < last {
-                profiles.insert(prefix(index));
-                if index >= 2 {
-                    targets.insert(prefix(index - 1));
+/// The cargo targets a patch's own pure additions recognise.
+struct PatchTargets {
+    /// Targets that are UTF-8 relative paths, in path-byte order.
+    targets: Vec<Vec<u8>>,
+    /// Profile directories: each holds an added `.fingerprint/…` file.
+    profiles: BTreeSet<Vec<u8>>,
+    /// Directories holding an added, Cargo-signed `CACHEDIR.TAG`.
+    tagged: BTreeSet<Vec<u8>>,
+}
+
+impl PatchTargets {
+    /// Recognise targets from added paths, each with whether its content is a signed tag: a
+    /// signed `T/CACHEDIR.TAG`, or `T/<p>/.fingerprint/…`.
+    fn recognise(added: &[(&[u8], bool)]) -> Self {
+        let mut profiles = BTreeSet::new();
+        let mut targets = BTreeSet::new();
+        let mut tagged = BTreeSet::new();
+        for (path, signed) in added {
+            let components = path.split(|byte| *byte == b'/').collect::<Vec<_>>();
+            let prefix = |count: usize| components[..count].join(&b'/');
+            let last = components.len() - 1;
+            if last >= 1 && *signed && components[last] == CACHEDIR_TAG_FILE.as_bytes() {
+                targets.insert(prefix(last));
+                tagged.insert(prefix(last));
+            }
+            for (index, component) in components.iter().enumerate() {
+                if *component == CARGO_PROFILE_MARKER.as_bytes() && index >= 1 && index < last {
+                    profiles.insert(prefix(index));
+                    if index >= 2 {
+                        targets.insert(prefix(index - 1));
+                    }
                 }
             }
         }
+        Self {
+            targets: targets
+                .into_iter()
+                .filter(|target| std::str::from_utf8(target).is_ok_and(relative_path))
+                .collect(),
+            profiles,
+            tagged,
+        }
     }
-    let targets = targets
-        .into_iter()
-        .filter(|target| std::str::from_utf8(target).is_ok_and(relative_path))
+
+    /// What the patch shows of `target`: a signed tag, and a profile one or two levels below.
+    fn facts(&self, target: &[u8]) -> TargetFacts {
+        TargetFacts {
+            signed_tag: self.tagged.contains(target),
+            holds_profile: self.profiles.iter().any(|profile| {
+                path_below(profile, target)
+                    .is_some_and(|rest| rest.split(|byte| *byte == b'/').count() <= 2)
+            }),
+        }
+    }
+
+    /// Whether `target/prefix` is a profile the patch adds a `.fingerprint/` file to.
+    fn profile(&self, target: &[u8], prefix: &[u8]) -> bool {
+        let mut directory = target.to_vec();
+        directory.push(b'/');
+        directory.extend_from_slice(prefix);
+        self.profiles.contains(&directory)
+    }
+}
+
+/// Decide which sections of a patch are cargo build layout.
+///
+/// Only a pure addition is stripped: a `new file mode` section whose path decoded, that no other
+/// section names, and that HEAD does not track ([`ScannedSection::tracked`]); and only when that
+/// path is build layout below a directory the patch's own pure additions recognise as a cargo
+/// target, by a Cargo-signed `CACHEDIR.TAG` or a profile's `.fingerprint/`. Every other section is
+/// kept whole: a type change of a tracked path is a `deleted file mode` and a `new file mode`
+/// section of one path, and both halves stay.
+pub fn plan_patch_strip(sections: &[ScannedSection]) -> PatchStripPlan {
+    // Per decoded path: how many sections name it, and whether every one is a `new file mode`.
+    let mut named: BTreeMap<&[u8], (usize, bool)> = BTreeMap::new();
+    for section in sections {
+        if let Some(path) = section.path.as_deref() {
+            let entry = named.entry(path).or_insert((0, true));
+            entry.0 += 1;
+            entry.1 &= section.new_file;
+        }
+    }
+    let pure_addition = |section: &ScannedSection| {
+        section.new_file
+            && !section.tracked
+            && section
+                .path
+                .as_deref()
+                .is_some_and(|path| named.get(path) == Some(&(1, true)))
+    };
+    let added = sections
+        .iter()
+        .filter(|section| pure_addition(section))
+        .filter_map(|section| {
+            section
+                .path
+                .as_deref()
+                .map(|path| (path, section.signed_tag))
+        })
         .collect::<Vec<_>>();
+    let recognised = PatchTargets::recognise(&added);
+    let targets = &recognised.targets;
     let mut plan = PatchStripPlan {
         strip: Vec::with_capacity(sections.len()),
         targets: Vec::new(),
@@ -427,14 +542,14 @@ pub fn plan_patch_strip(sections: &[ScannedSection]) -> PatchStripPlan {
         let target = section
             .path
             .as_deref()
-            .filter(|_| section.new_file)
+            .filter(|_| pure_addition(section))
             .and_then(|path| {
-                layout_target(path, &targets, |target, prefix| {
-                    let mut directory = target.to_vec();
-                    directory.push(b'/');
-                    directory.extend_from_slice(prefix);
-                    profiles.contains(&directory)
-                })
+                layout_target(
+                    path,
+                    targets,
+                    |target| recognised.facts(target),
+                    |target, prefix| recognised.profile(target, prefix),
+                )
             });
         plan.strip.push(target.is_some());
         if let Some(index) = target {
@@ -762,6 +877,8 @@ mod tests {
         ScannedSection {
             path: Some(path.as_bytes().to_vec()),
             new_file,
+            tracked: false,
+            signed_tag: false,
             patch_bytes: 10,
             content_bytes: 3,
         }
@@ -771,6 +888,10 @@ mod tests {
     fn layout_is_the_first_component_or_a_profile_below_the_target() {
         let profiles = ["custom", "x86_64-unknown-linux-gnu/debug"];
         let profile = |prefix: &[u8]| profiles.iter().any(|item| item.as_bytes() == prefix);
+        let all = TargetFacts {
+            signed_tag: true,
+            holds_profile: true,
+        };
         for layout in [
             "debug/deps/libone.rlib",
             "release/one",
@@ -780,7 +901,7 @@ mod tests {
             "custom/deps/libone.rlib",
             "x86_64-unknown-linux-gnu/debug/deps/libone.rlib",
         ] {
-            assert!(is_build_layout(layout.as_bytes(), profile), "{layout}");
+            assert!(is_build_layout(layout.as_bytes(), all, profile), "{layout}");
         }
         for kept in [
             "ess-conformance/report.json",
@@ -790,21 +911,44 @@ mod tests {
             ".future-incompat-report.json",
             "",
         ] {
-            assert!(!is_build_layout(kept.as_bytes(), profile), "{kept}");
+            assert!(!is_build_layout(kept.as_bytes(), all, profile), "{kept}");
         }
+        // `tmp/` is Cargo's only beside a profile, `CACHEDIR.TAG` only when it is signed.
+        let unsigned = TargetFacts {
+            signed_tag: false,
+            holds_profile: true,
+        };
+        assert!(!is_build_layout(b"CACHEDIR.TAG", unsigned, profile));
+        assert!(is_build_layout(b"tmp/scratch/file", unsigned, profile));
+        let profileless = TargetFacts {
+            signed_tag: true,
+            holds_profile: false,
+        };
+        assert!(!is_build_layout(b"tmp/scratch/file", profileless, profile));
+        assert!(is_build_layout(b"CACHEDIR.TAG", profileless, profile));
     }
 
     #[test]
     fn the_outermost_target_holding_layout_is_chosen() {
         let targets = vec![b"target/x86_64".to_vec(), b"target".to_vec()];
         let none = |_: &[u8], _: &[u8]| false;
-        assert_eq!(layout_target(b"target/debug/x", &targets, none), Some(1));
+        let facts = |_: &[u8]| TargetFacts::default();
         assert_eq!(
-            layout_target(b"target/x86_64/debug/x", &targets, none),
+            layout_target(b"target/debug/x", &targets, facts, none),
+            Some(1)
+        );
+        assert_eq!(
+            layout_target(b"target/x86_64/debug/x", &targets, facts, none),
             Some(0)
         );
-        assert_eq!(layout_target(b"target/records/x", &targets, none), None);
-        assert_eq!(layout_target(b"targets/debug/x", &targets, none), None);
+        assert_eq!(
+            layout_target(b"target/records/x", &targets, facts, none),
+            None
+        );
+        assert_eq!(
+            layout_target(b"targets/debug/x", &targets, facts, none),
+            None
+        );
     }
 
     #[test]
@@ -889,6 +1033,8 @@ mod tests {
             ScannedSection {
                 path: None,
                 new_file: true,
+                tracked: false,
+                signed_tag: false,
                 patch_bytes: 10,
                 content_bytes: 3,
             },
@@ -913,6 +1059,126 @@ mod tests {
         // Without any recognising file nothing is a target.
         let plan = plan_patch_strip(&[section("target/debug/deps/libone.rlib", true)]);
         assert_eq!(plan.sections_stripped, 0);
+    }
+
+    /// A section that is not a pure addition of an untracked path is kept, and so is every other
+    /// section naming its path: a type change is a `deleted file mode` and a `new file mode`
+    /// section of one path, and stripping either half loses the tracked file.
+    #[test]
+    fn a_path_named_twice_tracked_or_changed_keeps_every_section() {
+        let profile = section("target/debug/.fingerprint/one/lib", true);
+        let tracked = ScannedSection {
+            tracked: true,
+            ..section("target/debug/tracked.txt", true)
+        };
+        let sections = vec![
+            profile.clone(),
+            section("target/debug/kept.txt", false),
+            section("target/debug/kept.txt", true),
+            section("target/debug/twice", true),
+            section("target/debug/twice", true),
+            tracked,
+            section("target/debug/deps/libone.rlib", true),
+        ];
+        let plan = plan_patch_strip(&sections);
+        assert_eq!(
+            plan.strip,
+            [true, false, false, false, false, false, true],
+            "{plan:?}"
+        );
+        // Only a pure addition recognises a target: a tracked or doubly named profile does not.
+        for disguised in [
+            ScannedSection {
+                tracked: true,
+                ..profile.clone()
+            },
+            section("target/debug/.fingerprint/one/lib", false),
+        ] {
+            let plan = plan_patch_strip(&[
+                disguised,
+                section("target/debug/.fingerprint/one/lib", true),
+                section("target/debug/deps/libone.rlib", true),
+            ]);
+            assert_eq!(plan.sections_stripped, 0, "{plan:?}");
+        }
+    }
+
+    /// In a patch, only a Cargo-signed `CACHEDIR.TAG` or a profile's `.fingerprint/` recognises a
+    /// target; `.rustc_info.json` or an unsigned tag never does, and `tmp/` is stripped only
+    /// beside a profile, as `discard-cache` keeps a profile-less `tmp/` on disk.
+    #[test]
+    fn a_patch_target_needs_a_signed_tag_or_a_profile() {
+        let signed = |path: &str| ScannedSection {
+            signed_tag: true,
+            ..section(path, true)
+        };
+        for unrecognised in [
+            vec![
+                section("target/.rustc_info.json", true),
+                section("target/tmp/scratch", true),
+                section("target/debug/deps/libone.rlib", true),
+            ],
+            vec![
+                section("target/CACHEDIR.TAG", true),
+                section("target/tmp/scratch", true),
+                section("target/debug/deps/libone.rlib", true),
+            ],
+        ] {
+            let plan = plan_patch_strip(&unrecognised);
+            assert_eq!(plan.sections_stripped, 0, "{plan:?}");
+        }
+        // A signed tag recognises the target, but its `tmp/` stays without a profile.
+        let plan = plan_patch_strip(&[
+            signed("target/CACHEDIR.TAG"),
+            section("target/.rustc_info.json", true),
+            section("target/tmp/scratch", true),
+            section("target/debug/deps/libone.rlib", true),
+        ]);
+        assert_eq!(plan.strip, [true, true, false, true], "{plan:?}");
+        // Beside a profile, even a cross-target one, `tmp/` goes; an unsigned tag stays.
+        let plan = plan_patch_strip(&[
+            section("target/CACHEDIR.TAG", true),
+            section(
+                "target/x86_64-unknown-linux-gnu/debug/.fingerprint/one/lib",
+                true,
+            ),
+            section("target/tmp/scratch", true),
+        ]);
+        assert_eq!(plan.strip, [false, true, false], "{plan:?}");
+        let plan = plan_patch_strip(&[
+            signed("target/CACHEDIR.TAG"),
+            section(
+                "target/x86_64-unknown-linux-gnu/debug/.fingerprint/one/lib",
+                true,
+            ),
+            section("target/tmp/scratch", true),
+        ]);
+        assert_eq!(plan.strip, [true, true, true], "{plan:?}");
+    }
+
+    #[test]
+    fn a_signed_tag_is_the_signature_as_the_first_added_line() {
+        let observe = |lines: &[&[u8]]| {
+            let mut size = NewFileSize::default();
+            for line in lines {
+                size.observe(line);
+            }
+            size.signed_tag()
+        };
+        assert!(observe(&[
+            b"new file mode 100644\n",
+            b"@@ -0,0 +1,2 @@\n",
+            b"+Signature: 8a477f597d28d172789f06886806bc55\n",
+            b"+# cargo\n",
+        ]));
+        assert!(!observe(&[
+            b"new file mode 100644\n",
+            b"@@ -0,0 +1,2 @@\n",
+            b"+# cargo\n",
+            b"+Signature: 8a477f597d28d172789f06886806bc55\n",
+        ]));
+        assert!(!observe(&[b"@@ -0,0 +1 @@\n", b"+Signature: 0000\n"]));
+        assert!(!observe(&[b"GIT binary patch\n", b"literal 3\n"]));
     }
 
     #[test]

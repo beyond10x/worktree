@@ -40,11 +40,13 @@ independent policy: every decision must come from the public façade.
   a tree is returned to HEAD by resetting the index, then restoring or deleting each file only after
   re-hashing it against the archive, before the non-forced removal. Archiving never modifies the
   tree, and only `prune-archives --apply` deletes an archive, and only under its rule.
-- Cargo build layout is the one content an archive leaves out. Below a cargo target that
-  `discard-cache`'s structural rule recognises, a file neither HEAD nor the index tracks is build
-  layout when its first component below the target is `debug`, `release`, `tmp`, `CACHEDIR.TAG`,
-  `.rustc_info.json` or a profile directory (holding `.fingerprint/`; also
-  `<target>/<triple>/<profile>/`); everything else below the target stays archived. Such an
+- Cargo build layout is the one content an archive leaves out. Below a cargo target recognised
+  on disk by `discard-cache`'s structure (a valid tag or the untagged-target rule, and a profile),
+  whether or not a tracked file below it hides it from `discard-cache`'s walk of ignored entries,
+  a file neither HEAD nor the index tracks is build layout when its first component below the
+  target is `debug`, `release`, `.rustc_info.json`, `tmp`, a Cargo-signed `CACHEDIR.TAG` or a
+  profile directory (holding `.fingerprint/`; also `<target>/<triple>/<profile>/`); everything
+  else below the target, every tracked file included, stays archived. Such an
   archive is `worktree.archive/3` and records per target the files and bytes left out; one that
   left nothing out is written exactly as format 1 or 2. Its fingerprint excludes that layout, and
   layout below a target it did not record refuses as `archive-stale`. Removal through it deletes
@@ -54,10 +56,12 @@ independent policy: every decision must come from the public façade.
   nothing. `--apply` takes exact `--id` values only, re-assesses each, and rewrites only an archive
   whose manifest is valid, whose directory holds only recorded files, whose tree path is absent and
   whose repository exists. It streams `dirty.patch` (verifying its recorded digest) and removes only
-  whole `diff --git` sections that add a file (`new file mode`) whose decoded path is build layout
-  below a directory the patch's own added files recognise as a target (`<t>/CACHEDIR.TAG`,
-  `<t>/.rustc_info.json` or `<t>/<p>/.fingerprint/…`); an undecodable path keeps its section, and
-  nested images are never touched. The new patch is written outside the archive, verified to apply
+  whole `diff --git` sections that purely add an untracked file: `new file mode`, a decoded path
+  no other section names, and a path HEAD's tree (read from Git, never the patch) holds neither
+  as a file or directory nor below a file. Such a path is stripped only when it is build layout
+  below a directory the patch's own pure additions recognise as a target (a Cargo-signed
+  `<t>/CACHEDIR.TAG` or `<t>/<p>/.fingerprint/…`; `<t>/tmp/` only beside a profile). Both halves of
+  a type change stay, an undecodable path keeps its section, and nested images are never touched. The new patch is written outside the archive, verified to apply
   over HEAD in a scratch index (never a tree's or the repository's own index), `worktree_tree` is
   recomputed from it, and only then are the patch replaced (or deleted when nothing remains) and
   the format 3 manifest written last. Any refusal leaves the archive byte for byte as it was; an

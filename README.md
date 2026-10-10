@@ -148,8 +148,10 @@ Cargo's own build layout is left out, because the next build recreates it from t
 Below a cargo target that `discard-cache` recognises by structure (a valid `CACHEDIR.TAG`, or an
 untagged `target/` beside a tracked `Cargo.toml` holding a full profile), a file neither HEAD nor
 the index tracks is build layout when its first component below the target is `debug`, `release`,
-`tmp`, `CACHEDIR.TAG`, `.rustc_info.json` or a profile directory (one holding `.fingerprint/`; also
-`<target>/<triple>/<profile>/`). That covers `deps/`, `build/`, `.fingerprint/`, `incremental/`
+`.rustc_info.json`, `tmp`, a `CACHEDIR.TAG` carrying Cargo's signature, or a profile directory (one
+holding `.fingerprint/`; also `<target>/<triple>/<profile>/`). The target is recognised on disk by
+that structure and a profile, also when a file Git tracks below it keeps `discard-cache` from
+reaching it; the tracked file stays archived. That covers `deps/`, `build/`, `.fingerprint/`, `incremental/`
 and `*.d`. Everything else below the target, such as `target/ess-conformance/report.json`, and
 every other ignored directory stays in the archive. The command prints `left out <files> file(s),
 <bytes> bytes of cargo build output under <target>`. An archive that left nothing out is written
@@ -267,10 +269,12 @@ Archives written before build output was left out hold it in `dirty.patch` and a
 `--repo`, `--scope` and `--id` selection, and never deletes an archive. A dry-run, the default,
 streams each patch and lists `directory, worktree id, bytes, verdict`, then the bytes and sections
 it would strip, the sections, bytes and nested images that stay, and the prune verdict the archive
-would have afterwards. Only a section that adds a file (`new file mode`) whose path, C-unquoted as
-Git writes it, is build layout below a directory the patch's own added files recognise as a target
-(`<t>/CACHEDIR.TAG`, `<t>/.rustc_info.json` or `<t>/<p>/.fingerprint/…`) is stripped; a section
-whose path cannot be decoded, every change to a tracked file and every nested image stay.
+would have afterwards. Only a section that purely adds an untracked file is stripped: `new file
+mode`, a path, C-unquoted as Git writes it, that no other section names and that HEAD's tree, read
+from Git, does not track, and that is build layout below a directory the patch's own pure
+additions recognise as a target (a Cargo-signed `<t>/CACHEDIR.TAG` or `<t>/<p>/.fingerprint/…`;
+`<t>/tmp/` only beside a profile). A section whose path cannot be decoded, both halves of a type
+change, every other change to a tracked file and every nested image stay.
 Verdicts, in this order:
 
 | Verdict | When |

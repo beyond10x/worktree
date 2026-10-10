@@ -15,9 +15,10 @@ use b10x_worktree_domain::{
     ARCHIVE_BUNDLE_FILE, ARCHIVE_HEAD_REF, ARCHIVE_MANIFEST_FILE, ARCHIVE_PATCH_FILE,
     ArchiveContents, ArchiveDirectoryEntry, ArchiveEntryKind, ArchiveEvidence, ArchiveFile,
     ArchiveManifest, ArchiveReference, ArchiveRequest, ArchiveStateCheck, BuildOutput,
-    BuildOutputOrigin, BuildOutputTarget, NestedRepositoryImage, NewFileSize, PatchStripPlan,
-    Refusal, ScannedSection, WorktreeRecord, archive_image_file, diff_git_path, is_extended_header,
-    layout_target, relative_path,
+    BuildOutputOrigin, BuildOutputTarget, CACHEDIR_TAG_FILE, CARGO_PROFILE_MARKER,
+    NestedRepositoryImage, NewFileSize, PatchStripPlan, Refusal, ScannedSection, TargetFacts,
+    WorktreeRecord, archive_image_file, diff_git_path, is_extended_header, layout_target,
+    relative_path,
 };
 use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -33,6 +34,9 @@ type NestedRoots = Vec<Vec<u8>>;
 
 /// Untracked build layout paths, each with the index of its target.
 type LayoutPaths = Vec<(Vec<u8>, usize)>;
+
+/// Paths relative to a tree root, as raw bytes.
+type PathSet = BTreeSet<Vec<u8>>;
 
 /// Mode, blob id and path of one working-tree file, as Git would index it.
 struct Entry {
@@ -1066,14 +1070,57 @@ impl Layout {
     }
 }
 
-/// The recognised cargo targets of a tree, as `discard-cache` recognises them, that a manifest
-/// can name: UTF-8 relative paths.
-fn recognised_targets(worktree: &Path) -> Result<Vec<Vec<u8>>, Refusal> {
-    Ok(cache::cargo_targets(worktree)?
+/// The cargo targets of a tree that a manifest can name (UTF-8 relative paths): those
+/// `discard-cache` recognises among the ignored entries Git reports, and every directory in which
+/// one of `paths` is a `CACHEDIR.TAG` or below a profile's `.fingerprint/` that the archive's own
+/// structural rule ([`cache::archive_target`]) recognises on disk. One tracked file below a target
+/// hides the target from the first and never from the second; the tracked file itself stays
+/// archived because it is never build layout.
+fn recognised_targets(worktree: &Path, paths: &[Vec<u8>]) -> Result<Vec<Vec<u8>>, Refusal> {
+    let mut targets = cache::cargo_targets(worktree)?
         .into_iter()
-        .filter(|target| target.to_str().is_some_and(relative_path))
         .map(|target| target.into_os_string().into_vec())
+        .collect::<BTreeSet<_>>();
+    let mut candidates = BTreeSet::new();
+    for path in paths {
+        let components = path.split(|byte| *byte == b'/').collect::<Vec<_>>();
+        let prefix = |count: usize| components[..count].join(&b'/');
+        let last = components.len() - 1;
+        if last >= 1 && components[last] == CACHEDIR_TAG_FILE.as_bytes() {
+            candidates.insert(prefix(last));
+        }
+        for (index, component) in components.iter().enumerate().take(last).skip(2) {
+            if *component == CARGO_PROFILE_MARKER.as_bytes() {
+                candidates.insert(prefix(index - 1));
+                if index >= 3 {
+                    candidates.insert(prefix(index - 2));
+                }
+            }
+        }
+    }
+    candidates.retain(|candidate| !targets.contains(candidate));
+    if !candidates.is_empty() {
+        let tracked = cache::tracked_paths(worktree)?;
+        for candidate in candidates {
+            let relative = Path::new(OsStr::from_bytes(&candidate));
+            if cache::archive_target(worktree, relative, &tracked)? {
+                targets.insert(candidate);
+            }
+        }
+    }
+    Ok(targets
+        .into_iter()
+        .filter(|target| std::str::from_utf8(target).is_ok_and(relative_path))
         .collect())
+}
+
+/// What is known on disk of a recognised target: whether its `CACHEDIR.TAG` is Cargo's. Every
+/// recognised target holds a profile.
+fn facts_on_disk(worktree: &Path, target: &[u8]) -> TargetFacts {
+    TargetFacts {
+        signed_tag: cache::signed_tag(&worktree.join(OsStr::from_bytes(target))),
+        holds_profile: true,
+    }
 }
 
 /// Every path HEAD or the tree's index tracks: such a file is never build layout.
@@ -1101,25 +1148,34 @@ fn profile_on_disk(worktree: &Path, target: &[u8], prefix: &[u8]) -> bool {
 
 /// Which of `paths` are build layout below a target recognised on disk.
 fn observe_layout(worktree: &Path, head: &str, paths: &[Vec<u8>]) -> Result<Layout, Refusal> {
-    let targets = recognised_targets(worktree)?;
+    let targets = recognised_targets(worktree, paths)?;
     if targets.is_empty() {
         return Ok(Layout::default());
     }
     let tracked = tracked_paths(worktree, head)?;
+    let facts = targets
+        .iter()
+        .map(|target| (target.clone(), facts_on_disk(worktree, target)))
+        .collect::<BTreeMap<_, _>>();
     let mut profiles: BTreeMap<Vec<u8>, bool> = BTreeMap::new();
     let mut files = BTreeMap::new();
     for path in paths {
         if tracked.contains(path) {
             continue;
         }
-        let target = layout_target(path, &targets, |target, prefix| {
-            let mut key = target.to_vec();
-            key.push(b'/');
-            key.extend_from_slice(prefix);
-            *profiles
-                .entry(key)
-                .or_insert_with(|| profile_on_disk(worktree, target, prefix))
-        });
+        let target = layout_target(
+            path,
+            &targets,
+            |target| facts[target],
+            |target, prefix| {
+                let mut key = target.to_vec();
+                key.push(b'/');
+                key.extend_from_slice(prefix);
+                *profiles
+                    .entry(key)
+                    .or_insert_with(|| profile_on_disk(worktree, target, prefix))
+            },
+        );
         if let Some(index) = target {
             let absolute = worktree.join(OsStr::from_bytes(path));
             let metadata = std::fs::symlink_metadata(&absolute)
@@ -1665,12 +1721,16 @@ struct LeftOut<'a> {
 impl<'a> LeftOut<'a> {
     /// Recognise the tree's targets now, keeping those `manifest` left layout out below. A format
     /// 1 or 2 archive left nothing out.
-    fn observe(manifest: &ArchiveManifest, worktree: &'a Path) -> Result<Self, Refusal> {
+    fn observe(
+        manifest: &ArchiveManifest,
+        worktree: &'a Path,
+        paths: &[Vec<u8>],
+    ) -> Result<Self, Refusal> {
         let recorded = left_out_targets(manifest);
         let targets = if recorded.is_empty() {
             Vec::new()
         } else {
-            recognised_targets(worktree)?
+            recognised_targets(worktree, paths)?
                 .into_iter()
                 .filter(|target| recorded.contains(target.as_slice()))
                 .collect()
@@ -1680,9 +1740,12 @@ impl<'a> LeftOut<'a> {
 
     /// The target `path` is build layout below, observed on disk now.
     fn target_of(&self, path: &[u8]) -> Option<usize> {
-        layout_target(path, &self.targets, |target, prefix| {
-            profile_on_disk(self.worktree, target, prefix)
-        })
+        layout_target(
+            path,
+            &self.targets,
+            |target| facts_on_disk(self.worktree, target),
+            |target, prefix| profile_on_disk(self.worktree, target, prefix),
+        )
     }
 
     /// Split untracked paths into build layout, each with its target, and everything else.
@@ -1849,7 +1912,7 @@ pub(crate) fn discard(record: &WorktreeRecord, archive: &Path, head: &str) -> Re
     }
     // The index is HEAD now, so every path here is untracked. Build layout the archive left out
     // is deleted as cache; everything else must still match the archive.
-    let left_out = LeftOut::observe(&manifest, worktree)?;
+    let left_out = LeftOut::observe(&manifest, worktree, &others)?;
     let (layout, others) = left_out.split(others);
     for entry in hash_files(worktree, &scratch, others, false)? {
         if archived.get(&entry.path) != Some(&(entry.mode, entry.id.clone())) {
@@ -2081,6 +2144,8 @@ pub(crate) fn scan_patch(
                 ScannedSection {
                     path: diff_git_path(header),
                     new_file: false,
+                    tracked: false,
+                    signed_tag: false,
                     patch_bytes: line.len() as u64,
                     content_bytes: 0,
                 },
@@ -2105,9 +2170,75 @@ pub(crate) fn scan_patch(
         .into_iter()
         .map(|(mut section, size)| {
             section.content_bytes = size.bytes();
+            section.signed_tag = size.signed_tag();
             section
         })
         .collect())
+}
+
+/// Scan an archive's patch ([`scan_patch`]) and mark each section whose decoded path HEAD's tree
+/// tracks, read from Git and never from the patch's own headers: a file or directory at that
+/// path, or a file at one of its ancestors. Such a section is never stripped.
+pub(crate) fn scan_patch_against_head(
+    archive: &Path,
+    manifest: &ArchiveManifest,
+) -> Result<Vec<ScannedSection>, Refusal> {
+    let mut sections = scan_patch(archive, manifest)?;
+    let (files, directories) = head_paths(archive, manifest)?;
+    for section in &mut sections {
+        let Some(path) = section.path.as_deref() else {
+            continue;
+        };
+        let below_a_file = path
+            .iter()
+            .enumerate()
+            .filter(|(_, byte)| **byte == b'/')
+            .any(|(at, _)| files.contains(&path[..at]));
+        section.tracked = files.contains(path) || directories.contains(path) || below_a_file;
+    }
+    Ok(sections)
+}
+
+/// The paths of the files and of the directories HEAD's tree holds. HEAD is read from the
+/// repository, or from the archive's own bundle through scratch objects when the repository no
+/// longer holds it; nothing is written to the repository.
+fn head_paths(archive: &Path, manifest: &ArchiveManifest) -> Result<(PathSet, PathSet), Refusal> {
+    ProcessGit::validate_object_id(&manifest.head)?;
+    let repository = manifest.repository_root.as_path();
+    let arguments =
+        |tree: &str| ["ls-tree", "-r", "-t", "-z", "--full-tree", tree].map(String::from);
+    let listing =
+        if let Ok(listing) = ProcessGit::output_bytes(repository, arguments(&manifest.head)) {
+            listing
+        } else {
+            let scratch = Scratch::new(repository, archive.parent().unwrap_or(archive))?;
+            let tree = archived_head_tree(&scratch, repository, archive, manifest)?;
+            run(scratch.git(repository, None).args(arguments(&tree)), None)?
+        };
+    let mut files = BTreeSet::new();
+    let mut directories = BTreeSet::new();
+    for record in listing
+        .split(|byte| *byte == 0)
+        .filter(|record| !record.is_empty())
+    {
+        let malformed = || {
+            unusable(format!(
+                "git ls-tree {} wrote a malformed record",
+                manifest.head
+            ))
+        };
+        let tab = record
+            .iter()
+            .position(|byte| *byte == b'\t')
+            .ok_or_else(malformed)?;
+        let (info, path) = (&record[..tab], record[tab + 1..].to_vec());
+        match info.split(|byte| *byte == b' ').nth(1) {
+            Some(b"tree") => directories.insert(path),
+            Some(_) => files.insert(path),
+            None => return Err(malformed()),
+        };
+    }
+    Ok((files, directories))
 }
 
 /// Stream `source` into a new file at `destination`, keeping each whole section `strip` does not
@@ -2297,6 +2428,11 @@ pub(crate) fn strip(
             patch_path.display()
         )));
     }
+    // A crash between this replacement and the manifest rename leaves a patch the old manifest's
+    // digest no longer describes: every later strip refuses it as unusable, and prune, seeing a
+    // recorded patch, never finds it removable (fail-closed).
+    // No recovery is attempted: the original bytes are gone, and keeping them under a second
+    // name would put a file in the archive its manifest does not name.
     let replaced = if remains {
         std::fs::rename(&staged_patch, &patch_path)
     } else {
@@ -2661,5 +2797,54 @@ index 0000000000000000000000000000000000000000..78981922613b2afb6025042ff6bd878a
         )
         .unwrap_err();
         assert_eq!(refusal.code, "archive-patch-unusable", "{refusal}");
+    }
+
+    /// Whether a section's path is tracked is read from HEAD's tree in the repository, whatever
+    /// the patch's headers say: every section of [`PATCH`] claims `new file mode`.
+    #[test]
+    fn sections_are_marked_tracked_from_heads_tree_not_the_patch() {
+        let repository = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(repository.path())
+                .args([
+                    "-c",
+                    "user.name=Fixture",
+                    "-c",
+                    "user.email=f@example.invalid",
+                ])
+                .args(["-c", "commit.gpgsign=false"])
+                .args(args)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{args:?}: {output:?}");
+            String::from_utf8(output.stdout).unwrap()
+        };
+        git(&["init", "--quiet"]);
+        // `.fingerprint` a file, so `.fingerprint/a` lies below a tracked file; `libé` a tracked
+        // directory; `notes.txt` untracked.
+        let root = repository.path();
+        std::fs::create_dir_all(root.join("target/debug/lib\u{e9}")).unwrap();
+        std::fs::write(root.join("target/debug/.fingerprint"), "file\n").unwrap();
+        std::fs::write(root.join("target/debug/lib\u{e9}/inner"), "inner\n").unwrap();
+        git(&["add", "-f", "."]);
+        git(&["commit", "--quiet", "-m", "tracked"]);
+        let head = git(&["rev-parse", "HEAD"]).trim().to_owned();
+
+        let (archive, mut manifest) = patched_archive(PATCH);
+        manifest.repository_root = root.to_path_buf();
+        manifest.head = head;
+        let sections = scan_patch_against_head(archive.path(), &manifest).unwrap();
+        assert!(sections.iter().all(|section| section.new_file));
+        assert_eq!(
+            sections
+                .iter()
+                .map(|section| section.tracked)
+                .collect::<Vec<_>>(),
+            [true, true, false]
+        );
     }
 }

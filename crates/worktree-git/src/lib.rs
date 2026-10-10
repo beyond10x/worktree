@@ -1135,7 +1135,7 @@ impl GitPort for ProcessGit {
         archive: &Path,
         manifest: &ArchiveManifest,
     ) -> Result<Vec<ScannedSection>, Refusal> {
-        archive::scan_patch(archive, manifest)
+        archive::scan_patch_against_head(archive, manifest)
     }
 
     #[cfg(unix)]

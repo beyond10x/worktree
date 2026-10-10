@@ -421,6 +421,26 @@ fn archive_keeps_non_layout_files_under_target() {
     }
 }
 
+/// A target that counts as tagged without a valid tag may hold a `CACHEDIR.TAG` Cargo did not
+/// write: only a Cargo-signed tag is build layout, as `discard-cache` keeps an unsigned one.
+#[test]
+fn archive_keeps_an_unsigned_cachedir_tag() {
+    let fixture = Fixture::new(true);
+    let tree = fixture.tree("unsigned", true);
+    Fixture::build(&tree, false);
+    write(&tree.join("target/CACHEDIR.TAG"), "not cargo's\n");
+
+    let archive = fixture.archive("unsigned");
+    assert_eq!(
+        archive["manifest"]["format"], "worktree.archive/3",
+        "{archive}"
+    );
+    let directory = PathBuf::from(archive["path"].as_str().unwrap());
+    let patch = std::fs::read_to_string(directory.join("dirty.patch")).unwrap();
+    assert!(patch.contains("b/target/CACHEDIR.TAG"), "{patch}");
+    assert!(!patch.contains("target/debug/"), "{patch}");
+}
+
 #[test]
 fn archive_without_build_output_keeps_format_2_bytes() {
     let fixture = Fixture::new(true);
@@ -539,6 +559,50 @@ fn gc_refuses_when_a_left_out_path_is_no_longer_build_layout() {
     assert_eq!(applied["refusal"]["code"], "archive-stale", "{applied}");
     assert!(tree.join("target/bench/deps/libone-1.rlib").is_file());
     assert!(tree.join("target/debug/deps/libone-1.rlib").is_file());
+}
+
+/// A second cargo target that appears after the archive was written is recognised, so its layout
+/// is left out of the fingerprint and the fingerprint still matches; only the check that every
+/// target with left-out layout is one the archive recorded refuses it.
+#[test]
+fn gc_refuses_layout_below_a_target_the_archive_did_not_record() {
+    let fixture = Fixture::new(true);
+    let tree = fixture.tree("second", false);
+    Fixture::build(&tree, true);
+    write(&tree.join("notes.txt"), "never committed\n");
+    let archive = fixture.archive("second");
+    let targets = &archive["manifest"]["build_output"]["targets"];
+    assert_eq!(targets.as_array().unwrap().len(), 1, "{archive}");
+    assert_eq!(targets[0]["path"], "target", "{archive}");
+    fixture.ok(&["finish", "second"]);
+    // A tagged, ignored target holding a profile, built after the archive.
+    write(&fixture.repository.join(".git/info/exclude"), "/build/\n");
+    write(&tree.join("build/CACHEDIR.TAG"), TAG);
+    write(&tree.join("build/debug/.fingerprint/two-1/lib-two"), "f\n");
+    write(&tree.join("build/debug/deps/libtwo-1.rlib"), [2u8; 16]);
+
+    for mode in ["--dry-run", "--apply"] {
+        let assessment = fixture.gc(mode, "second");
+        assert_eq!(
+            assessment["refusal"]["code"], "archive-stale",
+            "{mode}: {assessment}"
+        );
+        let message = assessment["refusal"]["message"].as_str().unwrap();
+        assert!(
+            message.contains("cargo build layout below build was not left out"),
+            "{mode}: {message}"
+        );
+    }
+    for kept in [
+        "build/CACHEDIR.TAG",
+        "build/debug/.fingerprint/two-1/lib-two",
+        "build/debug/deps/libtwo-1.rlib",
+        "target/debug/deps/libone-1.rlib",
+        "target/CACHEDIR.TAG",
+        "notes.txt",
+    ] {
+        assert!(tree.join(kept).is_file(), "{kept}");
+    }
 }
 
 #[test]
@@ -771,4 +835,130 @@ fn strip_apply_without_id_refuses() {
         "{error}"
     );
     assert_eq!(snapshot(&archive), before);
+}
+
+/// Apply an archive's `dirty.patch` over its HEAD in a scratch index and return `ls-files -s`
+/// of the result, one `<mode> <blob> <stage>\t<path>` line each.
+fn applied_listing(repository: &Path, archive: &Path) -> String {
+    let manifest: Value =
+        serde_json::from_slice(&std::fs::read(archive.join("manifest.json")).unwrap()).unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let index = scratch.path().join("index");
+    let ok = |args: &[&str]| {
+        let output = git_output(repository, args, Some(&index));
+        assert!(output.status.success(), "{args:?}: {output:?}");
+        String::from_utf8(output.stdout).unwrap()
+    };
+    ok(&["read-tree", manifest["head"].as_str().unwrap()]);
+    if archive.join("dirty.patch").exists() {
+        ok(&[
+            "apply",
+            "--cached",
+            "--binary",
+            archive.join("dirty.patch").to_str().unwrap(),
+        ]);
+    }
+    ok(&["ls-files", "-s"])
+}
+
+/// A tracked file under the target replaced by a symlink is a type change: Git writes it as a
+/// `deleted file mode` section and a `new file mode 120000` section of the same, tracked path.
+/// The contract keeps every change to a tracked file; stripping the second half restores the
+/// tree without the symlink.
+#[test]
+fn strip_keeps_a_tracked_file_replaced_by_a_symlink_under_target() {
+    let fixture = Fixture::new(false);
+    let archive = fixture.legacy_archive("typechange", true, &|tree| {
+        write(&tree.join("target/debug/kept.txt"), "committed\n");
+        git(tree, &["add", "-f", "target/debug/kept.txt"]);
+        git(
+            tree,
+            &["commit", "--quiet", "-m", "track a file under target"],
+        );
+        let id = "HEAD:refs/heads/typechange";
+        git(tree, &["push", "--quiet", "--force", "origin", id]);
+        std::fs::remove_file(tree.join("target/debug/kept.txt")).unwrap();
+        std::os::unix::fs::symlink("../../source", tree.join("target/debug/kept.txt")).unwrap();
+    });
+    let before = applied_listing(&fixture.repository, &archive);
+    assert!(
+        before
+            .lines()
+            .any(|line| line.starts_with("120000 ") && line.ends_with("\ttarget/debug/kept.txt")),
+        "{before}"
+    );
+
+    fixture.strip(&["--apply", "--id", "typechange"]);
+
+    let after = applied_listing(&fixture.repository, &archive);
+    assert!(
+        after
+            .lines()
+            .any(|line| line.starts_with("120000 ") && line.ends_with("\ttarget/debug/kept.txt")),
+        "the archive no longer recreates the tracked path as the symlink it was:\n{after}"
+    );
+}
+
+/// A file Git tracks below the target is never build layout, but it must not stop the rest of the
+/// target's layout from being left out: the contract excludes the tracked file, not the target.
+#[test]
+fn archive_leaves_layout_out_beside_a_tracked_file_under_target() {
+    let fixture = Fixture::new(true);
+    let tree = fixture.tree("beside", true);
+    write(&tree.join("target/debug/kept.txt"), "committed\n");
+    git(&tree, &["add", "-f", "target/debug/kept.txt"]);
+    git(
+        &tree,
+        &["commit", "--quiet", "-m", "track a file under target"],
+    );
+    git(
+        &tree,
+        &[
+            "push",
+            "--quiet",
+            "--force",
+            "origin",
+            "HEAD:refs/heads/beside",
+        ],
+    );
+    Fixture::build(&tree, true);
+
+    let archive = fixture.archive("beside");
+    assert_eq!(
+        archive["manifest"]["format"], "worktree.archive/3",
+        "{archive}"
+    );
+    let directory = PathBuf::from(archive["path"].as_str().unwrap());
+    let patch = std::fs::read_to_string(directory.join("dirty.patch")).unwrap_or_default();
+    assert!(!patch.contains("target/debug/deps/"), "{patch}");
+}
+
+/// Removal through such an archive deletes the layout left out beside the tracked file as cache
+/// and leaves the tracked file to Git.
+#[test]
+fn gc_removes_a_tree_with_a_tracked_file_under_its_target() {
+    let fixture = Fixture::new(true);
+    let tree = fixture.tree("tracked", true);
+    write(&tree.join("target/debug/kept.txt"), "committed\n");
+    git(&tree, &["add", "-f", "target/debug/kept.txt"]);
+    git(
+        &tree,
+        &["commit", "--quiet", "-m", "track a file under target"],
+    );
+    git(
+        &tree,
+        &[
+            "push",
+            "--quiet",
+            "--force",
+            "origin",
+            "HEAD:refs/heads/tracked",
+        ],
+    );
+    Fixture::build(&tree, true);
+    let archive = fixture.archive("tracked");
+    assert_eq!(archive["manifest"]["format"], "worktree.archive/3");
+    assert!(archive["manifest"]["patch"].is_null(), "{archive}");
+
+    fixture.retire("tracked", &tree);
 }

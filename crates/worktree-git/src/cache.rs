@@ -51,6 +51,43 @@ pub(crate) fn cargo_targets(worktree: &Path) -> Result<Vec<PathBuf>, Refusal> {
     Ok(targets)
 }
 
+/// Whether `relative` is a cargo target by the structure `discard-cache` requires of one, read
+/// on disk whatever Git tracks below it: a real directory that is tagged or counts as tagged
+/// ([`cargo_target_root`]) and holds a profile, directly or below a target-triple directory.
+///
+/// This is the archive's own rule. `discard-cache` reaches a target only through an ignored
+/// entry Git reports, so one tracked (or `git add -f`) file below a target hides the target from
+/// it, and it keeps that rule for its deletions. An archive leaves out only untracked layout
+/// below the target, file by file, so the tracked file never decides whether the target is one.
+pub(crate) fn archive_target(
+    worktree: &Path,
+    relative: &Path,
+    tracked: &BTreeSet<PathBuf>,
+) -> Result<bool, Refusal> {
+    let directory = worktree.join(relative);
+    if !real_directory(&directory) {
+        return Ok(false);
+    }
+    if !cargo_target_root(worktree, relative, tracked) {
+        return Ok(false);
+    }
+    for name in read_names(&directory)? {
+        if name == CARGO_TARGET_TMP {
+            continue;
+        }
+        let child = directory.join(&name);
+        if cargo_profile(&child) || (real_directory(&child) && holds_profile(&child)?) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Whether `directory/CACHEDIR.TAG` is a regular file carrying Cargo's signature.
+pub(crate) fn signed_tag(directory: &Path) -> bool {
+    cache_tagged(directory)
+}
+
 /// Classify every ignored entry of the tree.
 fn classify_tree(worktree: &Path) -> Result<Plan, Refusal> {
     let status = ProcessGit::output_bytes(
@@ -148,7 +185,8 @@ fn ignored_entries(status: &[u8]) -> Result<Vec<(PathBuf, bool)>, Refusal> {
     Ok(entries)
 }
 
-fn tracked_paths(worktree: &Path) -> Result<BTreeSet<PathBuf>, Refusal> {
+/// Every path the tree's index tracks.
+pub(crate) fn tracked_paths(worktree: &Path) -> Result<BTreeSet<PathBuf>, Refusal> {
     ProcessGit::output_bytes(worktree, ["ls-files", "-z"])?
         .split(|byte| *byte == 0)
         .filter(|field| !field.is_empty())
