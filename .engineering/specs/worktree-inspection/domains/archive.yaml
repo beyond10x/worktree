@@ -27,6 +27,29 @@ types:
     kind: enum
     variants: [Removable, CommitsNotOnRemote, UncommittedState, NestedRepositories, TreeStillPresent, RemoteProofUnavailable, UnrecordedContent, InvalidManifest]
 
+  # The verdict `prune-archives --strip-build-output` gives one archive directory, checked in this
+  # order. Only Strippable is rewritten under --apply; every refusal leaves the archive untouched.
+  #   InvalidManifest: manifest.json is missing, unreadable or of an unknown format.
+  #   UnrecordedContent: the directory holds an entry the manifest does not name.
+  #   TreeStillPresent: the registered tree path exists; the archive may be its recovery proof.
+  #   RepositoryGone: repository_root is gone, so the new patch cannot be verified over HEAD.
+  #   PatchUnusable: dirty.patch no longer has its recorded digest, holds bytes before its first
+  #     `diff --git` section, or the stripped patch does not apply over HEAD.
+  #   NothingToStrip: no patch, or no `new file mode` section whose path is build layout.
+  #   Strippable: at least one `new file mode` section adds a file under build layout.
+  - name: worktree.archive.StripVerdict
+    kind: enum
+    variants: [Strippable, NothingToStrip, InvalidManifest, UnrecordedContent, TreeStillPresent, RepositoryGone, PatchUnusable]
+
+  # How a left-out file was found to be cargo build layout.
+  #   Archive: `archive` observed it on disk below a target `discard-cache` recognises by structure.
+  #   Strip: `--strip-build-output` found its `new file mode` section in an existing patch, below a
+  #     directory for which the patch holds `T/CACHEDIR.TAG`, `T/.rustc_info.json` or
+  #     `T/<p>/.fingerprint/…`.
+  - name: worktree.archive.BuildOutputOrigin
+    kind: enum
+    variants: [Archive, Strip]
+
 # The manifest of one local archive (crates/worktree-domain/src/archive.rs, ArchiveManifest). It
 # stands in for remote recovery proof. Only `prune-archives --apply` deletes one, and only an
 # archive assessed Removable (worktree.archive.PruneVerdict) in the same run. Its worktree is the
@@ -37,8 +60,11 @@ entities:
       name: worktree_id
       type: String
     fields:
-      # worktree.archive/1 when the archive images no nested repository; worktree.archive/2,
-      # which adds the images, when it images at least one. Readers accept both.
+      # worktree.archive/1 when the archive images no nested repository and leaves nothing out;
+      # worktree.archive/2, which adds the images, when it images at least one and leaves nothing
+      # out; worktree.archive/3, which adds build_output (and may hold images), when it left cargo
+      # build layout out. Formats 1 and 2 are immutable; readers accept all three, and an archive
+      # with nothing left out is written exactly as format 1 or 2.
       - name: format
         type: String
       - name: head
@@ -46,17 +72,30 @@ entities:
       # Commits HEAD adds over every advertised remote ref; commits.bundle carries them.
       - name: unique_commits
         type: Integer
-      # Git tree id of the tree's on-disk content outside every imaged nested repository.
+      # Git tree id of the tree's on-disk content outside every imaged nested repository and,
+      # in format 3, outside the cargo build layout it left out.
       - name: worktree_tree
         type: String
       - name: created_at
         type: Integer
+      # Format 3 only: totals over build_output, absent (0) in formats 1 and 2.
+      - name: build_output_files
+        type: Integer
+      - name: build_output_bytes
+        type: Integer
     invariants:
       - unique_commits >= 0
+      - build_output_files >= 0
+      - build_output_bytes >= 0
     relations:
       - name: nested_repositories
         kind: owns
         target: worktree.archive.NestedRepositoryImage
+        cardinality: many
+        via: worktree_id
+      - name: build_output
+        kind: owns
+        target: worktree.archive.BuildOutputTarget
         cardinality: many
         via: worktree_id
     lifecycle:
@@ -103,6 +142,104 @@ entities:
     # `.git` that is a file or a symlink (a submodule or a linked worktree), a `.git` holding
     # `commondir`, non-empty `objects/info/alternates`, any `worktrees/` entry or any symlink, and a
     # root at or below which HEAD or the index tracks any path (a submodule's gitlink included).
+
+  # Cargo build layout one archive left out, per cargo target directory T (relative to the tree
+  # root), in path-byte order. A path is build layout when Git tracks it neither in HEAD nor in
+  # the index and its first component under T is `debug`, `release`, `tmp`, `CACHEDIR.TAG`,
+  # `.rustc_info.json`, or a profile directory (one holding `.fingerprint/` as a direct child;
+  # also `T/<triple>/<profile>/`). Every other path under T, and every other ignored directory,
+  # stays in the archive.
+  # Removal through a format 3 archive re-observes each left-out path immediately before deleting
+  # it: it must still be build layout below this same recognised T and is then deleted as cache;
+  # anything else that differs from worktree_tree refuses as archive-stale.
+  - name: worktree.archive.BuildOutputTarget
+    identity:
+      name: path
+      type: String
+    fields:
+      - name: worktree_id
+        type: String
+      # How the layout was found; one entry per path and origin, in path-byte then origin order,
+      # so an archive stripped after it was written may hold both.
+      - name: origin
+        type: worktree.archive.BuildOutputOrigin
+      # Files left out below this target.
+      - name: files
+        type: Integer
+      # Their content bytes: the file sizes on disk (Archive), or the sizes the stripped sections
+      # would have recreated (Strip).
+      - name: bytes
+        type: Integer
+    invariants:
+      - files >= 1
+      - bytes >= 0
+    lifecycle:
+      initial: LeftOut
+      states: [LeftOut]
+      terminal: [LeftOut]
+
+  # A report of one archive directory assessed by `prune-archives --strip-build-output`, not a
+  # persisted lifecycle. Selection (`--repo`, `--scope repo|profile`, `--id`) and the skipped
+  # entries are exactly those of ArchivePruneAssessment. `--dry-run` (the default) writes nothing.
+  # `--apply` requires `--id`; per id it re-assesses, writes the new patch beside the old in a
+  # scratch dot-directory of the repository's archive directory (never an archive entry; removed
+  # on any refusal), verifies in a scratch index that it applies over HEAD (never a tree or the
+  # repository's own index) and recomputes worktree_tree from it, then replaces dirty.patch (or
+  # deletes it when nothing remains, recording `patch: null`) and writes the format 3 manifest
+  # last. Only `new file mode` sections whose C-unquoted path is build layout are stripped; an
+  # undecodable path keeps its section, and nested repository images are not touched. Stripping
+  # never deletes an archive; removal stays `prune-archives --apply --id` under PruneVerdict.
+  - name: worktree.archive.ArchiveStripAssessment
+    identity:
+      name: archive_directory
+      type: String
+    fields:
+      - name: path
+        type: String
+      - name: worktree_id
+        type: Optional<String>
+      - name: repository_root
+        type: Optional<String>
+      - name: verdict
+        type: worktree.archive.StripVerdict
+      - name: reason
+        type: String
+      # Bytes of the regular files in the directory now.
+      - name: bytes
+        type: Integer
+      # Patch bytes the strip removes, and the sections it removes and keeps.
+      - name: strip_bytes
+        type: Integer
+      - name: sections_stripped
+        type: Integer
+      - name: sections_kept
+        type: Integer
+      # Bytes of the patch that stays; 0 when nothing remains.
+      - name: kept_patch_bytes
+        type: Integer
+      - name: nested_images
+        type: Integer
+      # The prune verdict the archive has after the strip; absent for a refusal.
+      - name: prune_verdict_after
+        type: Optional<worktree.archive.PruneVerdict>
+      # true only under --apply, for a Strippable archive that was rewritten.
+      - name: applied
+        type: Boolean
+      # Bytes the rewrite freed; 0 unless applied.
+      - name: freed_bytes
+        type: Integer
+    invariants:
+      - bytes >= 0
+      - strip_bytes >= 0
+      - sections_stripped >= 0
+      - sections_kept >= 0
+      - kept_patch_bytes >= 0
+      - nested_images >= 0
+      - freed_bytes >= 0
+    lifecycle:
+      initial: Assessed
+      states: [Assessed]
+      terminal: [Assessed]
 
   # A report of one archive directory assessed by `prune-archives`, not a persisted lifecycle.
   # The directory is `<id>` or a superseded `<id>.superseded-<n>`; `--id` names it. `--dry-run`
