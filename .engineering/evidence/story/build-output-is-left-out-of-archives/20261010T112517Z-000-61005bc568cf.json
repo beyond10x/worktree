@@ -1,0 +1,12 @@
+{
+  "at": "2026-10-10T11:25:17Z",
+  "actor": "human:timo",
+  "artifact": "story:build-output-is-left-out-of-archives",
+  "kind": "story",
+  "revision": 3,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "cargo test -p b10x-worktree-domain -p b10x-worktree -p b10x-worktree-git -p b10x-worktree-cli --locked --no-fail-fast"
+  }
+}
