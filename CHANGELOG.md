@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.15.0 — 2026-10-10
 
 - `worktree archive` (and `finish --archive`, and `sweep`) leaves cargo's own build layout out of
   an archive. Below a target recognised by `discard-cache`'s structure (also when a tracked file
