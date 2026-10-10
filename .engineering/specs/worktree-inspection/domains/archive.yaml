@@ -35,17 +35,22 @@ types:
   #   RepositoryGone: repository_root is gone, so the new patch cannot be verified over HEAD.
   #   PatchUnusable: dirty.patch no longer has its recorded digest, holds bytes before its first
   #     `diff --git` section, or the stripped patch does not apply over HEAD.
-  #   NothingToStrip: no patch, or no `new file mode` section whose path is build layout.
-  #   Strippable: at least one `new file mode` section adds a file under build layout.
+  #   NothingToStrip: no patch, or no section purely adds an untracked file under build layout.
+  #   Strippable: at least one section purely adds an untracked file under build layout: a
+  #     `new file mode` section whose decoded path no other section names and HEAD's tree, read
+  #     from Git and never from the patch, holds neither as a file or directory nor below a file.
   - name: worktree.archive.StripVerdict
     kind: enum
     variants: [Strippable, NothingToStrip, InvalidManifest, UnrecordedContent, TreeStillPresent, RepositoryGone, PatchUnusable]
 
   # How a left-out file was found to be cargo build layout.
-  #   Archive: `archive` observed it on disk below a target `discard-cache` recognises by structure.
-  #   Strip: `--strip-build-output` found its `new file mode` section in an existing patch, below a
-  #     directory for which the patch holds `T/CACHEDIR.TAG`, `T/.rustc_info.json` or
-  #     `T/<p>/.fingerprint/…`.
+  #   Archive: `archive` observed it on disk below a target recognised by `discard-cache`'s
+  #     structure (a valid tag or the untagged-target rule, and at least one profile), also when a
+  #     tracked file below the target hides it from `discard-cache`'s walk of ignored entries.
+  #   Strip: `--strip-build-output` found its pure-addition section in an existing patch, below a
+  #     directory T for which the patch's pure additions hold a `T/CACHEDIR.TAG` whose content
+  #     begins with Cargo's `Signature: 8a477f597d28d172789f06886806bc55` line, or
+  #     `T/<p>/.fingerprint/…`; `.rustc_info.json` or an unsigned tag alone never recognises T.
   - name: worktree.archive.BuildOutputOrigin
     kind: enum
     variants: [Archive, Strip]
@@ -145,10 +150,12 @@ entities:
 
   # Cargo build layout one archive left out, per cargo target directory T (relative to the tree
   # root), in path-byte order. A path is build layout when Git tracks it neither in HEAD nor in
-  # the index and its first component under T is `debug`, `release`, `tmp`, `CACHEDIR.TAG`,
-  # `.rustc_info.json`, or a profile directory (one holding `.fingerprint/` as a direct child;
-  # also `T/<triple>/<profile>/`). Every other path under T, and every other ignored directory,
-  # stays in the archive.
+  # the index and its first component under T is `debug`, `release`, `.rustc_info.json`, `tmp`
+  # (only while T holds a profile), `CACHEDIR.TAG` (only while it carries Cargo's signature), or a
+  # profile directory (one holding `.fingerprint/` as a direct child; also
+  # `T/<triple>/<profile>/`). Every other path under T, every tracked file under T, and every
+  # other ignored directory stays in the archive; a tracked file under T never stops T being
+  # recognised.
   # Removal through a format 3 archive re-observes each left-out path immediately before deleting
   # it: it must still be build layout below this same recognised T and is then deleted as cache;
   # anything else that differs from worktree_tree refuses as archive-stale.
@@ -186,8 +193,11 @@ entities:
   # on any refusal), verifies in a scratch index that it applies over HEAD (never a tree or the
   # repository's own index) and recomputes worktree_tree from it, then replaces dirty.patch (or
   # deletes it when nothing remains, recording `patch: null`) and writes the format 3 manifest
-  # last. Only `new file mode` sections whose C-unquoted path is build layout are stripped; an
-  # undecodable path keeps its section, and nested repository images are not touched. Stripping
+  # last. Only sections that purely add an untracked file (`new file mode`, a C-unquoted path no
+  # other section names, not held by HEAD's tree as a file or directory or below a file) whose
+  # path is build layout are stripped; both halves of a type change and every other section of a
+  # tracked path stay, an undecodable path keeps its section, and nested repository images are
+  # not touched. Stripping
   # never deletes an archive; removal stays `prune-archives --apply --id` under PruneVerdict.
   - name: worktree.archive.ArchiveStripAssessment
     identity:
