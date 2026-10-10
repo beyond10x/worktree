@@ -6,7 +6,10 @@
 //! the tree's files, which Git lists only as `<path>/`, is held as a byte image of its whole
 //! directory instead. The values here are I/O-free; the Git adapter writes and verifies the files.
 
-use crate::{Refusal, WorktreeId, WorktreeRecord};
+use crate::{
+    ARCHIVE_FORMAT_V3, BuildOutput, LocalRefusal, Refusal, WorktreeId, WorktreeRecord,
+    relative_path, require_local,
+};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -67,10 +70,12 @@ pub struct NestedRepositoryImage {
     pub entries: u64,
 }
 
-/// `manifest.json` of one archive, format [`ARCHIVE_FORMAT`] or [`ARCHIVE_FORMAT_V2`].
+/// `manifest.json` of one archive, format [`ARCHIVE_FORMAT`], [`ARCHIVE_FORMAT_V2`] or
+/// [`ARCHIVE_FORMAT_V3`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ArchiveManifest {
+    /// [`ARCHIVE_FORMAT_V3`] when [`Self::build_output`] is present, otherwise
     /// [`ARCHIVE_FORMAT_V2`] when [`Self::nested_repositories`] is not empty, otherwise
     /// [`ARCHIVE_FORMAT`].
     pub format: String,
@@ -103,10 +108,16 @@ pub struct ArchiveManifest {
     /// serialized when empty, so an archive without them stays [`ARCHIVE_FORMAT`] byte for byte.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub nested_repositories: Vec<NestedRepositoryImage>,
+    /// Cargo build layout left out of [`Self::patch`] and [`Self::worktree_tree`]; never
+    /// serialized when absent, so an archive that left nothing out stays [`ARCHIVE_FORMAT`] or
+    /// [`ARCHIVE_FORMAT_V2`] byte for byte.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_output: Option<BuildOutput>,
 }
 
 impl ArchiveManifest {
-    /// The format identifier a manifest with these nested repository images is written as.
+    /// The format identifier a manifest with these nested repository images, and nothing left
+    /// out, is written as.
     pub fn format_for(nested_repositories: &[NestedRepositoryImage]) -> &'static str {
         if nested_repositories.is_empty() {
             ARCHIVE_FORMAT
@@ -115,25 +126,49 @@ impl ArchiveManifest {
         }
     }
 
+    /// The format identifier this manifest must carry for what it holds.
+    pub fn expected_format(&self) -> &'static str {
+        if self.build_output.is_some() {
+            ARCHIVE_FORMAT_V3
+        } else {
+            Self::format_for(&self.nested_repositories)
+        }
+    }
+
     /// Refuse a manifest whose format does not match what it holds: [`ARCHIVE_FORMAT`] names no
-    /// image and [`ARCHIVE_FORMAT_V2`] at least one, each `nested-<n>.tar` in strictly increasing
-    /// path-byte order, with a relative path and at least one entry, and whose bundle and
-    /// patch are not [`ARCHIVE_BUNDLE_FILE`] and [`ARCHIVE_PATCH_FILE`].
+    /// image and leaves nothing out, [`ARCHIVE_FORMAT_V2`] names at least one image and leaves
+    /// nothing out, [`ARCHIVE_FORMAT_V3`] records a well-formed [`Self::build_output`]; each
+    /// `nested-<n>.tar` in strictly increasing path-byte order, with a relative path and at least
+    /// one entry, and whose bundle and patch are not [`ARCHIVE_BUNDLE_FILE`] and
+    /// [`ARCHIVE_PATCH_FILE`].
     pub fn require_format(&self) -> Result<(), Refusal> {
         let invalid = |message: String| Err(Refusal::new("archive-invalid", message));
-        if !matches!(self.format.as_str(), ARCHIVE_FORMAT | ARCHIVE_FORMAT_V2) {
+        if !matches!(
+            self.format.as_str(),
+            ARCHIVE_FORMAT | ARCHIVE_FORMAT_V2 | ARCHIVE_FORMAT_V3
+        ) {
             return invalid(format!(
-                "archive format {:?} is neither {ARCHIVE_FORMAT} nor {ARCHIVE_FORMAT_V2}",
+                "archive format {:?} is none of {ARCHIVE_FORMAT}, {ARCHIVE_FORMAT_V2} and \
+                 {ARCHIVE_FORMAT_V3}",
                 self.format
             ));
         }
-        let expected = Self::format_for(&self.nested_repositories);
+        let expected = self.expected_format();
         if self.format != expected {
             return invalid(format!(
-                "archive format {:?} with {} nested repository image(s) must be {expected}",
+                "archive format {:?} with {} nested repository image(s) and {} build output must \
+                 be {expected}",
                 self.format,
-                self.nested_repositories.len()
+                self.nested_repositories.len(),
+                if self.build_output.is_some() {
+                    "a"
+                } else {
+                    "no"
+                }
             ));
+        }
+        if let Some(defect) = self.build_output.as_ref().and_then(BuildOutput::defect) {
+            return invalid(defect);
         }
         // Every writer names these exact files; any other name could reach outside the archive.
         for (recorded, expected) in [
@@ -150,13 +185,7 @@ impl ArchiveManifest {
         let mut previous: Option<&str> = None;
         for (index, image) in self.nested_repositories.iter().enumerate() {
             let file = archive_image_file(index + 1);
-            let relative = !image.path.is_empty()
-                && !image.path.starts_with('/')
-                && !image.path.ends_with('/')
-                && image
-                    .path
-                    .split('/')
-                    .all(|part| !matches!(part, "" | "." | ".." | ".git"));
+            let relative = relative_path(&image.path);
             if image.image.file != file
                 || !relative
                 || image.entries == 0
@@ -416,50 +445,17 @@ pub fn decide_archive_prune(
         reason,
         commits_not_on_remote: 0,
     };
-    let manifest = match &contents.manifest {
+    let manifest = match require_local(contents, tree_present) {
         Ok(manifest) => manifest,
-        Err(reason) => return decision(PruneVerdict::InvalidManifest, reason.clone()),
+        Err((refusal, reason)) => {
+            let verdict = match refusal {
+                LocalRefusal::InvalidManifest => PruneVerdict::InvalidManifest,
+                LocalRefusal::UnrecordedContent => PruneVerdict::UnrecordedContent,
+                LocalRefusal::TreeStillPresent => PruneVerdict::TreeStillPresent,
+            };
+            return decision(verdict, reason);
+        }
     };
-    let recorded = manifest.recorded_files();
-    let mut unrecorded = contents
-        .entries
-        .iter()
-        .filter(|entry| {
-            entry.kind != ArchiveEntryKind::File || !recorded.contains(&entry.name.as_str())
-        })
-        .map(|entry| entry.name.as_str())
-        .collect::<Vec<_>>();
-    if !unrecorded.is_empty() {
-        unrecorded.sort_unstable();
-        return decision(
-            PruneVerdict::UnrecordedContent,
-            format!(
-                "holds {} that the manifest does not record as a file",
-                unrecorded.join(", ")
-            ),
-        );
-    }
-    match tree_present(manifest) {
-        Ok(false) => {}
-        Ok(true) => {
-            return decision(
-                PruneVerdict::TreeStillPresent,
-                format!(
-                    "the registered tree {} still exists",
-                    manifest.path.display()
-                ),
-            );
-        }
-        Err(error) => {
-            return decision(
-                PruneVerdict::TreeStillPresent,
-                format!(
-                    "the registered tree {} could not be observed absent: {error}",
-                    manifest.path.display()
-                ),
-            );
-        }
-    }
     if !manifest.nested_repositories.is_empty() {
         let paths = manifest
             .nested_repositories
@@ -627,6 +623,7 @@ mod tests {
             patch: None,
             created_at: 1,
             nested_repositories: Vec::new(),
+            build_output: None,
         }
     }
 
@@ -739,6 +736,47 @@ mod tests {
             );
         }
         assert!(manifest().require_matches(&record(), &head).is_ok());
+    }
+
+    #[test]
+    fn build_output_is_version_3_and_only_version_3_carries_it() {
+        let head = "a".repeat(40);
+        let output = BuildOutput::merged(
+            None,
+            vec![crate::BuildOutputTarget {
+                path: "target".into(),
+                origin: crate::BuildOutputOrigin::Archive,
+                files: 2,
+                bytes: 20,
+            }],
+        );
+        for images in [Vec::new(), vec![image(1, "evidence/a")]] {
+            let mut left_out = with_images(images);
+            left_out.build_output.clone_from(&output);
+            left_out.format = left_out.expected_format().into();
+            assert_eq!(left_out.format, ARCHIVE_FORMAT_V3);
+            assert!(left_out.require_matches(&record(), &head).is_ok());
+            let value = serde_json::to_value(&left_out).unwrap();
+            assert_eq!(value["build_output"]["targets"][0]["origin"], "archive");
+            let round_trip: ArchiveManifest = serde_json::from_value(value).unwrap();
+            assert_eq!(round_trip, left_out);
+
+            let mut older = left_out.clone();
+            older.format = ArchiveManifest::format_for(&older.nested_repositories).into();
+            let mut empty = left_out.clone();
+            empty.build_output = None;
+            let mut wrong_totals = left_out.clone();
+            if let Some(output) = wrong_totals.build_output.as_mut() {
+                output.bytes += 1;
+            }
+            for candidate in [older, empty, wrong_totals] {
+                assert_eq!(
+                    candidate.require_format().unwrap_err().code,
+                    "archive-invalid",
+                    "{candidate:?}"
+                );
+            }
+        }
     }
 
     #[test]

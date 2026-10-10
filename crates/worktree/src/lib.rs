@@ -2,12 +2,14 @@
 
 use b10x_worktree_domain::{
     ArchiveContents, ArchiveEvidence, ArchiveManifest, ArchivePruneAssessment, ArchivePruneReport,
-    ArchiveReference, ArchiveRequest, ArchiveStateCheck, CacheClassification, CacheDiscard,
-    CleanupAssessment, CreatePlan, CreateRequest, DiscoveredWorktree, GitRevision, Lifecycle,
-    OperationEvidence, PruneVerdict, ReconciliationAction, ReconciliationAssessment,
-    RecoveryEvidence, RecoveryKind, RecoveryProof, Refusal, RelocationIntent, RemoteObservation,
-    RemovalIntent, RepositorySnapshot, SkippedArchiveEntry, SweepItem, WorkspacePolicy, WorktreeId,
-    WorktreeRecord, WorktreeSnapshot, decide_archive_prune, require_child,
+    ArchiveReference, ArchiveRequest, ArchiveStateCheck, ArchiveStripAssessment,
+    ArchiveStripReport, CacheClassification, CacheDiscard, CleanupAssessment, CreatePlan,
+    CreateRequest, DiscoveredWorktree, GitRevision, Lifecycle, OperationEvidence, PatchStripPlan,
+    PruneVerdict, ReconciliationAction, ReconciliationAssessment, RecoveryEvidence, RecoveryKind,
+    RecoveryProof, Refusal, RelocationIntent, RemoteObservation, RemovalIntent, RepositorySnapshot,
+    ScannedSection, SkippedArchiveEntry, StripVerdict, SweepItem, WorkspacePolicy, WorktreeId,
+    WorktreeRecord, WorktreeSnapshot, contents_after_strip, decide_archive_prune,
+    decide_archive_strip, require_child,
 };
 use std::path::{Path, PathBuf};
 
@@ -236,6 +238,29 @@ pub trait GitPort: Send + Sync {
     /// an entry that appeared since refuses and is kept. Returns the bytes deleted. The default
     /// refuses.
     fn delete_archive(&self, archive: &Path, _manifest: &ArchiveManifest) -> Result<u64, Refusal> {
+        Err(archive_unsupported(archive))
+    }
+    /// Stream an archive's `dirty.patch` into its `diff --git` sections, verifying the digest
+    /// `manifest` records. Writes nothing. The default refuses.
+    fn scan_archive_patch(
+        &self,
+        archive: &Path,
+        _manifest: &ArchiveManifest,
+    ) -> Result<Vec<ScannedSection>, Refusal> {
+        Err(archive_unsupported(archive))
+    }
+    /// Remove the sections `plan` marks from an archive assessed strippable: the new patch is
+    /// written outside the archive, verified to apply over HEAD in a scratch index, and
+    /// `worktree_tree` recomputed from it; then the patch is replaced (or deleted when nothing
+    /// remains) and the format 3 manifest written last. The manifest on disk must still be
+    /// `manifest`; any refusal leaves the archive untouched. Returns the manifest written. The
+    /// default refuses.
+    fn strip_archive_build_output(
+        &self,
+        archive: &Path,
+        _manifest: &ArchiveManifest,
+        _plan: &PatchStripPlan,
+    ) -> Result<ArchiveManifest, Refusal> {
         Err(archive_unsupported(archive))
     }
 }
@@ -617,6 +642,149 @@ where
                  dry-run, named with --id",
             ));
         }
+        let (chosen, skipped) = self.select_archives(repository, scope, selected)?;
+        let mut archives = Vec::with_capacity(chosen.len());
+        for directory in &chosen {
+            archives.push(self.assess_archive_prune(directory, apply)?);
+        }
+        Ok(ArchivePruneReport::new(apply, archives, skipped))
+    }
+
+    /// Assess every archive in scope for cargo build layout in its patch and, with `apply`,
+    /// rewrite the selected strippable ones (`worktree.archive.ArchiveStripAssessment`).
+    ///
+    /// Selection is exactly [`Self::prune_archives`]'s, and `apply` requires `selected`. Each
+    /// selected archive is re-assessed immediately before it is rewritten, and only
+    /// [`StripVerdict::Strippable`] is ever rewritten. Stripping never deletes an archive: the
+    /// report carries the prune verdict each archive has afterwards, and removal stays
+    /// [`Self::prune_archives`] under its own rule.
+    pub fn strip_archive_build_output(
+        &self,
+        repository: &Path,
+        scope: CleanupScope,
+        selected: &[String],
+        apply: bool,
+    ) -> Result<ArchiveStripReport, Refusal> {
+        if apply && selected.is_empty() {
+            return Err(Refusal::new(
+                "explicit-archive-selection-required",
+                "prune-archives --strip-build-output --apply requires at least one archive \
+                 directory reviewed in a dry-run, named with --id",
+            ));
+        }
+        let (chosen, skipped) = self.select_archives(repository, scope, selected)?;
+        let mut archives = Vec::with_capacity(chosen.len());
+        for directory in &chosen {
+            archives.push(self.assess_archive_strip(directory, apply));
+        }
+        Ok(ArchiveStripReport::new(apply, archives, skipped))
+    }
+
+    /// Assess one archive directory for stripping now and, with `apply`, rewrite it when
+    /// strippable.
+    fn assess_archive_strip(
+        &self,
+        directory: &ArchiveDirectory,
+        apply: bool,
+    ) -> ArchiveStripAssessment {
+        let contents = self.read_archive(&directory.path);
+        let tree_present = |manifest: &ArchiveManifest| {
+            path_absent(&manifest.path)
+                .map(|absent| !absent)
+                .map_err(|error| error.message)
+        };
+        let decision = decide_archive_strip(
+            &contents,
+            tree_present,
+            |manifest| {
+                self.git
+                    .repository_absent(&manifest.repository_root)
+                    .map_err(|refusal| refusal.to_string())
+            },
+            |manifest| {
+                self.git
+                    .scan_archive_patch(&directory.path, manifest)
+                    .map_err(|refusal| refusal.to_string())
+            },
+        );
+        let manifest = contents.manifest.as_ref().ok();
+        let plan = decision.plan.as_ref();
+        let mut assessment = ArchiveStripAssessment {
+            archive_directory: directory.name.clone(),
+            path: directory.path.clone(),
+            worktree_id: manifest.map(|manifest| manifest.id.as_str().to_owned()),
+            repository_root: manifest.map(|manifest| manifest.repository_root.clone()),
+            bytes: contents.bytes(),
+            verdict: decision.verdict,
+            reason: decision.reason.clone(),
+            strip_bytes: plan.map_or(0, |plan| plan.strip_bytes),
+            sections_stripped: plan.map_or(0, |plan| plan.sections_stripped),
+            sections_kept: plan.map_or(0, |plan| plan.sections_kept),
+            kept_patch_bytes: plan.map_or_else(
+                || {
+                    manifest
+                        .and_then(|manifest| manifest.patch.as_ref())
+                        .map_or(0, |patch| patch.bytes)
+                },
+                |plan| plan.kept_bytes,
+            ),
+            nested_images: manifest.map_or(0, |manifest| manifest.nested_repositories.len() as u64),
+            prune_verdict_after: None,
+            applied: false,
+            freed_bytes: 0,
+        };
+        let after = match (decision.verdict, plan) {
+            (StripVerdict::Strippable, Some(plan)) => contents_after_strip(&contents, plan),
+            (StripVerdict::NothingToStrip, _) => contents.clone(),
+            _ => return assessment,
+        };
+        if apply && decision.verdict == StripVerdict::Strippable {
+            let (Some(manifest), Some(plan)) = (manifest, plan) else {
+                return assessment;
+            };
+            match self
+                .git
+                .strip_archive_build_output(&directory.path, manifest, plan)
+            {
+                Ok(_) => {
+                    let rewritten = self.read_archive(&directory.path);
+                    assessment.applied = true;
+                    assessment.freed_bytes = assessment.bytes.saturating_sub(rewritten.bytes());
+                    assessment.prune_verdict_after = Some(self.prune_decision(&rewritten).verdict);
+                }
+                Err(refusal) => {
+                    if refusal.code == "archive-patch-unusable" {
+                        assessment.verdict = StripVerdict::PatchUnusable;
+                    }
+                    assessment.reason = format!("rewrite refused: {refusal}");
+                }
+            }
+            return assessment;
+        }
+        assessment.prune_verdict_after = Some(self.prune_decision(&after).verdict);
+        assessment
+    }
+
+    /// The prune decision for one observation of an archive directory.
+    fn prune_decision(&self, contents: &ArchiveContents) -> b10x_worktree_domain::PruneDecision {
+        decide_archive_prune(
+            contents,
+            |manifest| {
+                path_absent(&manifest.path)
+                    .map(|absent| !absent)
+                    .map_err(|error| error.message)
+            },
+            |manifest| self.remote_observation(manifest),
+        )
+    }
+
+    /// The archive directories `prune-archives` selects, and the skipped entries it reports.
+    fn select_archives(
+        &self,
+        repository: &Path,
+        scope: CleanupScope,
+        selected: &[String],
+    ) -> Result<(Vec<ArchiveDirectory>, Vec<SkippedArchiveEntry>), Refusal> {
         let root = self.archive_root.as_ref().ok_or_else(|| {
             Refusal::new(
                 "archive-root-unconfigured",
@@ -666,12 +834,7 @@ where
                 }
             }
         }
-
-        let mut archives = Vec::with_capacity(chosen.len());
-        for directory in chosen {
-            archives.push(self.assess_archive_prune(directory, apply)?);
-        }
-        Ok(ArchivePruneReport::new(apply, archives, skipped))
+        Ok((chosen.into_iter().cloned().collect(), skipped))
     }
 
     /// Assess one archive directory now and, with `apply`, delete it when removable.
@@ -681,15 +844,7 @@ where
         apply: bool,
     ) -> Result<ArchivePruneAssessment, Refusal> {
         let contents = self.read_archive(&directory.path);
-        let decision = decide_archive_prune(
-            &contents,
-            |manifest| {
-                path_absent(&manifest.path)
-                    .map(|absent| !absent)
-                    .map_err(|error| error.message)
-            },
-            |manifest| self.remote_observation(manifest),
-        );
+        let decision = self.prune_decision(&contents);
         let manifest = contents.manifest.as_ref().ok();
         let mut assessment = ArchivePruneAssessment {
             archive_directory: directory.name.clone(),

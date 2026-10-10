@@ -1,5 +1,33 @@
 # Changelog
 
+## Unreleased
+
+- `worktree archive` (and `finish --archive`, and `sweep`) leaves cargo's own build layout out of
+  an archive. Below a target `discard-cache` recognises by structure, an untracked file whose first
+  component below the target is `debug`, `release`, `tmp`, `CACHEDIR.TAG`, `.rustc_info.json` or a
+  profile directory (holding `.fingerprint/`; also `<target>/<triple>/<profile>/`) is neither in
+  `dirty.patch` nor in the fingerprint. Everything else below the target, such as
+  `target/ess-conformance/`, stays archived. Such an archive is the new manifest format
+  `worktree.archive/3`, which records per target the files and bytes left out as `build_output`;
+  the command prints `left out <files> file(s), <bytes> bytes of cargo build output under
+  <target>`. An archive that left nothing out is written byte for byte as 0.14.0 writes format 1
+  or 2, and both stay readable.
+- Removal through a format 3 archive (`gc --apply`) deletes each left-out file as cache only after
+  re-observing it, immediately before deletion, as build layout below the same recognised target.
+  A left-out path that is no longer build layout, or layout below a target the archive did not
+  record, refuses as `archive-stale`.
+- `worktree prune-archives --strip-build-output [--repo] [--scope repo|profile] [--id]...
+  [--dry-run|--apply]` removes build layout from archives written before. A dry-run, the default,
+  streams each `dirty.patch` and lists the bytes and sections it would strip, what stays, and the
+  prune verdict afterwards. Only whole `new file mode` sections whose C-unquoted path is build
+  layout below a directory the patch itself recognises as a cargo target are stripped; tracked
+  changes, undecodable paths and nested images stay. `--apply --id` verifies the new patch over
+  HEAD in a scratch index, recomputes `worktree_tree`, replaces the patch (or deletes it) and writes
+  the format 3 manifest last, then prints the bytes freed. It refuses an invalid manifest,
+  unrecorded content, a present tree, a gone repository or an unusable patch and leaves that
+  archive unchanged; it never deletes an archive. On 2026-10-10, 19.18 GiB of one machine's
+  31.52 GiB of `UncommittedState` archives was build output under `target/`.
+
 ## 0.14.0 — 2026-10-08
 
 - `worktree prune-archives` removes archives a remote fully holds. A dry-run, the default, lists

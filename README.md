@@ -39,6 +39,9 @@ worktree gc --repo /path/to/repository --apply --id <reviewed-id>
 # Archives a remote now fully holds; refused ones say why and are kept.
 worktree prune-archives --repo /path/to/repository --dry-run
 worktree prune-archives --repo /path/to/repository --apply --id <reviewed-archive-directory>
+# Strip cargo build output from older archives; review, then rewrite only reviewed ones.
+worktree prune-archives --strip-build-output --repo /path/to/repository --dry-run
+worktree prune-archives --strip-build-output --repo /path/to/repository --apply --id <reviewed-archive-directory>
 worktree reconcile --repo /path/to/repository --dry-run
 worktree reconcile --repo /path/to/repository --apply --id <reviewed-id>
 worktree doctor --check
@@ -137,13 +140,25 @@ modifies the tree, its index or the repository's refs:
 | File | Content |
 |---|---|
 | `commits.bundle` | every commit HEAD adds over the refs the configured remotes advertise, as `refs/worktree-archive/head`; absent when there are none |
-| `dirty.patch` | a binary patch from HEAD that recreates every tracked, untracked and ignored file byte for byte; absent when the tree's content equals HEAD |
+| `dirty.patch` | a binary patch from HEAD that recreates every tracked, untracked and ignored file byte for byte, except cargo build layout; absent when the tree's content equals HEAD |
 | `nested-<n>.tar` | one per nested Git repository in the tree's files, `n` from 1 in path-byte order: its root directory and every entry below it, `.git` included, with permission bits, modification times and symlink targets; names are relative to the tree root |
-| `manifest.json` | format `worktree.archive/1`, or `worktree.archive/2` when it images nested repositories: tree id, repository root, path, HEAD, branch, the unique commits, each file's SHA-256 and size, `worktree_tree` (the fingerprint of the tree's on-disk content outside every nested repository), `nested_repositories` (each root's path, image file, fingerprint and entry count; only in `/2`), and `created_at` |
+| `manifest.json` | format `worktree.archive/1`, `worktree.archive/2` when it images nested repositories, or `worktree.archive/3` when it left cargo build layout out: tree id, repository root, path, HEAD, branch, the unique commits, each file's SHA-256 and size, `worktree_tree` (the fingerprint of the tree's on-disk content outside every nested repository and the build layout left out), `nested_repositories` (each root's path, image file, fingerprint and entry count; only in `/2` and `/3`), `created_at`, and `build_output` (only in `/3`: per target its `path`, `origin` (`archive` or `strip`), `files` and `bytes`, and the totals) |
 
-The fingerprint is a Git tree id computed from every file on disk, read without filters, index
-flags or attributes. It is recorded for every archive, including one of a tree Git reports clean,
-because Git status can be told not to look at a file. Before publishing an archive the command runs
+Cargo's own build layout is left out, because the next build recreates it from tracked sources.
+Below a cargo target that `discard-cache` recognises by structure (a valid `CACHEDIR.TAG`, or an
+untagged `target/` beside a tracked `Cargo.toml` holding a full profile), a file neither HEAD nor
+the index tracks is build layout when its first component below the target is `debug`, `release`,
+`tmp`, `CACHEDIR.TAG`, `.rustc_info.json` or a profile directory (one holding `.fingerprint/`; also
+`<target>/<triple>/<profile>/`). That covers `deps/`, `build/`, `.fingerprint/`, `incremental/`
+and `*.d`. Everything else below the target, such as `target/ess-conformance/report.json`, and
+every other ignored directory stays in the archive. The command prints `left out <files> file(s),
+<bytes> bytes of cargo build output under <target>`. An archive that left nothing out is written
+exactly as before, format 1 or 2.
+
+The fingerprint is a Git tree id computed from every file on disk except the build layout left
+out, read without filters, index flags or attributes. It is recorded for every archive, including
+one of a tree Git reports clean, because Git status can be told not to look at a file. Before
+publishing an archive the command runs
 `git bundle verify`, indexes the bundle's pack on its own and checks that it holds every object
 those commits need, applies the patch to HEAD in a scratch index and compares the result with the
 fingerprint, and re-reads every digest. An existing archive is refused as `archive-exists`;
@@ -175,9 +190,14 @@ The dry-run names the archive.
 Apply resets an archived dirty tree's index to HEAD, then restores each tracked file Git reports as
 changed only after re-hashing it and finding the archived bytes, deletes each untracked or
 ignored file only when it still matches the archive, and deletes each imaged nested repository
-bottom-up, re-observing every entry against its image immediately before deleting it. A directory
-it must empty is made owner-writable first, as Git's own removal does. It then removes the tree
-without `--force`. The archive and its images stay.
+bottom-up, re-observing every entry against its image immediately before deleting it. For a
+`worktree.archive/3` archive it deletes each left-out file as cache only after re-observing it,
+immediately before deletion, as build layout below the same recognised target; build output grown
+since the archive is deleted the same way. Layout below a target the archive did not record, or a
+left-out file that is no longer build layout (its profile lost `.fingerprint/`, its target is no
+longer recognised), changes the fingerprint and refuses as `archive-stale`. A directory it must
+empty is made owner-writable first, as Git's own removal does. It then removes the tree without
+`--force`. The archive and its images stay.
 
 Some state is invisible to `git status`, and neither remote refs nor an archive hold it, so every
 removal, with or without an archive, is refused while it exists; `worktree archive` reports it as
@@ -211,8 +231,9 @@ patch that changes an existing file.
 
 The bundle's prerequisites are the advertised commits it was cut against, so restoring needs a
 remote that still has them. Submodules, nested repositories that depend on state outside their
-directory, special files and paths containing a newline are refused as `archive-unsupported-entry`. Every ignored file is archived; there is no
-policy for disposable output yet, so remove build output first.
+directory, special files and paths containing a newline are refused as `archive-unsupported-entry`.
+Every ignored file other than cargo build layout is archived; discard other disposable output
+first with `worktree discard-cache`.
 
 An archive outlives its tree, and only `worktree prune-archives` deletes one. It lists each archive
 directory below `$XDG_STATE_HOME/worktree/archives/<repository>/` (`<id>` and superseded
@@ -240,6 +261,36 @@ directory, never recursively, and prints `removed <directory> <bytes>` and `free
 refused one is kept, its verdict printed, and the run exits non-zero after the others. No flag makes
 a refused archive removable: an archive whose commits no remote holds is the only copy of them, and
 deleting it stays the operator's decision, by hand.
+
+Archives written before build output was left out hold it in `dirty.patch` and are refused as
+`UncommittedState`. `worktree prune-archives --strip-build-output` removes it, with the same
+`--repo`, `--scope` and `--id` selection, and never deletes an archive. A dry-run, the default,
+streams each patch and lists `directory, worktree id, bytes, verdict`, then the bytes and sections
+it would strip, the sections, bytes and nested images that stay, and the prune verdict the archive
+would have afterwards. Only a section that adds a file (`new file mode`) whose path, C-unquoted as
+Git writes it, is build layout below a directory the patch's own added files recognise as a target
+(`<t>/CACHEDIR.TAG`, `<t>/.rustc_info.json` or `<t>/<p>/.fingerprint/…`) is stripped; a section
+whose path cannot be decoded, every change to a tracked file and every nested image stay.
+Verdicts, in this order:
+
+| Verdict | When |
+|---|---|
+| `InvalidManifest` | `manifest.json` is missing, unreadable or of an unknown format |
+| `UnrecordedContent` | the directory holds an entry the manifest does not name as a regular file |
+| `TreeStillPresent` | the registered tree path exists; the archive may still be its recovery proof |
+| `RepositoryGone` | the repository is gone, so a new patch cannot be verified over HEAD |
+| `PatchUnusable` | `dirty.patch` lost its digest, holds bytes before its first `diff --git`, or the stripped patch does not apply over HEAD |
+| `NothingToStrip` | no patch, or no section of it adds build layout |
+| `Strippable` | at least one section adds build layout |
+
+`--apply` requires `--id`. Each is re-assessed; the new patch is written in a scratch directory
+beside the archive, applied over HEAD in a scratch index (never the repository's own index), and
+`worktree_tree` recomputed from it. Only then is `dirty.patch` replaced, or deleted when nothing
+remains (`patch: null`), and the `worktree.archive/3` manifest written last, recording what was
+stripped as `build_output` with origin `strip`. It prints `stripped <directory> freed <bytes>
+bytes` and `freed <bytes> bytes in total`; anything other than `Strippable` is left unchanged and
+the run exits non-zero. An archive whose remaining state a remote holds is then `Removable` under
+the rule above, and still goes only with `worktree prune-archives --apply --id`.
 
 Use `worktree repo list --repo <path>` to inventory linked trees without adopting or deleting them.
 Existing trees only become manager-owned through the explicit `repo adopt` command. Hook integrations
@@ -298,7 +349,9 @@ same dry-run and exact-id apply discipline safely finishes the recorded transiti
 
 Non-hook CLI JSON uses protocol version 4, reconciliation JSON uses version 4, inspection reports
 use `worktree.inspection/2`, archive manifests use `worktree.archive/1`, or `worktree.archive/2`
-when they image nested repositories (a 0.11 reader refuses `/2` as `archive-invalid`), and
+when they image nested repositories (a 0.11 reader refuses `/2` as `archive-invalid`), or
+`worktree.archive/3` when they left cargo build layout out (a 0.14 reader refuses `/3` as
+`archive-invalid`), and
 lifecycle hooks remain on version 1. Version 3 and inspection 2 add the recovery proof `kind` and `equivalent_commits`
 fields. Version 4 adds the `archive` command, the `archive` recovery kind with its `archive`
 reference, and the cleanup assessment's `archive` path; both fields are omitted when no archive is

@@ -86,7 +86,19 @@ A nested Git repository is listed by Git only as `<path>/` on the empty index, s
 scratch index nor the patch holds it. The adapter walks each such root without following symlinks,
 writes its canonical listing as a GNU tar image with the `tar` crate, reads the image back and
 compares the listing, and records the listing's SHA-256 as the root's fingerprint. `worktree_tree`
-and `dirty.patch` cover everything outside the imaged roots.
+and `dirty.patch` cover everything outside the imaged roots and the cargo build layout left out.
+
+Cargo build layout is decided in the domain, I/O-free: `is_build_layout` and `layout_target` take
+a path below a target and an injected "is this prefix a profile directory" observation. The Git
+adapter recognises the targets with `discard-cache`'s own structural classification (one walk of
+the ignored entries, which now also reports each target it recognised), excludes the paths HEAD
+or the index tracks, and observes profiles on disk. The capture leaves those files out of the
+scratch index, so the patch and the fingerprint never see them, and the manifest records them per
+target as `build_output` in format `worktree.archive/3`. Verification leaves out the same layout
+only for a format 3 archive and refuses layout below a target the manifest does not name. The
+discard partitions the untracked files after the index reset into layout below a recorded target
+and everything else; the rest must match the archive as before, and each layout file is
+re-observed as layout below the same target immediately before it is deleted.
 
 ```mermaid
 flowchart LR
@@ -157,6 +169,42 @@ immediately before deleting it, and the adapter's `delete_archive` then requires
 disk to equal the assessed one, removes each recorded regular file, the manifest last, and finally
 the directory with a non-recursive `remove_dir`, so an entry that appeared meanwhile is kept and
 refuses.
+
+## Stripping build output from archives
+
+`prune-archives --strip-build-output` uses the same selection and never deletes an archive. The
+domain's `decide_archive_strip` shares pruning's local checks (`InvalidManifest`,
+`UnrecordedContent`, `TreeStillPresent`), then asks whether the repository is gone and only then
+for the patch's sections. The Git adapter's `scan_archive_patch` streams `dirty.patch` line by
+line, hashing it against the recorded digest, and splits it at each `diff --git` line; a line
+in a hunk starts with ` `, `+`, `-` or `\`, and a base85 line holds no space, so neither can open
+a section. Each section carries its decoded path (`diff_git_path`, with Git's C-quoting undone),
+whether its extended header holds `new file mode`, its patch bytes and the size of the file it
+adds. The domain's `plan_patch_strip` recognises targets from the added paths alone and marks
+the sections to strip. The report's prune verdict afterwards is `decide_archive_prune` over the
+directory as it would be (`contents_after_strip`).
+
+```mermaid
+flowchart LR
+    dir["archive directory"] --> local{"manifest valid, only recorded<br/>files, tree path absent?"}
+    local -->|no| refused["InvalidManifest /<br/>UnrecordedContent / TreeStillPresent"]
+    local -->|yes| repo{"repository exists?"}
+    repo -->|no| gone["RepositoryGone"]
+    repo -->|yes| scan{"patch streams with its digest<br/>and starts with diff --git?"}
+    scan -->|no| unusable["PatchUnusable"]
+    scan -->|yes| plan{"a new file mode section<br/>adds build layout?"}
+    plan -->|no| nothing["NothingToStrip"]
+    plan -->|yes| strippable["Strippable"]
+    strippable --> apply["--apply --id: rewrite into scratch,<br/>apply over HEAD in a scratch index,<br/>replace the patch, manifest last"]
+```
+
+`strip_archive_build_output` re-reads the manifest and refuses one that changed, streams the kept
+sections into a scratch directory beside the archive while re-verifying the source digest and
+section count, reads HEAD's tree through scratch objects (unbundling `commits.bundle` into them
+when the repository no longer holds HEAD), applies the new patch with `apply --cached` to a
+scratch index and records its `write-tree` as `worktree_tree`. Only after the manifest is
+re-checked does it rename the new patch over `dirty.patch` (or delete it) and rename the new
+manifest into place.
 
 ## Creation and membership
 

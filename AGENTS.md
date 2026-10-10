@@ -40,6 +40,29 @@ independent policy: every decision must come from the public façade.
   a tree is returned to HEAD by resetting the index, then restoring or deleting each file only after
   re-hashing it against the archive, before the non-forced removal. Archiving never modifies the
   tree, and only `prune-archives --apply` deletes an archive, and only under its rule.
+- Cargo build layout is the one content an archive leaves out. Below a cargo target that
+  `discard-cache`'s structural rule recognises, a file neither HEAD nor the index tracks is build
+  layout when its first component below the target is `debug`, `release`, `tmp`, `CACHEDIR.TAG`,
+  `.rustc_info.json` or a profile directory (holding `.fingerprint/`; also
+  `<target>/<triple>/<profile>/`); everything else below the target stays archived. Such an
+  archive is `worktree.archive/3` and records per target the files and bytes left out; one that
+  left nothing out is written exactly as format 1 or 2. Its fingerprint excludes that layout, and
+  layout below a target it did not record refuses as `archive-stale`. Removal through it deletes
+  each left-out file only after re-observing it, immediately before deletion, as a file or
+  symlink of build layout below the same recognised target; anything else refuses.
+- `prune-archives --strip-build-output` never deletes an archive. A dry-run, the default, writes
+  nothing. `--apply` takes exact `--id` values only, re-assesses each, and rewrites only an archive
+  whose manifest is valid, whose directory holds only recorded files, whose tree path is absent and
+  whose repository exists. It streams `dirty.patch` (verifying its recorded digest) and removes only
+  whole `diff --git` sections that add a file (`new file mode`) whose decoded path is build layout
+  below a directory the patch's own added files recognise as a target (`<t>/CACHEDIR.TAG`,
+  `<t>/.rustc_info.json` or `<t>/<p>/.fingerprint/…`); an undecodable path keeps its section, and
+  nested images are never touched. The new patch is written outside the archive, verified to apply
+  over HEAD in a scratch index (never a tree's or the repository's own index), `worktree_tree` is
+  recomputed from it, and only then are the patch replaced (or deleted when nothing remains) and
+  the format 3 manifest written last. Any refusal leaves the archive byte for byte as it was; an
+  interruption between the two replacements leaves the old manifest naming a patch that no longer
+  has its digest, which verification and pruning refuse.
 - `prune-archives --apply` deletes only archive directories named by exact `--id`, each
   re-assessed immediately before deletion and deleted only when `Removable`: a valid manifest,
   nothing in the directory the manifest does not name as a regular file, the registered tree path
@@ -68,7 +91,8 @@ independent policy: every decision must come from the public façade.
   a tracked `Cargo.toml` sits beside it and a direct child other than `tmp/` holds both
   `.fingerprint/` and `deps/` as real directories. A name alone never qualifies; anything
   unrecognised is retained and reported. It refuses for a live lease, a Git lock, or another
-  process using the tree.
+  process using the tree. The one other deletion of such files is removal through a
+  `worktree.archive/3` archive, and only of the build layout it left out, re-observed as above.
 - `sweep` composes only `discard-cache` and `archive`. It never changes lifecycle, never removes a
   tree and never applies GC; removal stays an exact-id, reviewed `gc --apply`.
 - Ordinary GC requires canonical containment below the configured worktree root. Only exact-id
@@ -91,8 +115,9 @@ independent policy: every decision must come from the public façade.
   relocation lifecycle claims, final HEAD updates, and lease exclusions are atomic, and
   proof-bearing removal intent is durable.
 - CLI JSON protocol version 4, reconciliation version 4, inspection format
-  `worktree.inspection/2`, archive manifest formats `worktree.archive/1` (no nested repository)
-  and `worktree.archive/2` (adds `nested_repositories`), hook protocol version 1,
+  `worktree.inspection/2`, archive manifest formats `worktree.archive/1` (no nested repository),
+  `worktree.archive/2` (adds `nested_repositories`) and `worktree.archive/3` (adds
+  `build_output`), hook protocol version 1,
   and configuration/workspace-policy version 1 are immutable after release. Cut a new surface
   version for a wire change.
 - Generated skill content comes from `worktree skill`; do not edit it by hand.

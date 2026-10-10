@@ -4,7 +4,7 @@ use b10x_worktree::GitPort;
 #[cfg(unix)]
 use b10x_worktree_domain::{
     ArchiveContents, ArchiveEvidence, ArchiveManifest, ArchiveReference, ArchiveRequest,
-    ArchiveStateCheck, WorktreeRecord,
+    ArchiveStateCheck, PatchStripPlan, ScannedSection, WorktreeRecord,
 };
 use b10x_worktree_domain::{
     CacheClassification, CreatePlan, DiscoveredWorktree, RecoveryEvidence, RecoveryKind, Refusal,
@@ -1127,6 +1127,25 @@ impl GitPort for ProcessGit {
     #[cfg(unix)]
     fn delete_archive(&self, archive: &Path, manifest: &ArchiveManifest) -> Result<u64, Refusal> {
         archive::delete(archive, manifest)
+    }
+
+    #[cfg(unix)]
+    fn scan_archive_patch(
+        &self,
+        archive: &Path,
+        manifest: &ArchiveManifest,
+    ) -> Result<Vec<ScannedSection>, Refusal> {
+        archive::scan_patch(archive, manifest)
+    }
+
+    #[cfg(unix)]
+    fn strip_archive_build_output(
+        &self,
+        archive: &Path,
+        manifest: &ArchiveManifest,
+        plan: &PatchStripPlan,
+    ) -> Result<ArchiveManifest, Refusal> {
+        archive::strip(archive, manifest, plan)
     }
 
     fn list_worktrees(&self, repository: &Path) -> Result<Vec<DiscoveredWorktree>, Refusal> {

@@ -9,25 +9,30 @@
 //! of its root directory and every entry below it, written from and verified against a canonical
 //! listing whose SHA-256 is the image's fingerprint.
 
-use crate::{AdvertisedTips, ProcessGit};
+use crate::{AdvertisedTips, ProcessGit, cache};
 use b10x_worktree::GitPort as _;
 use b10x_worktree_domain::{
     ARCHIVE_BUNDLE_FILE, ARCHIVE_HEAD_REF, ARCHIVE_MANIFEST_FILE, ARCHIVE_PATCH_FILE,
     ArchiveContents, ArchiveDirectoryEntry, ArchiveEntryKind, ArchiveEvidence, ArchiveFile,
-    ArchiveManifest, ArchiveReference, ArchiveRequest, ArchiveStateCheck, NestedRepositoryImage,
-    Refusal, WorktreeRecord, archive_image_file,
+    ArchiveManifest, ArchiveReference, ArchiveRequest, ArchiveStateCheck, BuildOutput,
+    BuildOutputOrigin, BuildOutputTarget, NestedRepositoryImage, NewFileSize, PatchStripPlan,
+    Refusal, ScannedSection, WorktreeRecord, archive_image_file, diff_git_path, is_extended_header,
+    layout_target, relative_path,
 };
 use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::io::{Read, Write as _};
-use std::os::unix::ffi::OsStrExt as _;
+use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 /// Nested repository roots relative to the tree root, as raw bytes in path-byte order.
 type NestedRoots = Vec<Vec<u8>>;
+
+/// Untracked build layout paths, each with the index of its target.
+type LayoutPaths = Vec<(Vec<u8>, usize)>;
 
 /// Mode, blob id and path of one working-tree file, as Git would index it.
 struct Entry {
@@ -995,8 +1000,138 @@ fn hash_files(
         .collect())
 }
 
-/// The tree id of the on-disk content outside every nested repository root, its entries, and
-/// those roots.
+/// Whether a capture leaves cargo build layout out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LeaveOut<'a> {
+    /// Every file counts: formats 1 and 2.
+    Nothing,
+    /// Build layout below a recognised cargo target, untracked in HEAD and the index, is left out.
+    BuildLayout {
+        /// HEAD the tracked paths are read from.
+        head: &'a str,
+    },
+}
+
+impl<'a> LeaveOut<'a> {
+    /// What verifying against `manifest` leaves out: build layout only for a format 3 archive.
+    fn for_manifest(manifest: &'a ArchiveManifest) -> Self {
+        if manifest.build_output.is_some() {
+            Self::BuildLayout {
+                head: &manifest.head,
+            }
+        } else {
+            Self::Nothing
+        }
+    }
+}
+
+/// Cargo build layout observed on disk.
+#[derive(Debug, Default)]
+struct Layout {
+    /// Recognised targets relative to the tree root, as raw bytes.
+    targets: Vec<Vec<u8>>,
+    /// Each left-out file, with the index of its target in [`Self::targets`] and its size.
+    files: BTreeMap<Vec<u8>, (usize, u64)>,
+}
+
+impl Layout {
+    /// The record of what was left out, per target; `None` when nothing was.
+    fn build_output(&self) -> Option<BuildOutput> {
+        let mut per_target = vec![(0u64, 0u64); self.targets.len()];
+        for (index, bytes) in self.files.values() {
+            per_target[*index].0 += 1;
+            per_target[*index].1 += bytes;
+        }
+        let targets = self
+            .targets
+            .iter()
+            .zip(per_target)
+            .filter(|(_, (files, _))| *files > 0)
+            .map(|(path, (files, bytes))| BuildOutputTarget {
+                path: String::from_utf8_lossy(path).into_owned(),
+                origin: BuildOutputOrigin::Archive,
+                files,
+                bytes,
+            })
+            .collect();
+        BuildOutput::merged(None, targets)
+    }
+
+    /// Paths of the targets something was left out below.
+    fn used_targets(&self) -> BTreeSet<&[u8]> {
+        self.files
+            .values()
+            .map(|(index, _)| self.targets[*index].as_slice())
+            .collect()
+    }
+}
+
+/// The recognised cargo targets of a tree, as `discard-cache` recognises them, that a manifest
+/// can name: UTF-8 relative paths.
+fn recognised_targets(worktree: &Path) -> Result<Vec<Vec<u8>>, Refusal> {
+    Ok(cache::cargo_targets(worktree)?
+        .into_iter()
+        .filter(|target| target.to_str().is_some_and(relative_path))
+        .map(|target| target.into_os_string().into_vec())
+        .collect())
+}
+
+/// Every path HEAD or the tree's index tracks: such a file is never build layout.
+fn tracked_paths(worktree: &Path, head: &str) -> Result<BTreeSet<Vec<u8>>, Refusal> {
+    let indexed = ProcessGit::output_bytes(worktree, ["ls-files", "-z"])?;
+    let committed = ProcessGit::output_bytes(
+        worktree,
+        ["ls-tree", "-r", "-z", "--name-only", "--full-tree", head],
+    )?;
+    Ok(indexed
+        .split(|byte| *byte == 0)
+        .chain(committed.split(|byte| *byte == 0))
+        .filter(|path| !path.is_empty())
+        .map(<[u8]>::to_vec)
+        .collect())
+}
+
+/// Whether `target/prefix` below `worktree` is a cargo profile directory now.
+fn profile_on_disk(worktree: &Path, target: &[u8], prefix: &[u8]) -> bool {
+    let mut directory = target.to_vec();
+    directory.push(b'/');
+    directory.extend_from_slice(prefix);
+    cache::cargo_profile(&worktree.join(OsStr::from_bytes(&directory)))
+}
+
+/// Which of `paths` are build layout below a target recognised on disk.
+fn observe_layout(worktree: &Path, head: &str, paths: &[Vec<u8>]) -> Result<Layout, Refusal> {
+    let targets = recognised_targets(worktree)?;
+    if targets.is_empty() {
+        return Ok(Layout::default());
+    }
+    let tracked = tracked_paths(worktree, head)?;
+    let mut profiles: BTreeMap<Vec<u8>, bool> = BTreeMap::new();
+    let mut files = BTreeMap::new();
+    for path in paths {
+        if tracked.contains(path) {
+            continue;
+        }
+        let target = layout_target(path, &targets, |target, prefix| {
+            let mut key = target.to_vec();
+            key.push(b'/');
+            key.extend_from_slice(prefix);
+            *profiles
+                .entry(key)
+                .or_insert_with(|| profile_on_disk(worktree, target, prefix))
+        });
+        if let Some(index) = target {
+            let absolute = worktree.join(OsStr::from_bytes(path));
+            let metadata = std::fs::symlink_metadata(&absolute)
+                .map_err(|error| io_refusal("worktree-state-unreadable", &absolute, &error))?;
+            files.insert(path.clone(), (index, metadata.len()));
+        }
+    }
+    Ok(Layout { targets, files })
+}
+
+/// The tree id of the on-disk content outside every nested repository root and whatever
+/// `leave_out` excludes, its entries, those roots, and the build layout left out.
 ///
 /// Every file is read from disk, so neither index flags nor attributes decide what is seen.
 /// A nested repository is held by its image, never by this tree. Files below any other nested
@@ -1005,8 +1140,14 @@ fn capture(
     worktree: &Path,
     scratch: &Scratch,
     write: bool,
-) -> Result<(String, Vec<Entry>, NestedRoots), Refusal> {
-    let (paths, roots) = list_files(worktree, scratch, None)?;
+    leave_out: LeaveOut<'_>,
+) -> Result<(String, Vec<Entry>, NestedRoots, Layout), Refusal> {
+    let (mut paths, roots) = list_files(worktree, scratch, None)?;
+    let layout = match leave_out {
+        LeaveOut::Nothing => Layout::default(),
+        LeaveOut::BuildLayout { head } => observe_layout(worktree, head, &paths)?,
+    };
+    paths.retain(|path| !layout.files.contains_key(path));
     let entries = hash_files(worktree, scratch, paths, write)?;
     let index = scratch.path("state-index");
     let mut info = Vec::new();
@@ -1027,7 +1168,7 @@ fn capture(
         write_tree.arg("--missing-ok");
     }
     let tree = text(run(&mut write_tree, None)?)?.trim().to_owned();
-    Ok((tree, entries, roots))
+    Ok((tree, entries, roots, layout))
 }
 
 /// Refuse a bundle that Git rejects or that does not itself carry every object HEAD adds over
@@ -1151,6 +1292,16 @@ fn path_exists(path: &Path) -> Result<bool, Refusal> {
     }
 }
 
+/// Write `manifest` to `path` as every archive writes it: pretty JSON and a final newline.
+fn write_manifest(path: &Path, manifest: &ArchiveManifest) -> Result<(), Refusal> {
+    let mut encoded = serde_json::to_vec_pretty(manifest)
+        .map_err(|error| Refusal::new("archive-write-failed", error.to_string()))?;
+    encoded.push(b'\n');
+    std::fs::write(path, encoded)
+        .and_then(|()| std::fs::File::open(path)?.sync_all())
+        .map_err(|error| io_refusal("archive-write-failed", path, &error))
+}
+
 /// Write, verify and publish one archive.
 pub(crate) fn write(request: &ArchiveRequest<'_>) -> Result<ArchiveEvidence, Refusal> {
     let record = request.record;
@@ -1197,10 +1348,12 @@ pub(crate) fn write(request: &ArchiveRequest<'_>) -> Result<ArchiveEvidence, Ref
         )?)
     };
     // Fingerprint every archive, even of a tree Git reports clean: status can be told not to look.
-    let (worktree_tree, patch, roots) = write_patch(worktree, head, staging.path(), &scratch)?;
+    // Cargo build layout is left out: the next build recreates it from tracked sources.
+    let (worktree_tree, patch, roots, build_output) =
+        write_patch(worktree, head, staging.path(), &scratch)?;
     let nested_repositories = write_images(worktree, head, &roots, staging.path())?;
-    let manifest = ArchiveManifest {
-        format: ArchiveManifest::format_for(&nested_repositories).to_owned(),
+    let mut manifest = ArchiveManifest {
+        format: String::new(),
         id: record.id.clone(),
         repository_root: record.repository_root.clone(),
         path: record.path.clone(),
@@ -1212,18 +1365,16 @@ pub(crate) fn write(request: &ArchiveRequest<'_>) -> Result<ArchiveEvidence, Ref
         patch,
         created_at: request.created_at,
         nested_repositories,
+        build_output,
     };
-    let mut encoded = serde_json::to_vec_pretty(&manifest)
-        .map_err(|error| Refusal::new("archive-write-failed", error.to_string()))?;
-    encoded.push(b'\n');
-    let manifest_path = staging.path().join(ARCHIVE_MANIFEST_FILE);
-    std::fs::write(&manifest_path, encoded)
-        .map_err(|error| io_refusal("archive-write-failed", &manifest_path, &error))?;
+    manifest.expected_format().clone_into(&mut manifest.format);
+    write_manifest(&staging.path().join(ARCHIVE_MANIFEST_FILE), &manifest)?;
 
     // The tree must still be what was archived: same HEAD, same content, the same nested
     // repositories, each re-walked to its recorded fingerprint.
     let after = ProcessGit.worktree_snapshot(repository, worktree)?;
-    let (after_tree, _, after_roots) = capture(worktree, &scratch, false)?;
+    let (after_tree, _, after_roots, _) =
+        capture(worktree, &scratch, false, LeaveOut::BuildLayout { head })?;
     if after.head != head
         || after_tree != manifest.worktree_tree
         || !nested_state_matches(&manifest, worktree, &after_roots)?
@@ -1293,19 +1444,29 @@ fn write_bundle(
     describe(staging, ARCHIVE_BUNDLE_FILE)
 }
 
-/// Fingerprint the tree's content outside every nested repository and, when it differs from HEAD,
-/// write and verify the binary patch that recreates it over HEAD. Also return the nested
-/// repository roots the fingerprint excludes.
+/// Fingerprint the tree's content outside every nested repository and its cargo build layout and,
+/// when it differs from HEAD, write and verify the binary patch that recreates it over HEAD. Also
+/// return the nested repository roots the fingerprint excludes and the build layout it left out.
 fn write_patch(
     worktree: &Path,
     head: &str,
     staging: &Path,
     scratch: &Scratch,
-) -> Result<(String, Option<ArchiveFile>, NestedRoots), Refusal> {
-    let (tree, _, roots) = capture(worktree, scratch, true)?;
+) -> Result<
+    (
+        String,
+        Option<ArchiveFile>,
+        NestedRoots,
+        Option<BuildOutput>,
+    ),
+    Refusal,
+> {
+    let (tree, _, roots, layout) =
+        capture(worktree, scratch, true, LeaveOut::BuildLayout { head })?;
+    let build_output = layout.build_output();
     let head_tree = ProcessGit::output(worktree, ["rev-parse", &format!("{head}^{{tree}}")])?;
     if head_tree.trim() == tree {
-        return Ok((tree, None, roots));
+        return Ok((tree, None, roots, build_output));
     }
     let patch = run(
         scratch.git(worktree, None).args([
@@ -1328,7 +1489,12 @@ fn write_patch(
     std::fs::write(&patch_path, &patch)
         .map_err(|error| io_refusal("archive-write-failed", &patch_path, &error))?;
     require_patch_recreates(worktree, scratch, head, &patch_path, &tree)?;
-    Ok((tree, Some(describe(staging, ARCHIVE_PATCH_FILE)?), roots))
+    Ok((
+        tree,
+        Some(describe(staging, ARCHIVE_PATCH_FILE)?),
+        roots,
+        build_output,
+    ))
 }
 
 /// Move a verified staging directory into place; an archive already there is moved aside.
@@ -1451,8 +1617,10 @@ pub(crate) fn verify(
 }
 
 /// Refuse a linked tree whose complete on-disk content is not the archived state: the fingerprint
-/// outside the nested repositories, and each nested repository's image and fingerprint. Return
-/// the outer fingerprint with the per-file entries it was computed from.
+/// outside the nested repositories and, for a format 3 archive, outside the cargo build layout,
+/// and each nested repository's image and fingerprint. Layout below a target the archive did not
+/// leave out is refused too. Return the outer fingerprint with the per-file entries it was
+/// computed from.
 fn require_state(
     manifest: &ArchiveManifest,
     archive: &Path,
@@ -1462,12 +1630,105 @@ fn require_state(
         require_file(archive, patch, ARCHIVE_PATCH_FILE)?;
     }
     let scratch = Scratch::new(worktree, archive.parent().unwrap_or(archive))?;
-    let (tree, entries, roots) = capture(worktree, &scratch, false)?;
+    let (tree, entries, roots, layout) =
+        capture(worktree, &scratch, false, LeaveOut::for_manifest(manifest))?;
     if tree != manifest.worktree_tree {
         return Err(stale_state(archive));
     }
+    let recorded = left_out_targets(manifest);
+    if let Some(other) = layout
+        .used_targets()
+        .into_iter()
+        .find(|target| !recorded.contains(*target))
+    {
+        return Err(Refusal::new(
+            "archive-stale",
+            format!(
+                "cargo build layout below {} was not left out by {}; rerun `worktree archive \
+                 --replace`",
+                lossy(other),
+                archive.display()
+            ),
+        ));
+    }
     require_images(manifest, archive, worktree, &roots)?;
     Ok((tree, entries, scratch))
+}
+
+/// The recognised targets whose build layout an archive left out, re-observed on disk.
+struct LeftOut<'a> {
+    worktree: &'a Path,
+    /// Targets recognised now that the archive's manifest names.
+    targets: Vec<Vec<u8>>,
+}
+
+impl<'a> LeftOut<'a> {
+    /// Recognise the tree's targets now, keeping those `manifest` left layout out below. A format
+    /// 1 or 2 archive left nothing out.
+    fn observe(manifest: &ArchiveManifest, worktree: &'a Path) -> Result<Self, Refusal> {
+        let recorded = left_out_targets(manifest);
+        let targets = if recorded.is_empty() {
+            Vec::new()
+        } else {
+            recognised_targets(worktree)?
+                .into_iter()
+                .filter(|target| recorded.contains(target.as_slice()))
+                .collect()
+        };
+        Ok(Self { worktree, targets })
+    }
+
+    /// The target `path` is build layout below, observed on disk now.
+    fn target_of(&self, path: &[u8]) -> Option<usize> {
+        layout_target(path, &self.targets, |target, prefix| {
+            profile_on_disk(self.worktree, target, prefix)
+        })
+    }
+
+    /// Split untracked paths into build layout, each with its target, and everything else.
+    fn split(&self, paths: Vec<Vec<u8>>) -> (LayoutPaths, Vec<Vec<u8>>) {
+        let mut layout = Vec::new();
+        let mut others = Vec::new();
+        for path in paths {
+            match self.target_of(&path) {
+                Some(target) => layout.push((path, target)),
+                None => others.push(path),
+            }
+        }
+        (layout, others)
+    }
+
+    /// Delete each layout file as cache, re-observed immediately before deletion: still a file or
+    /// symlink below a layout name or profile of the same target. Anything else refuses.
+    fn delete(
+        &self,
+        layout: LayoutPaths,
+        changed: &dyn Fn(&[u8]) -> Refusal,
+    ) -> Result<(), Refusal> {
+        for (relative, target) in layout {
+            let path = self.worktree.join(OsStr::from_bytes(&relative));
+            let kind = std::fs::symlink_metadata(&path)
+                .map_err(|error| io_refusal("worktree-state-unreadable", &path, &error))?
+                .file_type();
+            if !(kind.is_file() || kind.is_symlink()) || self.target_of(&relative) != Some(target) {
+                return Err(changed(&relative));
+            }
+            make_parents_owner_writable(self.worktree, &relative)?;
+            std::fs::remove_file(&path)
+                .map_err(|error| io_refusal("archive-discard-failed", &path, &error))?;
+        }
+        Ok(())
+    }
+}
+
+/// The target paths whose build layout the archive left out.
+fn left_out_targets(manifest: &ArchiveManifest) -> BTreeSet<&[u8]> {
+    manifest
+        .build_output
+        .iter()
+        .flat_map(|output| &output.targets)
+        .map(|target| target.path.as_bytes())
+        .collect()
 }
 
 fn stale_state(archive: &Path) -> Refusal {
@@ -1586,6 +1847,10 @@ pub(crate) fn discard(record: &WorktreeRecord, archive: &Path, head: &str) -> Re
     if !roots.iter().map(Vec::as_slice).eq(imaged) {
         return Err(stale_state(archive));
     }
+    // The index is HEAD now, so every path here is untracked. Build layout the archive left out
+    // is deleted as cache; everything else must still match the archive.
+    let left_out = LeftOut::observe(&manifest, worktree)?;
+    let (layout, others) = left_out.split(others);
     for entry in hash_files(worktree, &scratch, others, false)? {
         if archived.get(&entry.path) != Some(&(entry.mode, entry.id.clone())) {
             return Err(changed(&entry.path));
@@ -1595,6 +1860,7 @@ pub(crate) fn discard(record: &WorktreeRecord, archive: &Path, head: &str) -> Re
         std::fs::remove_file(&path)
             .map_err(|error| io_refusal("archive-discard-failed", &path, &error))?;
     }
+    left_out.delete(layout, &changed)?;
     remove_imaged_roots(&manifest, archive, worktree)?;
     // Git reports an empty ignored directory as ignored state, and no archive holds a directory
     // without files, so empty directories go too. The caller re-observes the tree afterwards.
@@ -1733,6 +1999,313 @@ pub(crate) fn delete(archive: &Path, manifest: &ArchiveManifest) -> Result<u64, 
         ))
     })?;
     Ok(freed)
+}
+
+/// A refusal for a patch that `--strip-build-output` cannot use.
+fn unusable(message: String) -> Refusal {
+    Refusal::new("archive-patch-unusable", message)
+}
+
+/// Stream `patch` line by line, newline included, calling `visit(line, starts_section)` for each,
+/// and return the SHA-256 and length of every byte read. Bytes before the first `diff --git` line
+/// refuse: the patch is then not one `git diff` wrote.
+fn walk_patch(
+    patch: &Path,
+    mut visit: impl FnMut(&[u8], bool) -> Result<(), Refusal>,
+) -> Result<(String, u64), Refusal> {
+    use std::io::BufRead as _;
+    let unreadable = |error: std::io::Error| io_refusal("archive-unreadable", patch, &error);
+    let file = std::fs::File::open(patch).map_err(unreadable)?;
+    let mut reader = std::io::BufReader::with_capacity(1 << 16, file);
+    let mut hasher = Sha256::new();
+    let mut total = 0u64;
+    let mut line = Vec::new();
+    let mut first = true;
+    loop {
+        line.clear();
+        let read = reader.read_until(b'\n', &mut line).map_err(unreadable)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&line);
+        total += read as u64;
+        let starts = line.starts_with(b"diff --git ");
+        if first && !starts {
+            return Err(unusable(format!(
+                "{} holds bytes before its first diff --git section",
+                patch.display()
+            )));
+        }
+        first = false;
+        visit(&line, starts)?;
+    }
+    Ok((hex(&hasher.finalize()), total))
+}
+
+/// Refuse a patch whose streamed digest is not the one its manifest records.
+fn require_streamed(
+    patch: &Path,
+    recorded: &ArchiveFile,
+    digest: &(String, u64),
+) -> Result<(), Refusal> {
+    if digest.0 != recorded.sha256 || digest.1 != recorded.bytes {
+        return Err(Refusal::new(
+            "archive-digest-mismatch",
+            format!(
+                "{} no longer has the SHA-256 {} it was verified at",
+                patch.display(),
+                recorded.sha256
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Stream an archive's `dirty.patch` into its `diff --git` sections, verifying the digest the
+/// manifest records. Nothing is written.
+pub(crate) fn scan_patch(
+    archive: &Path,
+    manifest: &ArchiveManifest,
+) -> Result<Vec<ScannedSection>, Refusal> {
+    let recorded = manifest
+        .patch
+        .as_ref()
+        .ok_or_else(|| unusable(format!("{} records no patch", archive.display())))?;
+    let patch = archive.join(ARCHIVE_PATCH_FILE);
+    let mut sections: Vec<(ScannedSection, NewFileSize)> = Vec::new();
+    let mut in_header = false;
+    let digest = walk_patch(&patch, |line, starts| {
+        if starts {
+            let header = line.strip_suffix(b"\n").unwrap_or(line);
+            sections.push((
+                ScannedSection {
+                    path: diff_git_path(header),
+                    new_file: false,
+                    patch_bytes: line.len() as u64,
+                    content_bytes: 0,
+                },
+                NewFileSize::default(),
+            ));
+            in_header = true;
+            return Ok(());
+        }
+        if let Some((section, size)) = sections.last_mut() {
+            section.patch_bytes += line.len() as u64;
+            if in_header && is_extended_header(line) {
+                section.new_file |= line.starts_with(b"new file mode ");
+            } else {
+                in_header = false;
+            }
+            size.observe(line);
+        }
+        Ok(())
+    })?;
+    require_streamed(&patch, recorded, &digest)?;
+    Ok(sections
+        .into_iter()
+        .map(|(mut section, size)| {
+            section.content_bytes = size.bytes();
+            section
+        })
+        .collect())
+}
+
+/// Stream `source` into a new file at `destination`, keeping each whole section `strip` does not
+/// mark, and verify that `source` still has its recorded digest and the scanned section count.
+fn rewrite_patch(
+    source: &Path,
+    destination: &Path,
+    strip: &[bool],
+    recorded: &ArchiveFile,
+) -> Result<ArchiveFile, Refusal> {
+    use std::io::Write as _;
+    let failed = |error: &std::io::Error| io_refusal("archive-write-failed", destination, error);
+    let file = std::fs::File::options()
+        .write(true)
+        .create_new(true)
+        .open(destination)
+        .map_err(|error| failed(&error))?;
+    let mut writer = std::io::BufWriter::new(file);
+    let mut hasher = Sha256::new();
+    let mut written = 0u64;
+    let mut sections = 0usize;
+    let mut keep = false;
+    let digest = walk_patch(source, |line, starts| {
+        if starts {
+            keep = !*strip.get(sections).ok_or_else(|| {
+                unusable(format!(
+                    "{} holds more sections than were assessed",
+                    source.display()
+                ))
+            })?;
+            sections += 1;
+        }
+        if keep {
+            writer.write_all(line).map_err(|error| failed(&error))?;
+            hasher.update(line);
+            written += line.len() as u64;
+        }
+        Ok(())
+    })?;
+    require_streamed(source, recorded, &digest)?;
+    if sections != strip.len() {
+        return Err(unusable(format!(
+            "{} holds {sections} sections where {} were assessed",
+            source.display(),
+            strip.len()
+        )));
+    }
+    let file = writer.into_inner().map_err(|error| failed(error.error()))?;
+    file.sync_all().map_err(|error| failed(&error))?;
+    Ok(ArchiveFile {
+        file: ARCHIVE_PATCH_FILE.to_owned(),
+        sha256: hex(&hasher.finalize()),
+        bytes: written,
+    })
+}
+
+/// The tree id of the archive's HEAD, read through scratch objects: from the repository, or from
+/// the archive's own bundle when the repository no longer holds the commit.
+fn archived_head_tree(
+    scratch: &Scratch,
+    repository: &Path,
+    archive: &Path,
+    manifest: &ArchiveManifest,
+) -> Result<String, Refusal> {
+    ProcessGit::validate_object_id(&manifest.head)?;
+    let revision = format!("{}^{{tree}}", manifest.head);
+    let read = || {
+        run(
+            scratch
+                .git(repository, None)
+                .args(["rev-parse", "--verify", "--quiet", &revision]),
+            None,
+        )
+        .and_then(text)
+        .map(|tree| tree.trim().to_owned())
+    };
+    if let Ok(tree) = read() {
+        return Ok(tree);
+    }
+    let Some(bundle) = &manifest.bundle else {
+        return Err(unusable(format!(
+            "{} does not hold HEAD {} and the archive has no bundle",
+            repository.display(),
+            manifest.head
+        )));
+    };
+    require_file(archive, bundle, ARCHIVE_BUNDLE_FILE)?;
+    run(
+        scratch
+            .git(repository, None)
+            .args(["bundle", "unbundle"])
+            .arg(archive.join(ARCHIVE_BUNDLE_FILE)),
+        None,
+    )?;
+    read().map_err(|refusal| {
+        unusable(format!(
+            "HEAD {} is in neither {} nor the archive's bundle: {}",
+            manifest.head,
+            repository.display(),
+            refusal.message
+        ))
+    })
+}
+
+/// Rewrite an archive assessed strippable: write the new patch in a scratch directory beside the
+/// archive, verify it applies over HEAD in a scratch index and recompute `worktree_tree` from it,
+/// then replace `dirty.patch` (or delete it when nothing remains) and write the format 3 manifest
+/// last. The manifest on disk must still be `manifest`; any refusal leaves the archive untouched.
+pub(crate) fn strip(
+    archive: &Path,
+    manifest: &ArchiveManifest,
+    plan: &PatchStripPlan,
+) -> Result<ArchiveManifest, Refusal> {
+    let changed = |message: String| Refusal::new("archive-changed", message);
+    let manifest_path = archive.join(ARCHIVE_MANIFEST_FILE);
+    let unchanged = || -> Result<(), Refusal> {
+        let (on_disk, _) = parse_manifest(archive)?;
+        if &on_disk != manifest {
+            return Err(changed(format!(
+                "{} changed after it was assessed",
+                manifest_path.display()
+            )));
+        }
+        Ok(())
+    };
+    unchanged()?;
+    let recorded = manifest
+        .patch
+        .as_ref()
+        .ok_or_else(|| unusable(format!("{} records no patch", archive.display())))?;
+    let repository = manifest.repository_root.as_path();
+    let parent = archive.parent().unwrap_or(archive);
+    let scratch = Scratch::new(repository, parent)?;
+    let patch_path = archive.join(ARCHIVE_PATCH_FILE);
+    let staged_patch = scratch.path("dirty.patch");
+    let rewritten = rewrite_patch(&patch_path, &staged_patch, &plan.strip, recorded)?;
+    let head_tree = archived_head_tree(&scratch, repository, archive, manifest)?;
+    let remains = plan.sections_kept > 0;
+    let worktree_tree = if remains {
+        let index = scratch.path("strip-index");
+        let not_applied = |refusal: Refusal| {
+            unusable(format!(
+                "the stripped patch does not apply over HEAD {}: {}",
+                manifest.head, refusal.message
+            ))
+        };
+        run(
+            scratch
+                .git(repository, Some(&index))
+                .args(["read-tree", &head_tree]),
+            None,
+        )
+        .map_err(not_applied)?;
+        run(
+            scratch
+                .git(repository, Some(&index))
+                .args(["apply", "--cached", "--binary", "--whitespace=nowarn"])
+                .arg(&staged_patch),
+            None,
+        )
+        .map_err(not_applied)?;
+        text(run(
+            scratch.git(repository, Some(&index)).arg("write-tree"),
+            None,
+        )?)?
+        .trim()
+        .to_owned()
+    } else {
+        head_tree
+    };
+    let mut next = manifest.clone();
+    next.patch = remains.then_some(rewritten);
+    next.worktree_tree = worktree_tree;
+    next.build_output = BuildOutput::merged(manifest.build_output.as_ref(), plan.targets.clone());
+    next.expected_format().clone_into(&mut next.format);
+    next.require_format()?;
+    let staged_manifest = scratch.path("manifest.json");
+    write_manifest(&staged_manifest, &next)?;
+
+    // Immediately before replacing anything, the archive must still be the one assessed.
+    unchanged()?;
+    let on_disk = std::fs::symlink_metadata(&patch_path)
+        .map_err(|error| io_refusal("archive-unreadable", &patch_path, &error))?;
+    if !on_disk.is_file() || on_disk.len() != recorded.bytes {
+        return Err(changed(format!(
+            "{} changed after it was assessed",
+            patch_path.display()
+        )));
+    }
+    let replaced = if remains {
+        std::fs::rename(&staged_patch, &patch_path)
+    } else {
+        std::fs::remove_file(&patch_path)
+    };
+    replaced.map_err(|error| io_refusal("archive-write-failed", &patch_path, &error))?;
+    std::fs::rename(&staged_manifest, &manifest_path)
+        .map_err(|error| io_refusal("archive-write-failed", &manifest_path, &error))?;
+    Ok(next)
 }
 
 #[cfg(test)]
@@ -1979,5 +2552,114 @@ mod tests {
         std::fs::write(root.join("two\nlines"), "x").unwrap();
         let refusal = list_root(tree.path(), ROOT).unwrap_err();
         assert_eq!(refusal.code, "archive-unsupported-entry", "{refusal}");
+    }
+
+    const PATCH: &[u8] =
+        b"diff --git a/target/debug/.fingerprint/a b/target/debug/.fingerprint/a\n\
+new file mode 100644\n\
+index 0000000000000000000000000000000000000000..78981922613b2afb6025042ff6bd878ac1994e85\n\
+--- /dev/null\n\
++++ b/target/debug/.fingerprint/a\n\
+@@ -0,0 +1 @@\n\
++a\n\
+diff --git \"a/target/debug/lib\\303\\251\" \"b/target/debug/lib\\303\\251\"\n\
+new file mode 100644\n\
+index 0000000000000000000000000000000000000000..e69de29bb2d1d6434b8b29ae775ad8c2e48c5391\n\
+diff --git a/notes.txt b/notes.txt\n\
+new file mode 100644\n\
+index 0000000000000000000000000000000000000000..78981922613b2afb6025042ff6bd878ac1994e85\n\
+--- /dev/null\n\
++++ b/notes.txt\n\
+@@ -0,0 +1 @@\n\
++a\n";
+
+    /// An archive directory holding `patch` as `dirty.patch`, and a manifest recording it.
+    fn patched_archive(patch: &[u8]) -> (tempfile::TempDir, ArchiveManifest) {
+        let archive = tempfile::tempdir().unwrap();
+        std::fs::write(archive.path().join(ARCHIVE_PATCH_FILE), patch).unwrap();
+        let manifest = ArchiveManifest {
+            format: b10x_worktree_domain::ARCHIVE_FORMAT.into(),
+            id: b10x_worktree_domain::WorktreeId::new("tree").unwrap(),
+            repository_root: "/workspace/repo".into(),
+            path: "/managed/repo/tree".into(),
+            head: "a".repeat(40),
+            branch: None,
+            unique_commits: Vec::new(),
+            bundle: None,
+            worktree_tree: "b".repeat(40),
+            patch: Some(describe(archive.path(), ARCHIVE_PATCH_FILE).unwrap()),
+            created_at: 1,
+            nested_repositories: Vec::new(),
+            build_output: None,
+        };
+        (archive, manifest)
+    }
+
+    #[test]
+    fn a_scanned_patch_splits_into_whole_sections_with_decoded_paths() {
+        let (archive, manifest) = patched_archive(PATCH);
+        let sections = scan_patch(archive.path(), &manifest).unwrap();
+        let paths = sections
+            .iter()
+            .map(|section| section.path.clone().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            paths,
+            [
+                b"target/debug/.fingerprint/a".to_vec(),
+                "target/debug/lib\u{e9}".as_bytes().to_vec(),
+                b"notes.txt".to_vec(),
+            ]
+        );
+        assert!(sections.iter().all(|section| section.new_file));
+        assert_eq!(
+            sections
+                .iter()
+                .map(|section| section.patch_bytes)
+                .sum::<u64>(),
+            PATCH.len() as u64
+        );
+        assert_eq!(sections[0].content_bytes, 2);
+
+        let rewritten = archive.path().join("rewritten");
+        let kept = rewrite_patch(
+            &archive.path().join(ARCHIVE_PATCH_FILE),
+            &rewritten,
+            &[true, true, false],
+            manifest.patch.as_ref().unwrap(),
+        )
+        .unwrap();
+        let bytes = std::fs::read(&rewritten).unwrap();
+        assert!(bytes.starts_with(b"diff --git a/notes.txt b/notes.txt\n"));
+        assert!(PATCH.ends_with(&bytes));
+        assert_eq!(kept.bytes, bytes.len() as u64);
+        assert_eq!(kept.sha256, sha256_hex(&bytes));
+    }
+
+    #[test]
+    fn a_patch_with_a_preamble_a_changed_digest_or_other_sections_is_refused() {
+        let mut preamble = b"From a mail\n".to_vec();
+        preamble.extend_from_slice(PATCH);
+        let (archive, manifest) = patched_archive(&preamble);
+        let refusal = scan_patch(archive.path(), &manifest).unwrap_err();
+        assert_eq!(refusal.code, "archive-patch-unusable", "{refusal}");
+
+        let (archive, manifest) = patched_archive(PATCH);
+        std::fs::write(archive.path().join(ARCHIVE_PATCH_FILE), &PATCH[1..]).unwrap();
+        let refusal = scan_patch(archive.path(), &manifest).unwrap_err();
+        assert_eq!(refusal.code, "archive-patch-unusable", "{refusal}");
+        std::fs::write(archive.path().join(ARCHIVE_PATCH_FILE), PATCH.repeat(2)).unwrap();
+        let refusal = scan_patch(archive.path(), &manifest).unwrap_err();
+        assert_eq!(refusal.code, "archive-digest-mismatch", "{refusal}");
+
+        let (archive, manifest) = patched_archive(PATCH);
+        let refusal = rewrite_patch(
+            &archive.path().join(ARCHIVE_PATCH_FILE),
+            &archive.path().join("rewritten"),
+            &[true, false],
+            manifest.patch.as_ref().unwrap(),
+        )
+        .unwrap_err();
+        assert_eq!(refusal.code, "archive-patch-unusable", "{refusal}");
     }
 }

@@ -20,6 +20,8 @@ use std::path::{Component, Path, PathBuf};
 struct Plan {
     discarded: Vec<(PathBuf, CacheKind)>,
     retained: Vec<PathBuf>,
+    /// Cargo targets recognised at an ignored entry or as its parent.
+    targets: Vec<PathBuf>,
 }
 
 /// What a tagged Cargo target turned out to hold.
@@ -35,6 +37,22 @@ enum TargetShape {
 }
 
 pub(crate) fn discard(worktree: &Path, apply: bool) -> Result<CacheClassification, Refusal> {
+    let plan = classify_tree(worktree)?;
+    finish_discard(worktree, plan, apply)
+}
+
+/// The cargo targets `discard-cache` recognises among the tree's ignored entries, relative to the
+/// tree root, in path order: each holds at least one profile and is tagged or counts as tagged.
+/// Archives leave the build layout below them out ([`b10x_worktree_domain::is_build_layout`]).
+pub(crate) fn cargo_targets(worktree: &Path) -> Result<Vec<PathBuf>, Refusal> {
+    let mut targets = classify_tree(worktree)?.targets;
+    targets.sort();
+    targets.dedup();
+    Ok(targets)
+}
+
+/// Classify every ignored entry of the tree.
+fn classify_tree(worktree: &Path) -> Result<Plan, Refusal> {
     let status = ProcessGit::output_bytes(
         worktree,
         [
@@ -55,6 +73,15 @@ pub(crate) fn discard(worktree: &Path, apply: bool) -> Result<CacheClassificatio
             plan.retained.push(relative);
         }
     }
+    Ok(plan)
+}
+
+/// Report the classified entries and, with `apply`, delete the recognised cache.
+fn finish_discard(
+    worktree: &Path,
+    plan: Plan,
+    apply: bool,
+) -> Result<CacheClassification, Refusal> {
     let users = processes_using(worktree);
     if let Some(active) = users.as_ref().filter(|users| apply && !users.is_empty()) {
         return Err(in_use(worktree, active));
@@ -151,6 +178,7 @@ fn classify(
     } else if name.is_some_and(|name| TAGGED_TOOL_CACHES.contains(&name)) && cache_tagged(&path) {
         Some(CacheKind::ToolCache)
     } else if cargo_profile(&path) && cargo_target_root(worktree, parent, tracked) {
+        plan.targets.push(parent.to_path_buf());
         Some(CacheKind::CargoProfile)
     } else {
         None
@@ -161,10 +189,13 @@ fn classify(
     }
     if cargo_target_root(worktree, relative, tracked) {
         match cargo_target(worktree, relative, true)? {
-            TargetShape::Whole => plan
-                .discarded
-                .push((relative.to_path_buf(), CacheKind::CargoTarget)),
+            TargetShape::Whole => {
+                plan.targets.push(relative.to_path_buf());
+                plan.discarded
+                    .push((relative.to_path_buf(), CacheKind::CargoTarget));
+            }
             TargetShape::Partial(inner) => {
+                plan.targets.push(relative.to_path_buf());
                 plan.discarded.extend(inner.discarded);
                 plan.retained.extend(inner.retained);
             }
@@ -301,7 +332,8 @@ fn regular_file(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_file())
 }
 
-fn cargo_profile(path: &Path) -> bool {
+/// A Cargo profile: a real directory holding `.fingerprint/` as a real directory.
+pub(crate) fn cargo_profile(path: &Path) -> bool {
     real_directory(path) && real_directory(&path.join(CARGO_PROFILE_MARKER))
 }
 
