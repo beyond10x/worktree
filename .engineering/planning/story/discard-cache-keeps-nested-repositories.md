@@ -4,7 +4,7 @@ id: story:discard-cache-keeps-nested-repositories
 kind: story
 status: active
 title: discard-cache never deletes a nested repository
-revision: 3
+revision: 4
 transitions:
 - {from: "draft", to: "proposed", at: "2026-10-12T20:01:34Z", actor: "human:timo", revision: 2}
 - {from: "proposed", to: "active", at: "2026-10-12T20:01:35Z", actor: "human:timo", revision: 3}
@@ -64,3 +64,26 @@ Named tests, CLI against a real Git repository with a bare remote
 - `a_profile_holding_a_nested_repository_is_retained_whole`.
 - `node_modules_holding_a_nested_repository_is_retained_whole`.
 - the untagged-target tests hold the same rule for a target that counts as tagged.
+
+## Delivered
+
+Delivered beyond the first contract, after the adversary pass:
+
+- A Git directory with no `.git` entry (a bare repository, a separate Git directory) counts as a
+  repository: `HEAD` a regular file, `objects/` and `refs/` real directories, no symlink followed.
+- `archive`, verification, removal through a format 3 archive and
+  `prune-archives --strip-build-output` never treat repository content as build layout: a path
+  with a `.git` component, or at or below a Git directory (on disk; in a patch, a directory whose
+  `HEAD` and some `objects/` path the patch purely adds), stays archived and is never deleted as
+  layout. Before, a bare repository in a kept profile was left out and `gc --apply` removed it.
+
+Limit, decided: a tree whose kept state the archive cannot image (a fixture with linked
+worktrees, a gitfile or symlinked `.git`) or gc cannot read (an unreadable directory) is not
+collected. The refusal names the path (`archive-unsupported-entry`, `worktree-state-unreadable`);
+the tree's owner resolves it. Deleting it would be the loss this story prevents.
+
+Tests added for these: `nested_cache_adversary.rs` (13 cases), `build_output.rs`
+`strip_keeps_a_bare_repository_beside_the_layout_it_strips`, domain
+`a_repository_the_patch_adds_below_a_profile_is_never_stripped`,
+`repository_content_is_a_git_component_or_below_a_git_directory`,
+`a_git_directory_needs_head_objects_and_refs`, git `a_git_directory_is_recognised_by_head_objects_and_refs`.
