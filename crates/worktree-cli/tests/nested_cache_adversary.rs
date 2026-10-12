@@ -599,7 +599,8 @@ fn a_bare_repository_in_a_kept_profile_survives_finish_and_gc() {
         manifest["build_output"]["targets"][0]["path"], "target",
         "{finished}"
     );
-    let patch = std::fs::read_to_string(archive.join("dirty.patch")).unwrap();
+    let patch =
+        String::from_utf8_lossy(&std::fs::read(archive.join("dirty.patch")).unwrap()).into_owned();
     assert!(
         patch.contains(&format!("b/{relative}/HEAD")),
         "the archive left the repository out: {patch}"
@@ -629,7 +630,8 @@ fn a_bare_repository_in_target_tmp_is_not_left_out_of_the_archive() {
     let archive = PathBuf::from(archived["archive"]["path"].as_str().unwrap());
     let manifest = &archived["archive"]["manifest"];
     assert_eq!(manifest["format"], "worktree.archive/3", "{archived}");
-    let patch = std::fs::read_to_string(archive.join("dirty.patch")).unwrap();
+    let patch =
+        String::from_utf8_lossy(&std::fs::read(archive.join("dirty.patch")).unwrap()).into_owned();
     assert!(
         patch.contains(&format!("b/{relative}/HEAD")),
         "the archive left the repository out: {patch}"

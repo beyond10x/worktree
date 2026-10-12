@@ -343,10 +343,11 @@ impl Fixture {
             archive["manifest"].get("build_output").is_none(),
             "{archive}"
         );
-        let patch = std::fs::read_to_string(
-            PathBuf::from(archive["path"].as_str().unwrap()).join("dirty.patch"),
+        let patch = String::from_utf8_lossy(
+            &std::fs::read(PathBuf::from(archive["path"].as_str().unwrap()).join("dirty.patch"))
+                .unwrap(),
         )
-        .unwrap();
+        .into_owned();
         assert!(patch.contains("target/debug/.fingerprint/"), "{patch}");
         self.retire(id, &tree);
         PathBuf::from(archive["path"].as_str().unwrap())
@@ -1193,7 +1194,8 @@ fn strip_keeps_a_bare_repository_beside_the_layout_it_strips() {
         std::fs::remove_dir_all(&scratch).unwrap();
     });
     let commit = commit.into_inner();
-    let before = std::fs::read_to_string(archive.join("dirty.patch")).unwrap();
+    let before =
+        String::from_utf8_lossy(&std::fs::read(archive.join("dirty.patch")).unwrap()).into_owned();
     let repository_sections = before
         .lines()
         .filter(|line| line.starts_with(&format!("diff --git a/{relative}/")))
@@ -1206,7 +1208,8 @@ fn strip_keeps_a_bare_repository_beside_the_layout_it_strips() {
     assert_eq!(item["sections_kept"], repository_sections, "{item}");
     fixture.strip(&["--apply", "--id", "bare"]);
 
-    let patch = std::fs::read_to_string(archive.join("dirty.patch")).unwrap();
+    let patch =
+        String::from_utf8_lossy(&std::fs::read(archive.join("dirty.patch")).unwrap()).into_owned();
     assert!(patch.contains(&format!("b/{relative}/HEAD")), "{patch}");
     assert!(patch.contains(&format!("b/{relative}/objects/")), "{patch}");
     assert!(!patch.contains(".fingerprint"), "{patch}");
