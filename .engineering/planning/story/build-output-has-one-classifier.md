@@ -2,12 +2,13 @@
 format: aep.planning-md/3
 id: story:build-output-has-one-classifier
 kind: story
-status: active
+status: implemented
 title: Archive, discard-cache and the strip share one build-output classifier
-revision: 3
+revision: 4
 transitions:
 - {from: "draft", to: "proposed", at: "2026-10-12T17:37:56Z", actor: "human:timo", revision: 2}
 - {from: "proposed", to: "active", at: "2026-10-12T17:37:56Z", actor: "human:timo", revision: 3}
+- {from: "active", to: "implemented", at: "2026-10-12T18:21:39Z", actor: "human:timo", revision: 4, decided_on: {"recorded":{"test_result":1,"review_outcome":1}}}
 ---
 ## Outcome
 
