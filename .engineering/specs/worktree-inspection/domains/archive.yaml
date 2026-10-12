@@ -40,7 +40,9 @@ types:
   #     `new file mode` section whose decoded path no other section names and HEAD's tree, read
   #     from Git and never from the patch, holds neither as a file or directory nor below a file.
   #     Build layout is cargo's (below a target the patch recognises, BuildOutputOrigin) or a
-  #     Flutter app's (worktree.archive.FlutterOutputKind).
+  #     Flutter app's (worktree.archive.FlutterOutputKind). A path with a `.git` component, or at
+  #     or below a directory D whose `D/HEAD` and some path under `D/objects/` the patch purely
+  #     adds (a Git directory, as the patch can show one), is never build layout and stays.
   - name: worktree.archive.StripVerdict
     kind: enum
     variants: [Strippable, NothingToStrip, InvalidManifest, UnrecordedContent, TreeStillPresent, RepositoryGone, PatchUnusable]
@@ -187,6 +189,11 @@ entities:
   # `T/<triple>/<profile>/`). Every other path under T, every tracked file under T, and every
   # other ignored directory stays in the archive; a tracked file under T never stops T being
   # recognised.
+  # A repository is never build layout, cargo's or a Flutter app's: a path with a `.git`
+  # component, or at or below a Git directory (one holding `HEAD` as a regular file and
+  # `objects/` and `refs/` as real directories, observed on disk without following a symlink),
+  # stays in the archive, as worktree.cache.CacheKind keeps it in the tree. Removal re-observes
+  # this too, so such a path is never deleted as build layout.
   # Removal through a format 3 archive re-observes each left-out path immediately before deleting
   # it: it must still be build layout below this same recognised T (or Flutter output directory)
   # and is then deleted as cache; anything else that differs from worktree_tree refuses as

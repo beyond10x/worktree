@@ -55,13 +55,19 @@ independent policy: every decision must come from the public façade.
   supplies; none keeps a rule of its own. A directory that is both a recognised cargo target and
   a Flutter output directory is classified by the cargo rule alone, in `archive`, `discard-cache`
   and the strip alike, so a file below it that is not cargo layout stays archived. The outermost
-  of a cargo target and a Flutter output directory is recorded. Such an archive is `worktree.archive/3` and records per directory the
+  of a cargo target and a Flutter output directory is recorded. A repository is never build
+  layout, cargo's or a Flutter app's: a path with a `.git` component, or at or below a Git
+  directory observed on disk (`HEAD` a regular file, `objects/` and `refs/` real directories, none
+  reached through a symbolic link; the one predicate `discard-cache` uses), stays in `dirty.patch`
+  and the fingerprint; one I/O-free rule in the domain decides it for `archive`, verification,
+  removal and the strip. Such an archive is `worktree.archive/3` and records per directory the
   files and bytes left out; one that left nothing out is written exactly as format 1 or 2. Its
   fingerprint excludes that layout, and verification leaves layout out only below the directories
   the manifest records, so layout below a directory it did not record stays in the fingerprint and
   refuses as `archive-stale`. Removal through it deletes each left-out file only after
   re-observing it, immediately before deletion, as a file or symlink of build layout below the
-  same recorded directory, recognised now; anything else refuses.
+  same recorded directory, recognised now, and still neither with a `.git` component nor at or
+  below a Git directory; anything else refuses, and such a path is never deleted as layout.
 - `prune-archives --strip-build-output` never deletes an archive. A dry-run, the default, writes
   nothing. `--apply` takes exact `--id` values only, re-assesses each, and rewrites only an archive
   whose manifest is valid, whose directory holds only recorded files, whose tree path is absent and
@@ -74,7 +80,9 @@ independent policy: every decision must come from the public façade.
   below a Flutter app's `<P>/build/` or `<P>/.dart_tool/`, where HEAD's tree holds
   `<P>/pubspec.yaml` as anything but a directory or the patch purely adds it (that section stays) and HEAD's tree
   holds nothing at the directory's own path, and the patch recognises no cargo target there (one
-  that is both is classified by the cargo rule alone). The outermost directory whose rule strips the path is recorded. Both halves of
+  that is both is classified by the cargo rule alone). A path with a `.git` component, or at or
+  below a directory `D` for which the patch purely adds `D/HEAD` and at least one path under
+  `D/objects/` (a Git directory, as the patch can show one), is never stripped. The outermost directory whose rule strips the path is recorded. Both halves of
   a type change stay, an undecodable path keeps its section, and nested images are never touched. The new patch is written outside the archive, verified to apply
   over HEAD in a scratch index (never a tree's or the repository's own index), `worktree_tree` is
   recomputed from it, and only then are the patch replaced (or deleted when nothing remains) and
@@ -102,17 +110,28 @@ independent policy: every decision must come from the public façade.
 - The only command that deletes files a tree's owner wrote is `discard-cache` (and `finish
   --discard-cache`), and it deletes only ignored, real directories recognised as build cache by
   structure: a Cargo profile holding `.fingerprint/` inside a validly tagged target, that target's
-  own real `tmp/` (Cargo's `CARGO_TARGET_TMPDIR`, whatever it holds) when the target holds a
-  profile, `node_modules` at or below a tracked lockfile, a virtual environment beside a tracked
-  Python manifest, a Flutter app's `<P>/build/` or `<P>/.dart_tool/` that the one classifier
-  recognises on disk (a regular `<P>/pubspec.yaml` beside it, nothing HEAD or the index tracks at
-  or below it, no cargo target at it) and that holds no `.git` (file, directory or symbolic link)
-  at any depth below it, found by a walk that follows no symbolic link and repeated immediately
-  before deletion (one that holds a `.git`, or that the walk cannot read, is retained whole), and a tagged `.pytest_cache`, `.mypy_cache` or `.ruff_cache`. Cargo tags only a
-  target it creates, so a real directory named `target` without a valid tag counts as tagged when
-  a tracked `Cargo.toml` sits beside it and a direct child other than `tmp/` holds both
-  `.fingerprint/` and `deps/` as real directories. A name alone never qualifies; anything
-  unrecognised is retained and reported. It refuses for a live lease, a Git lock, or another
+  own real `tmp/` (Cargo's `CARGO_TARGET_TMPDIR`) when the target holds a profile,
+  `node_modules` at or below a tracked lockfile, a virtual environment beside a tracked Python
+  manifest, a Flutter app's `<P>/build/` or `<P>/.dart_tool/` that the one classifier recognises
+  on disk (a regular `<P>/pubspec.yaml` beside it, nothing HEAD or the index tracks at or below
+  it, no cargo target at it), and a tagged `.pytest_cache`, `.mypy_cache` or `.ruff_cache`. Cargo
+  tags only a target it creates, so a real directory named `target` without a valid tag counts as
+  tagged when a tracked `Cargo.toml` sits beside it and a direct child other than `tmp/` holds
+  both `.fingerprint/` and `deps/` as real directories. A nested repository is never cache: a
+  recognised directory of any kind that holds a repository, found by one walk that follows no
+  symbolic link, is never deleted whole. A repository is an entry named `.git` (file, directory
+  or symbolic link) at any depth below it, or a Git directory whatever its name (a bare
+  repository or a `--separate-git-dir`: `HEAD` a regular file, `objects/` and `refs/` real
+  directories, none through a symbolic link) at it or at any depth below it; an entry whose type
+  or a directory whose names the walk cannot read counts as one. A whole target holding one
+  falls to its parts, each profile, nested target and `tmp/` under its own rule; a `tmp/`
+  holding one deletes each direct entry (file, symbolic link or directory) that is and holds
+  none as `cargo-target-tmp` and retains each other; every other directory holding one is
+  retained whole. The walk is repeated immediately before each deletion, and a directory that is
+  or holds a repository then is retained whole. Keeping is not recovering: a tree whose kept
+  state the archive cannot image (a nested `.git` with linked worktrees) or no walk can read
+  stays, and `finish --archive` or `gc` refuses naming the path. A name alone never qualifies; anything unrecognised is
+  retained and reported. It refuses for a live lease, a Git lock, or another
   process using the tree. The one other deletion of such files is removal through a
   `worktree.archive/3` archive, and only of the build layout it left out, re-observed as above.
 - `sweep` composes only `discard-cache` and `archive`. It never changes lifecycle, never removes a

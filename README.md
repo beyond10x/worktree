@@ -57,16 +57,20 @@ changing state.
 
 `worktree discard-cache` recognises build cache by structure, never by a directory's name: a Cargo
 profile (it holds `.fingerprint/`) inside a target carrying a valid `CACHEDIR.TAG`, that target's
-`tmp/` test scratch (Cargo's `CARGO_TARGET_TMPDIR`, whatever it holds) when the target holds a
+`tmp/` test scratch (Cargo's `CARGO_TARGET_TMPDIR`) when the target holds a
 profile, `node_modules` at or below a tracked npm, Yarn, pnpm or Bun lockfile, a virtual environment (`pyvenv.cfg`) beside
 a tracked Python manifest, a Flutter app's `<P>/build/` or `<P>/.dart_tool/` (as `flutter-output`) when
 `<P>/pubspec.yaml` is a regular file beside it and neither HEAD nor the index tracks anything at or
 below it, and a tagged `.pytest_cache`, `.mypy_cache` or `.ruff_cache`. A `build/` with no
-`pubspec.yaml` beside it is kept. A Flutter output directory holding a `.git` (a file, a directory
-or a symbolic link) at any depth below it is kept whole, because the repository there may hold
-commits no remote does; the walk that looks for it follows no symbolic link and runs again
-immediately before deletion, and a directory it cannot read is kept too (`archive` images such a
-repository). A directory that is a cargo target too is classified by the cargo rule alone. Cargo
+`pubspec.yaml` beside it is kept. A nested repository is never cache, because it may hold commits
+no remote does: a recognised directory of any kind holding a `.git` (a file, a directory or a
+symbolic link) at any depth below it, or a bare or `--separate-git-dir` Git directory (`HEAD`,
+`objects/` and `refs/`) at or below it, is never deleted whole. A whole target holding one falls to
+its parts, each profile, nested target and `tmp/` under its own rule; a `tmp/` holding one deletes
+each direct entry that holds none and keeps each that holds one, such as a test's fixture
+repository; every other directory holding one is kept whole. The walk that looks for it follows no
+symbolic link and runs again immediately before each deletion, and a directory it cannot read is
+kept too (`archive` images such a repository). A directory that is a cargo target too is classified by the cargo rule alone. Cargo
 writes the tag only when it creates the target itself, so a `target/` made before the first build
 has none; such a directory counts as tagged when a tracked `Cargo.toml` sits beside it and a
 child other than `tmp/` holds both `.fingerprint/` and `deps/`. Every other
@@ -177,6 +181,12 @@ a cargo target and a Flutter output directory is recorded. Verification leaves l
 below the directories the manifest records, so an archive written before Flutter output was left
 out still verifies, and layout below a directory an archive did not record refuses as
 `archive-stale`.
+
+A repository is never build layout: a path with a `.git` component, or at or below a Git
+directory (`HEAD` a regular file, `objects/` and `refs/` real directories), stays in the archive
+wherever it lies, and removal never deletes it as layout. `prune-archives --strip-build-output`
+keeps such a path too, recognising a Git directory in a patch by the `HEAD` and `objects/` paths
+it adds.
 
 The fingerprint is a Git tree id computed from every file on disk except the build layout left
 out, read without filters, index flags or attributes. It is recorded for every archive, including

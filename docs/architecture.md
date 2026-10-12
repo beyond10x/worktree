@@ -113,10 +113,22 @@ or the index tracks at or below it, and `cache::archive_target` for the cargo ta
 observes HEAD's tree and the patch's pure additions, and its own recognised targets. The archive
 records the outer of a cargo target and a Flutter output directory (`outermost_build_directory`),
 as the strip does; `discard-cache` deletes an ignored directory the classifier recognises as
-`CacheKind::FlutterOutput`, after its cargo rules, unless a walk that follows no symbolic link
-finds a `.git` (file, directory or symbolic link) at any depth below it (`cache::holds_git_entry`):
-a repository there may hold commits no remote does, so the directory is retained whole. The walk
-runs again immediately before deletion, and an unreadable directory counts as holding one.
+`CacheKind::FlutterOutput`, after its cargo rules. For every kind, one walk that follows no
+symbolic link (`cache::holds_git_entry`) decides whether a recognised directory holds a `.git`
+(file, directory or symbolic link) at any depth below it, or is or holds a Git directory with no
+`.git` entry (`cache::git_directory`: `HEAD` a regular file, `objects/` and `refs/` real
+directories, as a bare repository or a `--separate-git-dir` has): a repository there may hold commits no
+remote does, so the directory is never deleted whole. A whole Cargo target holding one falls to
+its parts (each profile, nested target and `tmp/` under its own rule; a target is `cargo-target`
+only when nothing in it was retained, so by construction it holds none); a `tmp/` holding one is
+split into its direct entries, those holding none discarded as `cargo-target-tmp` and the rest
+retained; every other kind holding one is retained whole. The walk runs again immediately before
+each deletion, whatever the kind, and an unreadable directory counts as holding one.
+
+Repository content is never layout. The domain's `layout_directory` asks, besides the cargo and
+Flutter rules, whether a path has a `.git` component or lies at or below a Git directory
+(`GitDirectoryFacts`); the disk side observes that with the one predicate `discard-cache` uses, and
+the strip infers it from the `HEAD` and `objects/` paths a patch purely adds.
 
 Verification of a format 3 archive leaves layout out only below the directories the manifest
 records, so an archive written before a kind of output was recognised still holds it in its
