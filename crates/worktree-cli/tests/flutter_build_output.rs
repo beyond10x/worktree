@@ -602,3 +602,135 @@ fn discard_cache_retains_a_build_directory_with_no_pubspec_beside() {
     let refusal = fixture.refused(&["finish", "--discard-cache", tree.to_str().unwrap()]);
     assert!(refusal["code"].is_string(), "{refusal}");
 }
+
+/// A Flutter app's output directory holding a `.git` at any depth, as a directory, a file or a
+/// symbolic link, may hold a repository whose commits no remote does: `discard-cache` retains it
+/// whole, and deletes an output directory holding none.
+#[test]
+fn discard_cache_retains_flutter_output_holding_a_git_entry_at_any_depth() {
+    let fixture = Fixture::new(&[
+        ("app/pubspec.yaml", "name: app\n"),
+        ("pkg/pubspec.yaml", "name: pkg\n"),
+        ("plain/pubspec.yaml", "name: plain\n"),
+    ]);
+    let tree = fixture.tree("dotgit");
+    Fixture::flutter_build(&tree, "");
+    Fixture::flutter_build(&tree, "app");
+    Fixture::flutter_build(&tree, "pkg");
+    Fixture::flutter_build(&tree, "plain");
+    // A repository deep below `build/`.
+    let nested = tree.join("build/app/outputs/notes");
+    std::fs::create_dir_all(&nested).unwrap();
+    git(&nested, &["init", "--quiet"]);
+    write(&nested.join("journal.md"), "committed nowhere else\n");
+    git(&nested, &["add", "journal.md"]);
+    git(&nested, &["commit", "--quiet", "-m", "only copy"]);
+    // A gitfile below `app/.dart_tool/`, and a symbolic link named `.git` below `pkg/build/`.
+    write(
+        &tree.join("app/.dart_tool/linked/.git"),
+        "gitdir: ../../../elsewhere\n",
+    );
+    std::fs::create_dir_all(tree.join("pkg/build/web")).unwrap();
+    std::os::unix::fs::symlink("../../lib", tree.join("pkg/build/web/.git")).unwrap();
+
+    let planned = fixture.discard(&tree, &["--dry-run"]);
+    let mut discarded = paths(&planned, "discarded");
+    discarded.sort();
+    let expected = [
+        ".dart_tool",
+        "app/build",
+        "pkg/.dart_tool",
+        "plain/.dart_tool",
+        "plain/build",
+    ];
+    assert_eq!(discarded, expected, "{planned}");
+    let mut retained = paths(&planned, "retained_ignored");
+    retained.sort();
+    assert_eq!(
+        retained,
+        ["app/.dart_tool", "build", "pkg/build"],
+        "{planned}"
+    );
+
+    let applied = fixture.discard(&tree, &[]);
+    let mut discarded = paths(&applied, "discarded");
+    discarded.sort();
+    assert_eq!(discarded, expected, "{applied}");
+    for directory in expected {
+        assert!(!tree.join(directory).exists(), "{directory}");
+    }
+    assert!(nested.join(".git").is_dir() && nested.join("journal.md").is_file());
+    assert!(tree.join("app/.dart_tool/linked/.git").is_file());
+    assert!(
+        std::fs::symlink_metadata(tree.join("pkg/build/web/.git"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert!(tree.join("lib/main.dart").is_file());
+}
+
+/// A cargo target named `build/` beside a `pubspec.yaml` is classified by the cargo rule alone in
+/// the strip as in `archive` and `discard-cache`: cargo's layout below it is stripped from an
+/// archive written before, and `build/notes.md`, which is no layout, stays in `dirty.patch`.
+#[test]
+fn strip_keeps_a_non_layout_file_in_a_cargo_target_named_build_beside_a_pubspec() {
+    let fixture = Fixture::new(&[("Cargo.toml", "[package]\nname = \"one\"\n")]);
+    let tree = fixture.tree("strip");
+    write(&tree.join("build/CACHEDIR.TAG"), TAG);
+    write(&tree.join("build/debug/.fingerprint/one-1/lib-one"), "f\n");
+    write(&tree.join("build/debug/deps/libone-1.rlib"), [9u8; 16]);
+    write(
+        &tree.join("build/notes.md"),
+        "hand-written, never committed\n",
+    );
+
+    // While the index tracks every file below `build/`, `archive` leaves nothing out: the archive
+    // is the one a release before this classifier wrote.
+    git(&tree, &["add", "-f", "build"]);
+    let archive = fixture.archive("strip");
+    git(&tree, &["read-tree", "HEAD"]);
+    assert!(
+        archive["manifest"].get("build_output").is_none(),
+        "{archive}"
+    );
+    for path in ["b/build/notes.md", "b/build/debug/deps/libone-1.rlib"] {
+        assert!(patch_of(&archive).contains(path), "{path}");
+    }
+    fixture.ok(&["finish", "strip"]);
+    assert!(fixture.gc("--apply", "strip")["evidence"].is_object());
+    assert!(!tree.exists());
+
+    let strip = |extra: &[&str]| {
+        let mut args = vec![
+            "prune-archives",
+            "--strip-build-output",
+            "--repo",
+            fixture.repository.to_str().unwrap(),
+        ];
+        args.extend_from_slice(extra);
+        fixture.ok(&args)
+    };
+    let dry = strip(&[]);
+    assert_eq!(dry["archives"][0]["verdict"], "strippable", "{dry}");
+    assert_eq!(dry["archives"][0]["sections_stripped"], 3, "{dry}");
+    strip(&["--apply", "--id", "strip"]);
+    let directory = PathBuf::from(archive["path"].as_str().unwrap());
+    let manifest: Value =
+        serde_json::from_slice(&std::fs::read(directory.join("manifest.json")).unwrap()).unwrap();
+    let recorded: Vec<(&str, u64)> = manifest["build_output"]["targets"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{manifest}"))
+        .iter()
+        .map(|target| {
+            (
+                target["path"].as_str().unwrap(),
+                target["files"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(recorded, [("build", 3)], "{manifest}");
+    let patch = std::fs::read_to_string(directory.join("dirty.patch")).unwrap();
+    assert!(patch.contains("b/build/notes.md"), "{patch}");
+    assert!(!patch.contains("b/build/debug/"), "{patch}");
+}

@@ -20,7 +20,8 @@
 //! `pubspec.yaml`, where nothing is tracked at that path. One classifier
 //! ([`flutter_output_kind`]) decides it for `archive`, `discard-cache` and the strip, from
 //! observations each caller supplies ([`FlutterFacts`]): the disk and the index, or HEAD's tree and
-//! the patch. Every untracked file strictly below one is build layout.
+//! the patch. Every untracked file strictly below one is build layout. A directory that is a
+//! recognised cargo target too is classified by the cargo rule alone ([`FlutterFacts::cargo_target`]).
 
 use crate::{
     ARCHIVE_PATCH_FILE, ArchiveContents, ArchiveEntryKind, ArchiveManifest, CACHEDIR_TAG_FILE,
@@ -605,12 +606,17 @@ pub struct FlutterFacts {
     /// tree or the index holds the path or anything below it; for the strip, HEAD's tree holds
     /// it.
     pub tracked: bool,
+    /// The directory is itself a cargo target recognised from the same source: on disk by
+    /// `archive`'s structural rule, in a patch by the patch's own pure additions. Such a
+    /// directory is classified by the cargo rule alone, so a file below it that is no cargo
+    /// layout stays archived, as `discard-cache` keeps it.
+    pub cargo_target: bool,
 }
 
 impl FlutterFacts {
     /// Whether these observations make the directory a Flutter app's output.
     pub fn recognises(self) -> bool {
-        self.manifest_beside && !self.tracked
+        self.manifest_beside && !self.tracked && !self.cargo_target
     }
 }
 
@@ -657,7 +663,8 @@ pub fn flutter_output(
 }
 
 /// Of the cargo target and the Flutter output directory a path lies below, the outer one: both
-/// are its ancestors, so the shorter is the outer.
+/// are its ancestors, so the shorter is the outer. They are never one directory: the classifier
+/// never recognises a cargo target as a Flutter app's output ([`FlutterFacts::cargo_target`]).
 pub fn outermost_build_directory<'a>(
     cargo: Option<&'a [u8]>,
     flutter: Option<&'a [u8]>,
@@ -679,9 +686,9 @@ pub fn outermost_build_directory<'a>(
 /// path is build layout below a directory the patch's own pure additions recognise as a cargo
 /// target, by a Cargo-signed `CACHEDIR.TAG` or a profile's `.fingerprint/`, or strictly below a
 /// Flutter app's output directory ([`FlutterOutputKind`]) beside a `pubspec.yaml` HEAD holds or
-/// the patch purely adds. The outermost such directory is recorded. Every other section is kept
-/// whole: a type change of a tracked path is a `deleted file mode` and a `new file mode` section
-/// of one path, and both halves stay.
+/// the patch purely adds and that is no cargo target the patch recognises. The outermost such
+/// directory is recorded. Every other section is kept whole: a type change of a tracked path is a
+/// `deleted file mode` and a `new file mode` section of one path, and both halves stay.
 pub fn plan_patch_strip(patch: &ScannedPatch) -> PatchStripPlan {
     let sections = patch.sections.as_slice();
     // Per decoded path: how many sections name it, and whether every one is a `new file mode`.
@@ -750,6 +757,7 @@ pub fn plan_patch_strip(patch: &ScannedPatch) -> PatchStripPlan {
                         manifest_beside: patch.head_files.contains(manifest)
                             || added_manifests.contains(manifest),
                         tracked: patch.head_holds(directory),
+                        cargo_target: targets.iter().any(|target| target == directory),
                     })
                 });
                 outermost_build_directory(cargo, flutter)
@@ -1269,12 +1277,77 @@ mod tests {
         assert_eq!(FlutterOutputKind::named(b"target"), None);
     }
 
+    /// A directory that is both a recognised cargo target and a Flutter app's output directory is
+    /// classified by the cargo rule alone: only cargo's layout below it is stripped, and a file
+    /// that is no layout (`build/notes.md`) stays, as `discard-cache` keeps it.
+    #[test]
+    fn a_cargo_target_that_is_flutter_output_too_is_classified_by_cargo_alone() {
+        let mut tag = section("build/CACHEDIR.TAG", true);
+        tag.signed_tag = true;
+        let sections = [
+            tag,
+            section("build/debug/.fingerprint/one/lib", true),
+            section("build/debug/deps/libone.rlib", true),
+            section("build/notes.md", true),
+            section(".dart_tool/package_config.json", true),
+        ];
+        let plan = plan_over_head(&sections, &["pubspec.yaml", "Cargo.toml"], &[]);
+        assert_eq!(plan.strip, [true, true, true, false, true], "{plan:?}");
+        assert_eq!(
+            plan.targets,
+            [strip_target(".dart_tool", 1), strip_target("build", 3)]
+        );
+
+        // On disk the same: `build` is a recognised cargo target beside a `pubspec.yaml`, so the
+        // classifier recognises no Flutter output at it, and the cargo target is the one directory
+        // a path below it can be layout of. `.dart_tool` beside it still is Flutter output.
+        let mut disk = Disk::new(
+            &["pubspec.yaml", "Cargo.toml", "build/notes.md"],
+            &["build", "build/debug", ".dart_tool"],
+            &["pubspec.yaml", "Cargo.toml"],
+        );
+        disk.cargo_targets.insert(b"build".to_vec());
+        let observe = |directory: &[u8], manifest: &[u8]| disk.observe(directory, manifest);
+        assert_eq!(flutter_output_kind(b"build", observe), None);
+        assert_eq!(flutter_output(b"build/notes.md", observe), None);
+        assert_eq!(
+            flutter_output_kind(b".dart_tool", observe),
+            Some(FlutterOutputKind::DartTool)
+        );
+        let targets = [b"build".to_vec()];
+        let cargo = |path: &[u8]| {
+            layout_target(
+                path,
+                &targets,
+                |_| TargetFacts {
+                    signed_tag: true,
+                    holds_profile: true,
+                },
+                |_, prefix| prefix == b"debug",
+            )
+            .map(|index| targets[index].as_slice())
+        };
+        for (path, expected) in [
+            (&b"build/notes.md"[..], None),
+            (b"build/debug/deps/libone.rlib", Some(&b"build"[..])),
+        ] {
+            assert_eq!(
+                outermost_build_directory(cargo(path), flutter_output(path, observe)),
+                expected,
+                "{}",
+                String::from_utf8_lossy(path)
+            );
+        }
+    }
+
     /// A tree as `archive` and `discard-cache` would observe it on disk: the regular files and
     /// real directories present, and every path HEAD or the index tracks.
     struct Disk {
         files: BTreeSet<Vec<u8>>,
         directories: BTreeSet<Vec<u8>>,
         tracked: BTreeSet<Vec<u8>>,
+        /// Directories recognised on disk as cargo targets.
+        cargo_targets: BTreeSet<Vec<u8>>,
     }
 
     impl Disk {
@@ -1284,17 +1357,20 @@ mod tests {
                 files: set(files),
                 directories: set(directories),
                 tracked: set(tracked),
+                cargo_targets: BTreeSet::new(),
             }
         }
 
         /// The observations `archive` supplies: `None` unless `directory` is a real directory;
-        /// the manifest as a regular file; anything tracked at or below the directory.
+        /// the manifest as a regular file; anything tracked at or below the directory; whether
+        /// the directory is itself a recognised cargo target.
         fn observe(&self, directory: &[u8], manifest: &[u8]) -> Option<FlutterFacts> {
             self.directories.contains(directory).then(|| FlutterFacts {
                 manifest_beside: self.files.contains(manifest),
                 tracked: self.tracked.iter().any(|path| {
                     path.as_slice() == directory || path_below(path, directory).is_some()
                 }),
+                cargo_target: self.cargo_targets.contains(directory),
             })
         }
     }
@@ -1445,6 +1521,7 @@ mod tests {
             Some(FlutterFacts {
                 manifest_beside: false,
                 tracked: false,
+                cargo_target: false,
             })
         });
         assert_eq!(absent, None);

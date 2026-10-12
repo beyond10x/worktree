@@ -1175,6 +1175,9 @@ struct Recognised<'a> {
     targets: Vec<Vec<u8>>,
     /// Every path HEAD or the index tracks.
     tracked: BTreeSet<Vec<u8>>,
+    /// Every path the index tracks, read only when a path may lie below a Flutter app's output:
+    /// the archive's cargo rule reads it to decide whether such a directory is a cargo target.
+    indexed: BTreeSet<PathBuf>,
     /// The only directories that count, when given.
     only: Option<BTreeSet<Vec<u8>>>,
 }
@@ -1197,10 +1200,16 @@ impl<'a> Recognised<'a> {
         } else {
             cache::head_or_index_paths(worktree, head)?
         };
+        let indexed = if flutter {
+            cache::tracked_paths(worktree)?
+        } else {
+            BTreeSet::new()
+        };
         Ok(Self {
             worktree,
             targets,
             tracked,
+            indexed,
             only: only.cloned(),
         })
     }
@@ -1241,7 +1250,13 @@ impl<'a> Recognised<'a> {
             |target| facts_on_disk(self.worktree, target),
             |target, prefix| profile_on_disk(self.worktree, target, prefix),
             |directory, manifest| {
-                cache::flutter_facts(self.worktree, directory, manifest, &self.tracked)
+                cache::flutter_facts(
+                    self.worktree,
+                    directory,
+                    manifest,
+                    &self.tracked,
+                    &self.indexed,
+                )
             },
         )
     }
@@ -1281,7 +1296,13 @@ fn observe_layout(
             },
             |directory, manifest| {
                 *outputs.entry(directory.to_vec()).or_insert_with(|| {
-                    cache::flutter_facts(worktree, directory, manifest, &recognised.tracked)
+                    cache::flutter_facts(
+                        worktree,
+                        directory,
+                        manifest,
+                        &recognised.tracked,
+                        &recognised.indexed,
+                    )
                 })
             },
         );
