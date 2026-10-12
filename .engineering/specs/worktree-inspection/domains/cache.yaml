@@ -11,9 +11,14 @@ types:
   # holds a direct child other than `tmp/` with both `.fingerprint/` and `deps/` as real
   # directories; a CACHEDIR.TAG with a bad signature inside it is kept. The same three
   # kinds then apply; no new variant.
+  # FlutterOutput: an ignored real directory `P/build/` or `P/.dart_tool/` that is a Flutter app's
+  # output directory (worktree.archive.FlutterOutputKind) by the one build-output classifier
+  # `archive` and `prune-archives --strip-build-output` use: `P/pubspec.yaml` is a regular file on
+  # disk beside it, and neither HEAD's tree nor the index holds anything at or below the
+  # directory. A `build/` with no `pubspec.yaml` beside it is retained.
   - name: worktree.cache.CacheKind
     kind: enum
-    variants: [CargoProfile, CargoTarget, CargoTargetTmp, NodeModules, PythonVirtualenv, ToolCache]
+    variants: [CargoProfile, CargoTarget, CargoTargetTmp, FlutterOutput, NodeModules, PythonVirtualenv, ToolCache]
 
 # A report of one cache discard, not a new persisted lifecycle. The worktree it names is the
 # existing registry record (crates/worktree-domain/src/lib.rs, WorktreeRecord).
