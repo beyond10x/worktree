@@ -2,12 +2,13 @@
 format: aep.planning-md/3
 id: story:discard-cache-keeps-nested-repositories
 kind: story
-status: active
+status: implemented
 title: discard-cache never deletes a nested repository
-revision: 4
+revision: 5
 transitions:
 - {from: "draft", to: "proposed", at: "2026-10-12T20:01:34Z", actor: "human:timo", revision: 2}
 - {from: "proposed", to: "active", at: "2026-10-12T20:01:35Z", actor: "human:timo", revision: 3}
+- {from: "active", to: "implemented", at: "2026-10-12T21:08:22Z", actor: "human:timo", revision: 5, decided_on: {"recorded":{"test_result":1}}}
 ---
 ## Outcome
 

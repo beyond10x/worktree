@@ -1,0 +1,12 @@
+{
+  "at": "2026-10-12T21:08:22Z",
+  "actor": "human:timo",
+  "artifact": "story:discard-cache-keeps-nested-repositories",
+  "kind": "story",
+  "revision": 4,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "https://github.com/beyond10x/worktree/actions/runs/38308553859 gate pass on 857fc3f"
+  }
+}

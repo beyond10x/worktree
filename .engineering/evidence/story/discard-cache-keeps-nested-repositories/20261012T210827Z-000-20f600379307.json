@@ -1,0 +1,14 @@
+{
+  "at": "2026-10-12T21:08:27Z",
+  "actor": "human:timo",
+  "artifact": "story:discard-cache-keeps-nested-repositories",
+  "kind": "story",
+  "revision": 5,
+  "change": {
+    "change": "evidence",
+    "kind": "review_outcome",
+    "source": "22cfe8a, bc7d38d",
+    "review": "review-result:adversary-nested-cache-pass-1",
+    "outcome": "fixed"
+  }
+}
