@@ -184,12 +184,17 @@ line, hashing it against the recorded digest, and splits it at each `diff --git`
 in a hunk starts with ` `, `+`, `-` or `\`, and a base85 line holds no space, so neither can open
 a section. Each section carries its decoded path (`diff_git_path`, with Git's C-quoting undone),
 whether its extended header holds `new file mode`, whether the file it adds begins with Cargo's
-`CACHEDIR.TAG` signature, its patch bytes and the size of the file it adds; the adapter then marks
-each section whose path HEAD's tree, read with `git ls-tree` (from the archive's bundle when the
-repository lacks HEAD), holds as a file or directory or below a file. The domain's
+`CACHEDIR.TAG` signature, its patch bytes and the size of the file it adds. The adapter returns
+them as a `ScannedPatch` with the paths of HEAD's files and directories, read with `git ls-tree`
+(from the archive's bundle when the repository lacks HEAD); `ScannedPatch::against_head`, in the
+domain, marks each section whose path HEAD holds as a file or directory or below a file. The
+adapter only observes: it reads no file contents and decides nothing. The domain's
 `plan_patch_strip` keeps every section of a path named twice, named by a section that is not
-`new file mode`, or tracked, recognises targets from the remaining pure additions alone (a signed
-tag or a profile) and marks the sections to strip. The report's prune verdict afterwards is `decide_archive_prune` over the
+`new file mode`, or tracked, recognises cargo targets from the remaining pure additions alone (a
+signed tag or a profile) and Flutter output directories (`FlutterOutputKind`: `<P>/build` or
+`<P>/.dart_tool`, where HEAD's files or the pure additions hold `<P>/pubspec.yaml` and HEAD holds
+nothing at the directory's own path), and marks the sections to strip, recording each under the
+outermost recognised directory that claims it, cargo target or Flutter output. The report's prune verdict afterwards is `decide_archive_prune` over the
 directory as it would be (`contents_after_strip`).
 
 ```mermaid

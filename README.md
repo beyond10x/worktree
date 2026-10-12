@@ -142,7 +142,7 @@ modifies the tree, its index or the repository's refs:
 | `commits.bundle` | every commit HEAD adds over the refs the configured remotes advertise, as `refs/worktree-archive/head`; absent when there are none |
 | `dirty.patch` | a binary patch from HEAD that recreates every tracked, untracked and ignored file byte for byte, except cargo build layout; absent when the tree's content equals HEAD |
 | `nested-<n>.tar` | one per nested Git repository in the tree's files, `n` from 1 in path-byte order: its root directory and every entry below it, `.git` included, with permission bits, modification times and symlink targets; names are relative to the tree root |
-| `manifest.json` | format `worktree.archive/1`, `worktree.archive/2` when it images nested repositories, or `worktree.archive/3` when it left cargo build layout out: tree id, repository root, path, HEAD, branch, the unique commits, each file's SHA-256 and size, `worktree_tree` (the fingerprint of the tree's on-disk content outside every nested repository and the build layout left out), `nested_repositories` (each root's path, image file, fingerprint and entry count; only in `/2` and `/3`), `created_at`, and `build_output` (only in `/3`: per target its `path`, `origin` (`archive` or `strip`), `files` and `bytes`, and the totals) |
+| `manifest.json` | format `worktree.archive/1`, `worktree.archive/2` when it images nested repositories, or `worktree.archive/3` when it left build layout out (cargo's, or a Flutter app's output a strip removed): tree id, repository root, path, HEAD, branch, the unique commits, each file's SHA-256 and size, `worktree_tree` (the fingerprint of the tree's on-disk content outside every nested repository and the build layout left out), `nested_repositories` (each root's path, image file, fingerprint and entry count; only in `/2` and `/3`), `created_at`, and `build_output` (only in `/3`: per target its `path`, `origin` (`archive` or `strip`), `files` and `bytes`, and the totals) |
 
 Cargo's own build layout is left out, because the next build recreates it from tracked sources.
 Below a cargo target that `discard-cache` recognises by structure (a valid `CACHEDIR.TAG`, or an
@@ -265,7 +265,8 @@ a refused archive removable: an archive whose commits no remote holds is the onl
 deleting it stays the operator's decision, by hand.
 
 Archives written before build output was left out hold it in `dirty.patch` and are refused as
-`UncommittedState`. `worktree prune-archives --strip-build-output` removes it, with the same
+`UncommittedState`, and so do archives of a Flutter app's tree, whose `build/` and `.dart_tool/`
+`archive` keeps. `worktree prune-archives --strip-build-output` removes it, with the same
 `--repo`, `--scope` and `--id` selection, and never deletes an archive. A dry-run, the default,
 streams each patch and lists `directory, worktree id, bytes, verdict`, then the bytes and sections
 it would strip, the sections, bytes and nested images that stay, and the prune verdict the archive
@@ -273,8 +274,15 @@ would have afterwards. Only a section that purely adds an untracked file is stri
 mode`, a path, C-unquoted as Git writes it, that no other section names and that HEAD's tree, read
 from Git, does not track, and that is build layout below a directory the patch's own pure
 additions recognise as a target (a Cargo-signed `<t>/CACHEDIR.TAG` or `<t>/<p>/.fingerprint/…`;
-`<t>/tmp/` only beside a profile). A section whose path cannot be decoded, both halves of a type
-change, every other change to a tracked file and every nested image stay.
+`<t>/tmp/` only beside a profile), or that lies strictly below a Flutter app's output directory:
+`<P>/build/` or `<P>/.dart_tool/` (the tree root included as `<P>`) where HEAD's tree holds
+`<P>/pubspec.yaml` as a file or the patch purely adds it (that section stays), and HEAD's tree
+holds nothing at that path, so a tracked source directory named `build` and a `build/` with no
+`pubspec.yaml` beside it are never stripped. The outermost recognised directory, cargo target or
+Flutter output, is recorded: a cargo target inside `<P>/build/` counts as `<P>/build`. `archive`,
+`finish --archive` and `discard-cache` do not recognise Flutter output. A section whose path cannot
+be decoded, both halves of a type change, every other change to a tracked file and every nested
+image stay.
 Verdicts, in this order:
 
 | Verdict | When |
