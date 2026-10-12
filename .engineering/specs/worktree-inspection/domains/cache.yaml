@@ -15,7 +15,9 @@ types:
   # output directory (worktree.archive.FlutterOutputKind) by the one build-output classifier
   # `archive` and `prune-archives --strip-build-output` use: `P/pubspec.yaml` is a regular file on
   # disk beside it, and neither HEAD's tree nor the index holds anything at or below the
-  # directory. A `build/` with no `pubspec.yaml` beside it is retained.
+  # directory. A `build/` with no `pubspec.yaml` beside it is retained. A Flutter output directory
+  # holding a `.git` (file, directory or symbolic link) at any depth below it is retained whole:
+  # its nested repository may hold commits no remote does. `archive` images such a repository.
   - name: worktree.cache.CacheKind
     kind: enum
     variants: [CargoProfile, CargoTarget, CargoTargetTmp, FlutterOutput, NodeModules, PythonVirtualenv, ToolCache]
