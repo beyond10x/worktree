@@ -2,7 +2,7 @@
 format: aep.planning-md/3
 id: story:flutter-build-output-is-stripped
 kind: story
-status: active
+status: implemented
 title: A Flutter app's build output is stripped from archives
 scope:
 - confidence: cited
@@ -15,10 +15,11 @@ scope:
   path: crates/worktree-git/src/lib.rs
 - confidence: cited
   path: crates/worktree/src/lib.rs
-revision: 5
+revision: 6
 transitions:
 - {from: "draft", to: "proposed", at: "2026-10-12T16:33:20Z", actor: "human:timo", revision: 2}
 - {from: "proposed", to: "active", at: "2026-10-12T16:33:20Z", actor: "human:timo", revision: 3}
+- {from: "active", to: "implemented", at: "2026-10-12T17:17:58Z", actor: "human:timo", revision: 6, decided_on: {"recorded":{"test_result":1,"review_outcome":1}}}
 ---
 ## Outcome
 

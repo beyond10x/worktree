@@ -1,0 +1,12 @@
+{
+  "at": "2026-10-12T17:17:58Z",
+  "actor": "human:timo",
+  "artifact": "story:flutter-build-output-is-stripped",
+  "kind": "story",
+  "revision": 5,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "cargo test -p b10x-worktree-domain -p b10x-worktree -p b10x-worktree-git -p b10x-worktree-cli --locked"
+  }
+}

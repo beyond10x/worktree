@@ -1,0 +1,14 @@
+{
+  "at": "2026-10-12T17:17:58Z",
+  "actor": "human:timo",
+  "artifact": "story:flutter-build-output-is-stripped",
+  "kind": "story",
+  "revision": 5,
+  "change": {
+    "change": "evidence",
+    "kind": "review_outcome",
+    "source": "review-result:adversary-flutter-strip-pass-1",
+    "review": "review-result:adversary-flutter-strip-pass-1",
+    "outcome": "fixed"
+  }
+}
