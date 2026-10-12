@@ -1,15 +1,15 @@
 # Changelog
 
-## Unreleased
+## 0.16.0 — 2026-10-12
 
 - `worktree prune-archives --strip-build-output` also strips a Flutter app's build output from an
   existing archive: every section that purely adds an untracked file strictly below `<P>/build/`
   or `<P>/.dart_tool/`, where `<P>` (the tree root included) holds a `pubspec.yaml` that HEAD's
-  tree, read from Git, holds as a file or that the patch purely adds (that section is kept), and
-  where HEAD's tree holds nothing at the directory's own path. A tracked source directory named
-  `build`, and a `build/` or `.dart_tool/` with no `pubspec.yaml` beside it, are never stripped.
-  The outermost directory whose rule strips the path, cargo target or Flutter output, is recorded as a
-  `build_output` target with origin `strip`; no manifest field is added and formats 1 to 3 are
+  tree, read from Git, holds as anything but a directory or that the patch purely adds (that
+  section is kept), and where HEAD's tree holds nothing at the directory's own path. A tracked
+  source directory named `build`, and a `build/` or `.dart_tool/` with no `pubspec.yaml` beside
+  it, are never stripped. The outermost directory whose rule strips the path, cargo target or
+  Flutter output, is recorded as a `build_output` target with origin `strip`; no manifest field is added and formats 1 to 3 are
   unchanged. `archive`, `finish --archive` and `discard-cache` still recognise only cargo's
   layout. The strip's reasons now say "build layout" rather than "cargo build layout".
 - The `GitPort::scan_archive_patch` port returns a `ScannedPatch`: the sections with the paths of
