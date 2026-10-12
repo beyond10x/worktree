@@ -86,7 +86,7 @@ A nested Git repository is listed by Git only as `<path>/` on the empty index, s
 scratch index nor the patch holds it. The adapter walks each such root without following symlinks,
 writes its canonical listing as a GNU tar image with the `tar` crate, reads the image back and
 compares the listing, and records the listing's SHA-256 as the root's fingerprint. `worktree_tree`
-and `dirty.patch` cover everything outside the imaged roots and the cargo build layout left out.
+and `dirty.patch` cover everything outside the imaged roots and the build layout left out.
 
 Cargo build layout is decided in the domain, I/O-free: `is_build_layout` and `layout_target` take
 a path below a target, the target's `TargetFacts` (a Cargo-signed tag; a profile, which `tmp/`
@@ -98,11 +98,26 @@ below a target keeps that walk from reaching it, also checks each directory a li
 (`cache::archive_target`, used only by archives; `discard-cache`'s deletions are unchanged). It
 excludes the paths HEAD or the index tracks and observes profiles on disk. The capture leaves those files out of the
 scratch index, so the patch and the fingerprint never see them, and the manifest records them per
-target as `build_output` in format `worktree.archive/3`. Verification leaves out the same layout
-only for a format 3 archive and refuses layout below a target the manifest does not name. The
-discard partitions the untracked files after the index reset into layout below a recorded target
-and everything else; the rest must match the archive as before, and each layout file is
-re-observed as layout below the same target immediately before it is deleted.
+target as `build_output` in format `worktree.archive/3`.
+
+A Flutter app's output is decided by one classifier in the domain, also I/O-free:
+`flutter_output_kind` decides whether a directory `<P>/build` or `<P>/.dart_tool` is one, and
+`flutter_output` finds the outermost one a path lies strictly below, from `FlutterFacts` its caller
+observes: whether `<P>/pubspec.yaml` is present beside it as anything but a directory, and whether
+anything is tracked at the directory's path. The archive and `discard-cache` observe the disk
+(`cache::flutter_facts`: a real directory, a regular `pubspec.yaml`, nothing HEAD or the index
+tracks at or below it); the strip observes HEAD's tree and the patch's pure additions. The
+archive records the outer of a cargo target and a Flutter output directory
+(`outermost_build_directory`), as the strip does; `discard-cache` deletes an ignored directory the
+classifier recognises as `CacheKind::FlutterOutput`, after its cargo rules.
+
+Verification of a format 3 archive leaves layout out only below the directories the manifest
+records, so an archive written before a kind of output was recognised still holds it in its
+fingerprint and still verifies; layout below an unrecorded directory stays in the fingerprint and
+refuses, and the refusal names that directory. The discard partitions the untracked files after
+the index reset into layout below a recorded directory and everything else; the rest must match
+the archive as before, and each layout file is re-observed as layout below the same recorded
+directory, recognised now, immediately before it is deleted.
 
 ```mermaid
 flowchart LR

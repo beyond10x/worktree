@@ -40,18 +40,26 @@ independent policy: every decision must come from the public façade.
   a tree is returned to HEAD by resetting the index, then restoring or deleting each file only after
   re-hashing it against the archive, before the non-forced removal. Archiving never modifies the
   tree, and only `prune-archives --apply` deletes an archive, and only under its rule.
-- Cargo build layout is the one content an archive leaves out. Below a cargo target recognised
-  on disk by `discard-cache`'s structure (a valid tag or the untagged-target rule, and a profile),
-  whether or not a tracked file below it hides it from `discard-cache`'s walk of ignored entries,
-  a file neither HEAD nor the index tracks is build layout when its first component below the
-  target is `debug`, `release`, `.rustc_info.json`, `tmp`, a Cargo-signed `CACHEDIR.TAG` or a
-  profile directory (holding `.fingerprint/`; also `<target>/<triple>/<profile>/`); everything
-  else below the target, every tracked file included, stays archived. Such an
-  archive is `worktree.archive/3` and records per target the files and bytes left out; one that
-  left nothing out is written exactly as format 1 or 2. Its fingerprint excludes that layout, and
-  layout below a target it did not record refuses as `archive-stale`. Removal through it deletes
-  each left-out file only after re-observing it, immediately before deletion, as a file or
-  symlink of build layout below the same recognised target; anything else refuses.
+- Build layout, cargo's or a Flutter app's, is the one content an archive leaves out. Below a
+  cargo target recognised on disk by `discard-cache`'s structure (a valid tag or the
+  untagged-target rule, and a profile), whether or not a tracked file below it hides it from
+  `discard-cache`'s walk of ignored entries, a file neither HEAD nor the index tracks is build
+  layout when its first component below the target is `debug`, `release`, `.rustc_info.json`,
+  `tmp`, a Cargo-signed `CACHEDIR.TAG` or a profile directory (holding `.fingerprint/`; also
+  `<target>/<triple>/<profile>/`); everything else below the target, every tracked file included,
+  stays archived. A file neither HEAD nor the index tracks strictly below a Flutter app's
+  `<P>/build/` or `<P>/.dart_tool/` is build layout whatever it holds, when `<P>/pubspec.yaml` is a
+  regular file on disk (tracked or not), the directory is a real directory, and neither HEAD's
+  tree nor the index holds anything at or below it. One I/O-free classifier in the domain decides
+  a Flutter app's output for `archive`, `discard-cache` and the strip from the observations each
+  supplies; none keeps a rule of its own. The outermost of a cargo target and a Flutter output
+  directory is recorded. Such an archive is `worktree.archive/3` and records per directory the
+  files and bytes left out; one that left nothing out is written exactly as format 1 or 2. Its
+  fingerprint excludes that layout, and verification leaves layout out only below the directories
+  the manifest records, so layout below a directory it did not record stays in the fingerprint and
+  refuses as `archive-stale`. Removal through it deletes each left-out file only after
+  re-observing it, immediately before deletion, as a file or symlink of build layout below the
+  same recorded directory, recognised now; anything else refuses.
 - `prune-archives --strip-build-output` never deletes an archive. A dry-run, the default, writes
   nothing. `--apply` takes exact `--id` values only, re-assesses each, and rewrites only an archive
   whose manifest is valid, whose directory holds only recorded files, whose tree path is absent and
@@ -63,8 +71,7 @@ independent policy: every decision must come from the public façade.
   `<t>/CACHEDIR.TAG` or `<t>/<p>/.fingerprint/…`; `<t>/tmp/` only beside a profile), or strictly
   below a Flutter app's `<P>/build/` or `<P>/.dart_tool/`, where HEAD's tree holds
   `<P>/pubspec.yaml` as anything but a directory or the patch purely adds it (that section stays) and HEAD's tree
-  holds nothing at the directory's own path. The outermost directory whose rule strips the path is recorded;
-  `archive` and `discard-cache` do not recognise Flutter output. Both halves of
+  holds nothing at the directory's own path. The outermost directory whose rule strips the path is recorded. Both halves of
   a type change stay, an undecodable path keeps its section, and nested images are never touched. The new patch is written outside the archive, verified to apply
   over HEAD in a scratch index (never a tree's or the repository's own index), `worktree_tree` is
   recomputed from it, and only then are the patch replaced (or deleted when nothing remains) and
@@ -94,7 +101,9 @@ independent policy: every decision must come from the public façade.
   structure: a Cargo profile holding `.fingerprint/` inside a validly tagged target, that target's
   own real `tmp/` (Cargo's `CARGO_TARGET_TMPDIR`, whatever it holds) when the target holds a
   profile, `node_modules` at or below a tracked lockfile, a virtual environment beside a tracked
-  Python manifest, and a tagged `.pytest_cache`, `.mypy_cache` or `.ruff_cache`. Cargo tags only a
+  Python manifest, a Flutter app's `<P>/build/` or `<P>/.dart_tool/` that the one classifier
+  recognises on disk (a regular `<P>/pubspec.yaml` beside it, nothing HEAD or the index tracks at
+  or below it), and a tagged `.pytest_cache`, `.mypy_cache` or `.ruff_cache`. Cargo tags only a
   target it creates, so a real directory named `target` without a valid tag counts as tagged when
   a tracked `Cargo.toml` sits beside it and a direct child other than `tmp/` holds both
   `.fingerprint/` and `deps/` as real directories. A name alone never qualifies; anything

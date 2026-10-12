@@ -1,5 +1,33 @@
 # Changelog
 
+## Unreleased
+
+- `archive`, `finish --archive`, `discard-cache` (and `finish --discard-cache`, `sweep`) and
+  `prune-archives --strip-build-output` recognise a Flutter app's build output by one I/O-free
+  classifier in the domain (`flutter_output_kind`, `flutter_output`), from the observations each
+  caller supplies (`FlutterFacts`): whether `<P>/pubspec.yaml` is present beside the directory as
+  anything but a directory, and whether anything is tracked at its path. The strip's behaviour is
+  unchanged.
+- `archive` leaves out each file neither HEAD nor the index tracks strictly below `<P>/build/` or
+  `<P>/.dart_tool/`, when `<P>/pubspec.yaml` is a regular file on disk (tracked or not), the
+  directory is a real directory, and neither HEAD's tree nor the index holds anything at or below
+  it. The directory is recorded as a `build_output` target with origin `archive`; the outermost of
+  a cargo target and a Flutter output directory is recorded. No manifest field is added and
+  format 3 is unchanged on the wire. Removal through such an archive re-observes each left-out file
+  immediately before deleting it, as a file or symlink below the same recorded directory, still
+  recognised; anything else refuses.
+- Verification of a format 3 archive leaves build layout out only below the directories its
+  manifest records, so an archive 0.16.0 wrote of a tree holding a Flutter app's output (which it
+  kept in `dirty.patch` and the fingerprint) still verifies, and removal through it still works.
+  Layout below a directory the manifest does not record stays in the fingerprint and refuses as
+  `archive-stale`, naming the directory.
+- `discard-cache` deletes an ignored, real `<P>/build/` or `<P>/.dart_tool/` the classifier
+  recognises, as the new cache kind `flutter-output` (`CacheKind::FlutterOutput`); a `build/`
+  with no `pubspec.yaml` beside it, and every other ignored entry, is retained. Cargo behaviour is
+  unchanged.
+- `archive` prints `left out <files> file(s), <bytes> bytes of build output under <directory>`,
+  and the strip's summary `bytes of build output strippable`; both said "cargo build output".
+
 ## 0.16.0 — 2026-10-12
 
 - `worktree prune-archives --strip-build-output` also strips a Flutter app's build output from an
