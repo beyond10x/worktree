@@ -115,7 +115,9 @@ records the outer of a cargo target and a Flutter output directory (`outermost_b
 as the strip does; `discard-cache` deletes an ignored directory the classifier recognises as
 `CacheKind::FlutterOutput`, after its cargo rules. For every kind, one walk that follows no
 symbolic link (`cache::holds_git_entry`) decides whether a recognised directory holds a `.git`
-(file, directory or symbolic link) at any depth below it: a repository there may hold commits no
+(file, directory or symbolic link) at any depth below it, or is or holds a Git directory with no
+`.git` entry (`cache::git_directory`: `HEAD` a regular file, `objects/` and `refs/` real
+directories, as a bare repository or a `--separate-git-dir` has): a repository there may hold commits no
 remote does, so the directory is never deleted whole. A whole Cargo target holding one falls to
 its parts (each profile, nested target and `tmp/` under its own rule; a target is `cargo-target`
 only when nothing in it was retained, so by construction it holds none); a `tmp/` holding one is

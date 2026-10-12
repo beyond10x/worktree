@@ -16,11 +16,21 @@
   included) as `cargo-target-tmp`, reported per entry as `<target>/tmp/<entry>`, and retains each
   entry holding one. A profile, `node_modules`, virtual environment, tool cache or Flutter output
   directory holding one is retained whole.
+- The walk also recognises a Git directory that has no `.git` entry, whatever its name: a bare
+  repository (such as a test's `remote.git` in `tmp/`) or one placed with `--separate-git-dir`,
+  by `HEAD` as a regular file and `objects/` and `refs/` as real directories, none reached
+  through a symbolic link. Such a directory, or one holding one at any depth, is handled exactly
+  as one holding a `.git`, including as a direct entry of `tmp/`.
 - The walk is repeated immediately before each deletion for every kind, not only Flutter output;
-  a directory that holds a `.git` then is retained whole.
+  a directory that is or holds a repository then is retained whole.
 - Retained repositories appear in `retained_ignored`; `finish --discard-cache --archive` images
   each one, and the tree is still collected through that archive. No cache kind, JSON field or
   protocol version changes.
+- Keeping is not recovering. A tree whose kept state the archive cannot image stays, and the
+  refusal names the path: a fixture repository with a linked worktree makes
+  `finish --discard-cache --archive` refuse `archive-unsupported-entry` naming its
+  `.git/worktrees/<name>`, and a directory in `tmp/` no walk can read makes `gc` refuse
+  `worktree-state-unreadable` naming it. Nothing in either is deleted.
 
 ## 0.17.0 — 2026-10-12
 

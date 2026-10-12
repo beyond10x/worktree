@@ -19,6 +19,10 @@ use std::path::{Component, Path, PathBuf};
 
 /// The name of a repository's administrative entry; a directory holding one is never cache.
 const GIT_ENTRY: &str = ".git";
+/// What makes a directory a Git directory whatever its name ([`git_directory`]).
+const GIT_HEAD: &str = "HEAD";
+const GIT_OBJECTS: &str = "objects";
+const GIT_REFS: &str = "refs";
 
 /// Classified ignored entries, relative to the tree root.
 #[derive(Default)]
@@ -277,7 +281,7 @@ fn classify(
 
 impl Plan {
     /// Plan the recognised directory `relative` for deletion as `kind`, or retain it whole when
-    /// it holds a `.git` at any depth below it ([`holds_git_entry`]): a nested repository is
+    /// it holds a repository at any depth below it ([`holds_git_entry`]): a nested repository is
     /// never cache, whatever kind of directory holds it.
     fn discard_unless_repository(&mut self, worktree: &Path, relative: PathBuf, kind: CacheKind) {
         if holds_git_entry(&worktree.join(&relative)) {
@@ -353,14 +357,18 @@ fn flutter_output(
     .is_some())
 }
 
-/// Whether `directory` holds an entry named `.git` (a file, a directory or a symbolic link) at
-/// any depth below it: a repository there may hold commits no remote does, so `discard-cache`
-/// never deletes the directory whole, whatever kind of cache it is. The walk follows no symbolic
-/// link. An entry whose type or a directory whose names cannot be read counts as one, so it is
-/// retained too.
+/// Whether `directory` holds a repository: an entry named `.git` (a file, a directory or a
+/// symbolic link) at any depth below it, or a Git directory ([`git_directory`]: a bare
+/// repository, or one placed with `--separate-git-dir`) at it or at any depth below it. A
+/// repository there may hold commits no remote does, so `discard-cache` never deletes the
+/// directory whole, whatever kind of cache it is. The walk follows no symbolic link. An entry
+/// whose type or a directory whose names cannot be read counts as one, so it is retained too.
 fn holds_git_entry(directory: &Path) -> bool {
     let mut pending = vec![directory.to_path_buf()];
     while let Some(current) = pending.pop() {
+        if git_directory(&current) {
+            return true;
+        }
         let Ok(entries) = std::fs::read_dir(&current) else {
             return true;
         };
@@ -381,7 +389,16 @@ fn holds_git_entry(directory: &Path) -> bool {
     false
 }
 
-/// Whether the entry at `path` is named `.git` or, as a real directory, holds one
+/// Whether `directory` is itself a Git directory, whatever its name: `HEAD` a regular file, and
+/// `objects/` and `refs/` real directories, none reached through a symbolic link. A bare
+/// repository and a `--separate-git-dir` have no `.git` entry, so only this structure shows them.
+fn git_directory(directory: &Path) -> bool {
+    regular_file(&directory.join(GIT_HEAD))
+        && real_directory(&directory.join(GIT_OBJECTS))
+        && real_directory(&directory.join(GIT_REFS))
+}
+
+/// Whether the entry at `path` is named `.git` or, as a real directory, is or holds a repository
 /// ([`holds_git_entry`]). A file or symbolic link of another name holds none; an entry whose type
 /// cannot be read counts as holding one, and a missing one as holding none (its deletion then
 /// refuses as changed state).
@@ -816,6 +833,51 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A Git directory with no `.git` entry (a bare repository, or one `--separate-git-dir`
+    /// placed) is recognised by its own structure: `HEAD` a regular file, `objects/` and `refs/`
+    /// real directories. Anything less, or a symlinked part, is not one.
+    #[cfg(unix)]
+    #[test]
+    fn a_git_directory_is_recognised_by_head_objects_and_refs() {
+        let root = tempfile::tempdir().unwrap();
+        let make = |name: &str, head: bool, objects: bool, refs: bool| {
+            let directory = root.path().join(name);
+            std::fs::create_dir_all(&directory).unwrap();
+            if head {
+                std::fs::write(directory.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+            }
+            if objects {
+                std::fs::create_dir(directory.join("objects")).unwrap();
+            }
+            if refs {
+                std::fs::create_dir(directory.join("refs")).unwrap();
+            }
+            directory
+        };
+        let bare = make("remote.git", true, true, true);
+        let only_head = make("only-head", true, false, false);
+        let no_refs = make("no-refs", true, true, false);
+        let linked_objects = make("linked-objects", true, false, true);
+        std::os::unix::fs::symlink(bare.join("objects"), linked_objects.join("objects")).unwrap();
+        let head_directory = make("head-directory", false, true, true);
+        std::fs::create_dir(head_directory.join("HEAD")).unwrap();
+
+        assert!(git_directory(&bare));
+        assert!(is_or_holds_git_entry(&bare));
+        for not_one in [&only_head, &no_refs, &linked_objects, &head_directory] {
+            assert!(!git_directory(not_one), "{}", not_one.display());
+        }
+        assert!(!is_or_holds_git_entry(&only_head));
+        assert!(!is_or_holds_git_entry(&linked_objects));
+
+        // One at any depth below a directory counts, as a `.git` does.
+        let scratch = root.path().join("scratch");
+        std::fs::create_dir_all(scratch.join("deep")).unwrap();
+        assert!(!holds_git_entry(&scratch));
+        std::fs::rename(&bare, scratch.join("deep/remote.git")).unwrap();
+        assert!(holds_git_entry(&scratch));
     }
 
     /// A direct entry of Cargo's `tmp/` may be a file; it is deleted as `cargo-target-tmp`.

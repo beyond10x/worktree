@@ -64,7 +64,8 @@ a tracked Python manifest, a Flutter app's `<P>/build/` or `<P>/.dart_tool/` (as
 below it, and a tagged `.pytest_cache`, `.mypy_cache` or `.ruff_cache`. A `build/` with no
 `pubspec.yaml` beside it is kept. A nested repository is never cache, because it may hold commits
 no remote does: a recognised directory of any kind holding a `.git` (a file, a directory or a
-symbolic link) at any depth below it is never deleted whole. A whole target holding one falls to
+symbolic link) at any depth below it, or a bare or `--separate-git-dir` Git directory (`HEAD`,
+`objects/` and `refs/`) at or below it, is never deleted whole. A whole target holding one falls to
 its parts, each profile, nested target and `tmp/` under its own rule; a `tmp/` holding one deletes
 each direct entry that holds none and keeps each that holds one, such as a test's fixture
 repository; every other directory holding one is kept whole. The walk that looks for it follows no
