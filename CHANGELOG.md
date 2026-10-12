@@ -25,6 +25,15 @@
   recognises, as the new cache kind `flutter-output` (`CacheKind::FlutterOutput`); a `build/`
   with no `pubspec.yaml` beside it, and every other ignored entry, is retained. Cargo behaviour is
   unchanged.
+- `discard-cache` retains a Flutter output directory whole when a `.git` (a file, a directory or a
+  symbolic link) lies at any depth below it, found by a walk that follows no symbolic link and
+  repeated immediately before deletion; a directory the walk cannot read is retained too. A
+  repository there may hold commits no remote does; `archive` images it.
+- A directory that is both a recognised cargo target and a Flutter output directory, such as a
+  cargo target named `build/` beside a `pubspec.yaml`, is classified by the cargo rule alone in
+  `archive`, `discard-cache` and the strip: the classifier takes whether the directory is a cargo
+  target as one of its observations (`FlutterFacts::cargo_target`), so a file below it that is not
+  cargo layout stays archived, as `discard-cache` keeps it.
 - `archive` prints `left out <files> file(s), <bytes> bytes of build output under <directory>`,
   and the strip's summary `bytes of build output strippable`; both said "cargo build output".
 

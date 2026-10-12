@@ -62,7 +62,11 @@ profile, `node_modules` at or below a tracked npm, Yarn, pnpm or Bun lockfile, a
 a tracked Python manifest, a Flutter app's `<P>/build/` or `<P>/.dart_tool/` (as `flutter-output`) when
 `<P>/pubspec.yaml` is a regular file beside it and neither HEAD nor the index tracks anything at or
 below it, and a tagged `.pytest_cache`, `.mypy_cache` or `.ruff_cache`. A `build/` with no
-`pubspec.yaml` beside it is kept. Cargo
+`pubspec.yaml` beside it is kept. A Flutter output directory holding a `.git` (a file, a directory
+or a symbolic link) at any depth below it is kept whole, because the repository there may hold
+commits no remote does; the walk that looks for it follows no symbolic link and runs again
+immediately before deletion, and a directory it cannot read is kept too (`archive` images such a
+repository). A directory that is a cargo target too is classified by the cargo rule alone. Cargo
 writes the tag only when it creates the target itself, so a `target/` made before the first build
 has none; such a directory counts as tagged when a tracked `Cargo.toml` sits beside it and a
 child other than `tmp/` holds both `.fingerprint/` and `deps/`. Every other
@@ -165,7 +169,10 @@ A Flutter app's output is left out too: a file neither HEAD nor the index tracks
 `<P>/pubspec.yaml` is a regular file on disk (tracked or not), the directory is a real directory,
 and neither HEAD's tree nor the index holds anything at or below it. A tracked source directory
 named `build`, and a `build/` or `.dart_tool/` with no `pubspec.yaml` beside it, stay archived. One
-classifier decides this for `archive`, `discard-cache` and `--strip-build-output`. The outermost of
+classifier decides this for `archive`, `discard-cache` and `--strip-build-output`. A directory that
+is both a recognised cargo target and a Flutter output directory, such as a cargo target named
+`build/` beside a `pubspec.yaml`, is classified by the cargo rule alone in all three, so a file
+below it that is not cargo layout stays archived, as `discard-cache` keeps it. The outermost of
 a cargo target and a Flutter output directory is recorded. Verification leaves layout out only
 below the directories the manifest records, so an archive written before Flutter output was left
 out still verifies, and layout below a directory an archive did not record refuses as
@@ -292,7 +299,8 @@ additions recognise as a target (a Cargo-signed `<t>/CACHEDIR.TAG` or `<t>/<p>/.
 `<P>/build/` or `<P>/.dart_tool/` (the tree root included as `<P>`) where HEAD's tree holds
 `<P>/pubspec.yaml` as anything but a directory or the patch purely adds it (that section stays), and HEAD's tree
 holds nothing at that path, so a tracked source directory named `build` and a `build/` with no
-`pubspec.yaml` beside it are never stripped. The outermost directory whose rule strips the path, cargo target or
+`pubspec.yaml` beside it are never stripped. A directory the patch recognises as a cargo target is
+classified by the cargo rule alone, also beside a `pubspec.yaml`. The outermost directory whose rule strips the path, cargo target or
 Flutter output, is recorded: a cargo target inside `<P>/build/` counts as `<P>/build`. A section whose path cannot
 be decoded, both halves of a type change, every other change to a tracked file and every nested
 image stay.

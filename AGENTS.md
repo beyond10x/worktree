@@ -52,8 +52,10 @@ independent policy: every decision must come from the public façade.
   regular file on disk (tracked or not), the directory is a real directory, and neither HEAD's
   tree nor the index holds anything at or below it. One I/O-free classifier in the domain decides
   a Flutter app's output for `archive`, `discard-cache` and the strip from the observations each
-  supplies; none keeps a rule of its own. The outermost of a cargo target and a Flutter output
-  directory is recorded. Such an archive is `worktree.archive/3` and records per directory the
+  supplies; none keeps a rule of its own. A directory that is both a recognised cargo target and
+  a Flutter output directory is classified by the cargo rule alone, in `archive`, `discard-cache`
+  and the strip alike, so a file below it that is not cargo layout stays archived. The outermost
+  of a cargo target and a Flutter output directory is recorded. Such an archive is `worktree.archive/3` and records per directory the
   files and bytes left out; one that left nothing out is written exactly as format 1 or 2. Its
   fingerprint excludes that layout, and verification leaves layout out only below the directories
   the manifest records, so layout below a directory it did not record stays in the fingerprint and
@@ -71,7 +73,8 @@ independent policy: every decision must come from the public façade.
   `<t>/CACHEDIR.TAG` or `<t>/<p>/.fingerprint/…`; `<t>/tmp/` only beside a profile), or strictly
   below a Flutter app's `<P>/build/` or `<P>/.dart_tool/`, where HEAD's tree holds
   `<P>/pubspec.yaml` as anything but a directory or the patch purely adds it (that section stays) and HEAD's tree
-  holds nothing at the directory's own path. The outermost directory whose rule strips the path is recorded. Both halves of
+  holds nothing at the directory's own path, and the patch recognises no cargo target there (one
+  that is both is classified by the cargo rule alone). The outermost directory whose rule strips the path is recorded. Both halves of
   a type change stay, an undecodable path keeps its section, and nested images are never touched. The new patch is written outside the archive, verified to apply
   over HEAD in a scratch index (never a tree's or the repository's own index), `worktree_tree` is
   recomputed from it, and only then are the patch replaced (or deleted when nothing remains) and
@@ -103,7 +106,9 @@ independent policy: every decision must come from the public façade.
   profile, `node_modules` at or below a tracked lockfile, a virtual environment beside a tracked
   Python manifest, a Flutter app's `<P>/build/` or `<P>/.dart_tool/` that the one classifier
   recognises on disk (a regular `<P>/pubspec.yaml` beside it, nothing HEAD or the index tracks at
-  or below it), and a tagged `.pytest_cache`, `.mypy_cache` or `.ruff_cache`. Cargo tags only a
+  or below it, no cargo target at it) and that holds no `.git` (file, directory or symbolic link)
+  at any depth below it, found by a walk that follows no symbolic link and repeated immediately
+  before deletion (one that holds a `.git`, or that the walk cannot read, is retained whole), and a tagged `.pytest_cache`, `.mypy_cache` or `.ruff_cache`. Cargo tags only a
   target it creates, so a real directory named `target` without a valid tag counts as tagged when
   a tracked `Cargo.toml` sits beside it and a direct child other than `tmp/` holds both
   `.fingerprint/` and `deps/` as real directories. A name alone never qualifies; anything

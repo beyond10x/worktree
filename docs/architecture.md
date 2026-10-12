@@ -104,12 +104,19 @@ A Flutter app's output is decided by one classifier in the domain, also I/O-free
 `flutter_output_kind` decides whether a directory `<P>/build` or `<P>/.dart_tool` is one, and
 `flutter_output` finds the outermost one a path lies strictly below, from `FlutterFacts` its caller
 observes: whether `<P>/pubspec.yaml` is present beside it as anything but a directory, and whether
-anything is tracked at the directory's path. The archive and `discard-cache` observe the disk
-(`cache::flutter_facts`: a real directory, a regular `pubspec.yaml`, nothing HEAD or the index
-tracks at or below it); the strip observes HEAD's tree and the patch's pure additions. The
-archive records the outer of a cargo target and a Flutter output directory
-(`outermost_build_directory`), as the strip does; `discard-cache` deletes an ignored directory the
-classifier recognises as `CacheKind::FlutterOutput`, after its cargo rules.
+anything is tracked at the directory's path, and whether the directory is itself a recognised
+cargo target (`FlutterFacts::cargo_target`). A directory that is both is classified by the cargo
+rule alone, so a file below it that is not cargo layout stays archived; because the classifier
+decides that, `archive`, `discard-cache` and the strip agree. The archive and `discard-cache`
+observe the disk (`cache::flutter_facts`: a real directory, a regular `pubspec.yaml`, nothing HEAD
+or the index tracks at or below it, and `cache::archive_target` for the cargo target); the strip
+observes HEAD's tree and the patch's pure additions, and its own recognised targets. The archive
+records the outer of a cargo target and a Flutter output directory (`outermost_build_directory`),
+as the strip does; `discard-cache` deletes an ignored directory the classifier recognises as
+`CacheKind::FlutterOutput`, after its cargo rules, unless a walk that follows no symbolic link
+finds a `.git` (file, directory or symbolic link) at any depth below it (`cache::holds_git_entry`):
+a repository there may hold commits no remote does, so the directory is retained whole. The walk
+runs again immediately before deletion, and an unreadable directory counts as holding one.
 
 Verification of a format 3 archive leaves layout out only below the directories the manifest
 records, so an archive written before a kind of output was recognised still holds it in its
