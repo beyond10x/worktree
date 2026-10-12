@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.17.1 — 2026-10-12
 
 - `discard-cache` (and `finish --discard-cache`, `sweep`) never deletes a nested Git repository,
   whatever kind of recognised directory holds it. 0.17.0 deleted a Cargo target, or its `tmp/`,
