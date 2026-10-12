@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.17.0 — 2026-10-12
 
 - `archive`, `finish --archive`, `discard-cache` (and `finish --discard-cache`, `sweep`) and
   `prune-archives --strip-build-output` recognise a Flutter app's build output by one I/O-free
