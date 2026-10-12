@@ -39,6 +39,8 @@ types:
   #   Strippable: at least one section purely adds an untracked file under build layout: a
   #     `new file mode` section whose decoded path no other section names and HEAD's tree, read
   #     from Git and never from the patch, holds neither as a file or directory nor below a file.
+  #     Build layout is cargo's (below a target the patch recognises, BuildOutputOrigin) or a
+  #     Flutter app's (worktree.archive.FlutterOutputKind).
   - name: worktree.archive.StripVerdict
     kind: enum
     variants: [Strippable, NothingToStrip, InvalidManifest, UnrecordedContent, TreeStillPresent, RepositoryGone, PatchUnusable]
@@ -51,9 +53,26 @@ types:
   #     directory T for which the patch's pure additions hold a `T/CACHEDIR.TAG` whose content
   #     begins with Cargo's `Signature: 8a477f597d28d172789f06886806bc55` line, or
   #     `T/<p>/.fingerprint/…`; `.rustc_info.json` or an unsigned tag alone never recognises T.
+  #     A Flutter app's output directory (worktree.archive.FlutterOutputKind) is recognised by the
+  #     strip only, and recorded with this origin.
   - name: worktree.archive.BuildOutputOrigin
     kind: enum
     variants: [Archive, Strip]
+
+  # The output directories of a Flutter app (a Dart package) that `--strip-build-output`
+  # recognises in an existing patch. P is an app root, the tree root included: a directory for
+  # which HEAD's tree, read from Git, holds `P/pubspec.yaml` as a file, or the patch purely adds
+  # `P/pubspec.yaml` (that section is kept). `P/<name>` is an output directory only when HEAD's
+  # tree holds nothing at that path, as a file or a directory, so a tracked source directory named
+  # `build` is never one; a `build/` or `.dart_tool/` with no `pubspec.yaml` beside it is never
+  # one. Every pure-addition section strictly below an output directory is build layout, whatever
+  # it holds; the outermost recognised directory, cargo target or Flutter output, is recorded as
+  # the BuildOutputTarget. `archive` and `discard-cache` do not recognise these directories.
+  #   Build: `P/build/`, the output of `flutter build` and `flutter test`.
+  #   DartTool: `P/.dart_tool/`, the package configuration and tool caches.
+  - name: worktree.archive.FlutterOutputKind
+    kind: enum
+    variants: [Build, DartTool]
 
 # The manifest of one local archive (crates/worktree-domain/src/archive.rs, ArchiveManifest). It
 # stands in for remote recovery proof. Only `prune-archives --apply` deletes one, and only an
@@ -148,8 +167,9 @@ entities:
     # `commondir`, non-empty `objects/info/alternates`, any `worktrees/` entry or any symlink, and a
     # root at or below which HEAD or the index tracks any path (a submodule's gitlink included).
 
-  # Cargo build layout one archive left out, per cargo target directory T (relative to the tree
-  # root), in path-byte order. A path is build layout when Git tracks it neither in HEAD nor in
+  # Build layout one archive left out, per cargo target directory T or, for origin Strip only, per
+  # Flutter output directory (worktree.archive.FlutterOutputKind), relative to the tree root, in
+  # path-byte order. Below a cargo target a path is build layout when Git tracks it neither in HEAD nor in
   # the index and its first component under T is `debug`, `release`, `.rustc_info.json`, `tmp`
   # (only while T holds a profile), `CACHEDIR.TAG` (only while it carries Cargo's signature), or a
   # profile directory (one holding `.fingerprint/` as a direct child; also
