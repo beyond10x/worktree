@@ -75,7 +75,10 @@ types:
   # A `build/` or `.dart_tool/` with no `pubspec.yaml` beside it is never one. Every untracked
   # file strictly below an output directory is build layout, whatever it holds; a tracked file
   # below it stays archived. The outermost directory whose rule recognises the path, cargo
-  # target or Flutter output, is recorded as the BuildOutputTarget.
+  # target or Flutter output, is recorded as the BuildOutputTarget. A directory that is both a
+  # recognised cargo target and a Flutter output directory is classified by the cargo rule alone,
+  # in `archive`, `discard-cache` and the strip alike, so a file below it that is not cargo layout
+  # stays archived.
   #   Build: `P/build/`, the output of `flutter build` and `flutter test`.
   #   DartTool: `P/.dart_tool/`, the package configuration and tool caches.
   - name: worktree.archive.FlutterOutputKind

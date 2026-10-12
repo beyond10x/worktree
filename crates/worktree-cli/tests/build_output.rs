@@ -384,7 +384,7 @@ fn archive_leaves_cargo_layout_out_and_records_its_size() {
     let text = fixture.human(&["archive", "--replace", "built"]);
     assert!(
         text.contains(&format!(
-            "left out {files} file(s), {bytes} bytes of cargo build output under target"
+            "left out {files} file(s), {bytes} bytes of build output under target"
         )),
         "{text}"
     );
@@ -561,9 +561,9 @@ fn gc_refuses_when_a_left_out_path_is_no_longer_build_layout() {
     assert!(tree.join("target/debug/deps/libone-1.rlib").is_file());
 }
 
-/// A second cargo target that appears after the archive was written is recognised, so its layout
-/// is left out of the fingerprint and the fingerprint still matches; only the check that every
-/// target with left-out layout is one the archive recorded refuses it.
+/// A second cargo target that appears after the archive was written is not one the archive
+/// recorded, so verification keeps its layout in the fingerprint and refuses; the refusal names
+/// the target.
 #[test]
 fn gc_refuses_layout_below_a_target_the_archive_did_not_record() {
     let fixture = Fixture::new(true);
@@ -982,7 +982,9 @@ impl Fixture {
         let branch = format!("HEAD:refs/heads/{id}");
         git(&tree, &["push", "--quiet", "--force", "origin", &branch]);
         work(&tree);
+        stage_flutter_output(&tree);
         let archive = self.archive(id);
+        git(&tree, &["read-tree", "HEAD"]);
         assert_eq!(
             archive["manifest"]["format"], "worktree.archive/1",
             "{archive}"
@@ -1123,4 +1125,39 @@ fn strip_keeps_a_build_directory_with_no_pubspec_beside() {
         patch.contains("b/.dart_tool/package_config.json"),
         "{patch}"
     );
+}
+
+/// Stage every untracked file below a directory named `build` or `.dart_tool`. While they are
+/// staged, the index tracks something below each such directory, so `archive` recognises no
+/// Flutter app's output and keeps it in `dirty.patch` and the fingerprint, which read the disk and
+/// never the index: the archive is the one 0.16.0 writes, before `archive` left that output out.
+/// `git read-tree HEAD` unstages them afterwards.
+fn stage_flutter_output(tree: &Path) {
+    let listing = git_output(tree, &["ls-files", "-z", "--others"], None).stdout;
+    let mut input = Vec::new();
+    for path in listing.split(|byte| *byte == 0) {
+        let mut components = path.split(|byte| *byte == b'/').collect::<Vec<_>>();
+        components.pop();
+        if components
+            .iter()
+            .any(|component| *component == b"build" || *component == b".dart_tool")
+        {
+            input.extend_from_slice(path);
+            input.push(0);
+        }
+    }
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(tree)
+        .args(["update-index", "--add", "-z", "--stdin"])
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        use std::io::Write as _;
+        child.stdin.take().unwrap().write_all(&input).unwrap();
+    }
+    assert!(child.wait().unwrap().success());
 }

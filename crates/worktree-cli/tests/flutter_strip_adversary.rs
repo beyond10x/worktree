@@ -149,7 +149,9 @@ impl Fixture {
         let branch = format!("HEAD:refs/heads/{id}");
         git(&tree, &["push", "--quiet", "origin", &branch]);
         work(&tree);
+        stage_flutter_output(&tree);
         let archive = self.ok(&["archive", id])["archive"].clone();
+        git(&tree, &["read-tree", "HEAD"]);
         assert_eq!(
             archive["manifest"]["format"], "worktree.archive/1",
             "{archive}"
@@ -471,4 +473,39 @@ fn adversary_flutter_output_inside_a_cargo_target_is_recorded_by_its_own_rule() 
         .map(|target| target.path.as_str())
         .collect();
     assert_eq!(paths, ["x/target", "x/target/foo/build"], "{plan:?}");
+}
+
+/// Stage every untracked file below a directory named `build` or `.dart_tool`. While they are
+/// staged, the index tracks something below each such directory, so `archive` recognises no
+/// Flutter app's output and keeps it in `dirty.patch` and the fingerprint, which read the disk and
+/// never the index: the archive is the one 0.16.0 writes, before `archive` left that output out.
+/// `git read-tree HEAD` unstages them afterwards.
+fn stage_flutter_output(tree: &Path) {
+    let listing = git_output(tree, &["ls-files", "-z", "--others"], None).stdout;
+    let mut input = Vec::new();
+    for path in listing.split(|byte| *byte == 0) {
+        let mut components = path.split(|byte| *byte == b'/').collect::<Vec<_>>();
+        components.pop();
+        if components
+            .iter()
+            .any(|component| *component == b"build" || *component == b".dart_tool")
+        {
+            input.extend_from_slice(path);
+            input.push(0);
+        }
+    }
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(tree)
+        .args(["update-index", "--add", "-z", "--stdin"])
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        use std::io::Write as _;
+        child.stdin.take().unwrap().write_all(&input).unwrap();
+    }
+    assert!(child.wait().unwrap().success());
 }

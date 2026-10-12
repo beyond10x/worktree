@@ -8,8 +8,9 @@ use crate::ProcessGit;
 use b10x_worktree_domain::{
     CACHEDIR_TAG_FILE, CACHEDIR_TAG_SIGNATURE, CARGO_MANIFEST, CARGO_PROFILE_DEPS,
     CARGO_PROFILE_MARKER, CARGO_TARGET_METADATA, CARGO_TARGET_TMP, CARGO_UNTAGGED_TARGET,
-    CacheClassification, CacheKind, DiscardedCache, NODE_LOCKFILES, PYTHON_MANIFESTS,
-    PYTHON_VIRTUALENV_MARKER, Refusal, TAGGED_TOOL_CACHES, is_cache_tag,
+    CacheClassification, CacheKind, DiscardedCache, FlutterFacts, FlutterOutputKind,
+    NODE_LOCKFILES, PYTHON_MANIFESTS, PYTHON_VIRTUALENV_MARKER, Refusal, TAGGED_TOOL_CACHES,
+    flutter_output_kind, is_cache_tag,
 };
 use std::collections::BTreeSet;
 use std::io::Read as _;
@@ -102,10 +103,11 @@ fn classify_tree(worktree: &Path) -> Result<Plan, Refusal> {
         ],
     )?;
     let tracked = tracked_paths(worktree)?;
+    let mut committed = None;
     let mut plan = Plan::default();
     for (relative, directory) in ignored_entries(&status)? {
         if directory {
-            classify(worktree, &relative, &tracked, &mut plan)?;
+            classify(worktree, &relative, &tracked, &mut committed, &mut plan)?;
         } else {
             plan.retained.push(relative);
         }
@@ -124,8 +126,15 @@ fn finish_discard(
         return Err(in_use(worktree, active));
     }
     let mut discarded = Vec::with_capacity(plan.discarded.len());
+    let mut retained = plan.retained;
     for (relative, kind) in plan.discarded {
         let path = worktree.join(&relative);
+        // Re-observed immediately before deletion: a `.git` that appeared below a Flutter
+        // output directory since it was classified keeps it whole.
+        if kind == CacheKind::FlutterOutput && holds_git_entry(&path) {
+            retained.push(relative);
+            continue;
+        }
         let allocated_bytes = allocated_bytes(&path);
         if apply {
             remove(&path)?;
@@ -138,12 +147,11 @@ fn finish_discard(
     }
     Ok(CacheClassification {
         discarded,
-        retained_bytes: plan
-            .retained
+        retained_bytes: retained
             .iter()
             .map(|relative| allocated_bytes(&worktree.join(relative)))
             .sum(),
-        retained_ignored: plan.retained,
+        retained_ignored: retained,
         processes_observed: users.is_some(),
     })
 }
@@ -194,10 +202,13 @@ pub(crate) fn tracked_paths(worktree: &Path) -> Result<BTreeSet<PathBuf>, Refusa
         .collect()
 }
 
+/// Classify one ignored directory. `committed` holds, once a candidate needs it, every path HEAD
+/// or the index tracks ([`head_or_index_paths`]).
 fn classify(
     worktree: &Path,
     relative: &Path,
     tracked: &BTreeSet<PathBuf>,
+    committed: &mut Option<BTreeSet<Vec<u8>>>,
     plan: &mut Plan,
 ) -> Result<(), Refusal> {
     let path = worktree.join(relative);
@@ -237,6 +248,10 @@ fn classify(
                 plan.discarded.extend(inner.discarded);
                 plan.retained.extend(inner.retained);
             }
+            TargetShape::NotCargo(_) if flutter_output(worktree, relative, tracked, committed)? => {
+                plan.discarded
+                    .push((relative.to_path_buf(), CacheKind::FlutterOutput));
+            }
             TargetShape::NotCargo(children) if children.is_empty() => {
                 plan.retained.push(relative.to_path_buf());
             }
@@ -244,8 +259,128 @@ fn classify(
         }
         return Ok(());
     }
+    if flutter_output(worktree, relative, tracked, committed)? {
+        plan.discarded
+            .push((relative.to_path_buf(), CacheKind::FlutterOutput));
+        return Ok(());
+    }
     plan.retained.push(relative.to_path_buf());
     Ok(())
+}
+
+/// Whether the ignored directory `relative` is a Flutter app's output by the one build-output
+/// classifier ([`flutter_output_kind`]), observed on disk, that `discard-cache` may delete: one
+/// holding a `.git` at any depth below it is retained whole ([`holds_git_entry`]). HEAD's and the
+/// index's paths are read into `committed` only for a directory whose name could make it one;
+/// `tracked` holds the index's paths.
+fn flutter_output(
+    worktree: &Path,
+    relative: &Path,
+    tracked: &BTreeSet<PathBuf>,
+    committed: &mut Option<BTreeSet<Vec<u8>>>,
+) -> Result<bool, Refusal> {
+    let Some(directory) = relative.to_str().map(str::as_bytes) else {
+        return Ok(false);
+    };
+    let named = relative
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| FlutterOutputKind::named(name.as_bytes()).is_some());
+    if !named {
+        return Ok(false);
+    }
+    let committed = match committed {
+        Some(paths) => paths,
+        None => committed.insert(head_or_index_paths(worktree, "HEAD")?),
+    };
+    Ok(flutter_output_kind(directory, |directory, manifest| {
+        flutter_facts(worktree, directory, manifest, committed, tracked)
+    })
+    .is_some()
+        && !holds_git_entry(&worktree.join(relative)))
+}
+
+/// Whether `directory` holds an entry named `.git` (a file, a directory or a symbolic link) at
+/// any depth below it: a repository there may hold commits no remote does, so `discard-cache`
+/// retains the Flutter output directory whole. The walk follows no symbolic link. An entry whose
+/// type or a directory whose names cannot be read counts as one, so it is retained too.
+fn holds_git_entry(directory: &Path) -> bool {
+    let mut pending = vec![directory.to_path_buf()];
+    while let Some(current) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&current) else {
+            return true;
+        };
+        for entry in entries {
+            let Ok(entry) = entry else {
+                return true;
+            };
+            if entry.file_name() == ".git" {
+                return true;
+            }
+            match entry.file_type() {
+                Ok(kind) if kind.is_dir() => pending.push(entry.path()),
+                Ok(_) => {}
+                Err(_) => return true,
+            }
+        }
+    }
+    false
+}
+
+/// Every path HEAD's tree (`head`) or the tree's index tracks, as raw bytes: such a file is
+/// never build layout, and a directory holding one is no Flutter output.
+pub(crate) fn head_or_index_paths(
+    worktree: &Path,
+    head: &str,
+) -> Result<BTreeSet<Vec<u8>>, Refusal> {
+    let indexed = ProcessGit::output_bytes(worktree, ["ls-files", "-z"])?;
+    let committed = ProcessGit::output_bytes(
+        worktree,
+        ["ls-tree", "-r", "-z", "--name-only", "--full-tree", head],
+    )?;
+    Ok(indexed
+        .split(|byte| *byte == 0)
+        .chain(committed.split(|byte| *byte == 0))
+        .filter(|path| !path.is_empty())
+        .map(<[u8]>::to_vec)
+        .collect())
+}
+
+/// What the disk shows of one candidate Flutter output directory, the observations the one
+/// classifier takes: `None` unless `directory` is a real directory; `manifest` present as a
+/// regular file; anything `tracked` (HEAD's and the index's paths) at or below `directory`; and
+/// whether `directory` is itself a cargo target by the archive's structural rule
+/// ([`archive_target`], reading `indexed`, the index's paths), which then classifies it alone. A
+/// target that cannot be read counts as one, so nothing below it is taken for Flutter output.
+/// Both paths are relative to `worktree` and UTF-8, as the classifier passes them.
+pub(crate) fn flutter_facts(
+    worktree: &Path,
+    directory: &[u8],
+    manifest: &[u8],
+    tracked: &BTreeSet<Vec<u8>>,
+    indexed: &BTreeSet<PathBuf>,
+) -> Option<FlutterFacts> {
+    let at = |relative: &[u8]| {
+        std::str::from_utf8(relative)
+            .ok()
+            .map(|relative| worktree.join(relative))
+    };
+    if !real_directory(&at(directory)?) {
+        return None;
+    }
+    let mut below = directory.to_vec();
+    below.push(b'/');
+    Some(FlutterFacts {
+        manifest_beside: at(manifest).is_some_and(|manifest| regular_file(&manifest)),
+        tracked: tracked.contains(directory)
+            || tracked
+                .range(below.clone()..)
+                .next()
+                .is_some_and(|path| path.starts_with(&below)),
+        cargo_target: std::str::from_utf8(directory).map_or(true, |relative| {
+            archive_target(worktree, Path::new(relative), indexed).unwrap_or(true)
+        }),
+    })
 }
 
 /// Whether `relative` is a Cargo target classified as tagged: it carries a valid `CACHEDIR.TAG`,
