@@ -15,7 +15,7 @@ scope:
   path: crates/worktree-git/src/lib.rs
 - confidence: cited
   path: crates/worktree/src/lib.rs
-revision: 4
+revision: 5
 transitions:
 - {from: "draft", to: "proposed", at: "2026-10-12T16:33:20Z", actor: "human:timo", revision: 2}
 - {from: "proposed", to: "active", at: "2026-10-12T16:33:20Z", actor: "human:timo", revision: 3}
@@ -24,7 +24,7 @@ transitions:
 
 `worktree prune-archives --strip-build-output` also strips a Flutter app's build output from an
 existing archive: its `.dart_tool/` and `build/` directories, recognised only where a
-`pubspec.yaml` sits beside them, so a source directory named `build` is never stripped.
+`pubspec.yaml` sits beside them, so a `build` directory HEAD tracks is never stripped (recognition reads HEAD, as the cargo strip does: an uncommitted `build/` beside a `pubspec.yaml` is output).
 
 ## Why
 
@@ -41,7 +41,7 @@ and the Flutter case of `StripVerdict` and `BuildOutputTarget`, validated with t
 ## Contract
 
 - An app root `P` (the tree root included) is a directory for which HEAD's tree, read from Git and
-  never from the patch, holds `P/pubspec.yaml` as a file, or the patch purely adds
+  never from the patch, holds `P/pubspec.yaml` as anything but a directory, or the patch purely adds
   `P/pubspec.yaml`. That section itself is kept.
 - `P/build` and `P/.dart_tool` are output directories only while HEAD's tree holds nothing at that
   path, as a file or a directory. A `build/` or `.dart_tool/` with no `pubspec.yaml` beside it is
@@ -49,7 +49,7 @@ and the Flutter case of `StripVerdict` and `BuildOutputTarget`, validated with t
 - Every section that purely adds an untracked file strictly below an output directory is stripped,
   whatever it holds; the existing pure-addition rule is unchanged (a path named twice, a type
   change, a tracked path, an undecodable path keep their sections).
-- The outermost recognised directory, cargo target or Flutter output, is recorded as a
+- The outermost directory whose rule strips the path, cargo target or Flutter output, is recorded as a
   `build_output` target with origin `strip`. No manifest field is added; formats 1 to 3 are
   unchanged.
 - `archive`, `finish --archive` and `discard-cache` do not change: they do not recognise Flutter

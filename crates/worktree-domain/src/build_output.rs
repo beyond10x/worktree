@@ -51,8 +51,9 @@ pub const FLUTTER_MANIFEST: &str = "pubspec.yaml";
 
 /// The output directories of a Flutter app that `prune-archives --strip-build-output` recognises
 /// in an existing patch (`worktree.archive.FlutterOutputKind`). `P/<name>` is one only when HEAD's
-/// tree holds `P/pubspec.yaml` as a file or the patch purely adds it, and HEAD's tree holds
-/// nothing at `P/<name>`. `archive` and `discard-cache` do not recognise these directories.
+/// tree holds `P/pubspec.yaml` as anything but a directory or the patch purely adds it, and HEAD's
+/// tree holds nothing at `P/<name>`. `archive` and `discard-cache` do not recognise these
+/// directories.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum FlutterOutputKind {
     /// `P/build/`, the output of `flutter build` and `flutter test`.
@@ -588,9 +589,10 @@ impl PatchTargets {
 
 /// The outermost Flutter output directory (`worktree.archive.FlutterOutputKind`) strictly below
 /// which `path` lies, if any: an ancestor `P/build` or `P/.dart_tool` of a UTF-8 relative path
-/// such that HEAD's tree holds nothing at it, and HEAD's tree holds `P/pubspec.yaml` as a file or
-/// `added_manifests` (the `pubspec.yaml` files the patch purely adds) names it. `P` may be the
-/// tree root. `head` is the scanned patch, read here only for the paths of HEAD's tree.
+/// such that HEAD's tree holds nothing at it, and HEAD's tree holds `P/pubspec.yaml` as anything
+/// but a directory or `added_manifests` (the `pubspec.yaml` files the patch purely adds) names
+/// it. `P` may be the tree root. `head` is the scanned patch, read here only for the paths of
+/// HEAD's tree.
 fn flutter_output<'a>(
     path: &'a [u8],
     head: &ScannedPatch,
@@ -1190,8 +1192,8 @@ mod tests {
         }
     }
 
-    /// The outermost recognised directory, cargo target or Flutter output, is recorded: a
-    /// cargo target inside `build/` counts as `build`.
+    /// The outermost directory whose rule strips the path, cargo target or Flutter output, is
+    /// recorded: a cargo target inside `build/` counts as `build`.
     #[test]
     fn the_outermost_of_cargo_targets_and_flutter_outputs_is_recorded() {
         let sections = [

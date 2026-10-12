@@ -62,8 +62,8 @@ independent policy: every decision must come from the public façade.
   below a directory the patch's own pure additions recognise as a target (a Cargo-signed
   `<t>/CACHEDIR.TAG` or `<t>/<p>/.fingerprint/…`; `<t>/tmp/` only beside a profile), or strictly
   below a Flutter app's `<P>/build/` or `<P>/.dart_tool/`, where HEAD's tree holds
-  `<P>/pubspec.yaml` as a file or the patch purely adds it (that section stays) and HEAD's tree
-  holds nothing at the directory's own path. The outermost recognised directory is recorded;
+  `<P>/pubspec.yaml` as anything but a directory or the patch purely adds it (that section stays) and HEAD's tree
+  holds nothing at the directory's own path. The outermost directory whose rule strips the path is recorded;
   `archive` and `discard-cache` do not recognise Flutter output. Both halves of
   a type change stay, an undecodable path keeps its section, and nested images are never touched. The new patch is written outside the archive, verified to apply
   over HEAD in a scratch index (never a tree's or the repository's own index), `worktree_tree` is

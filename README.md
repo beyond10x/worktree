@@ -276,9 +276,9 @@ from Git, does not track, and that is build layout below a directory the patch's
 additions recognise as a target (a Cargo-signed `<t>/CACHEDIR.TAG` or `<t>/<p>/.fingerprint/…`;
 `<t>/tmp/` only beside a profile), or that lies strictly below a Flutter app's output directory:
 `<P>/build/` or `<P>/.dart_tool/` (the tree root included as `<P>`) where HEAD's tree holds
-`<P>/pubspec.yaml` as a file or the patch purely adds it (that section stays), and HEAD's tree
+`<P>/pubspec.yaml` as anything but a directory or the patch purely adds it (that section stays), and HEAD's tree
 holds nothing at that path, so a tracked source directory named `build` and a `build/` with no
-`pubspec.yaml` beside it are never stripped. The outermost recognised directory, cargo target or
+`pubspec.yaml` beside it are never stripped. The outermost directory whose rule strips the path, cargo target or
 Flutter output, is recorded: a cargo target inside `<P>/build/` counts as `<P>/build`. `archive`,
 `finish --archive` and `discard-cache` do not recognise Flutter output. A section whose path cannot
 be decoded, both halves of a type change, every other change to a tracked file and every nested

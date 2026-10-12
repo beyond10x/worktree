@@ -445,11 +445,11 @@ fn adversary_flutter_domain_edges_hold() {
     assert_eq!(plan_patch_strip(&patch).strip, [false]);
 }
 
-/// The contract records "the outermost recognised directory, cargo target or Flutter output".
-/// A Flutter output inside a recognised cargo target is recorded as a second, nested target.
+/// The contract records the outermost directory whose rule strips the path. A Flutter output inside
+/// a recognised cargo target, on a path that is not cargo layout, is stripped by the Flutter rule
+/// and recorded as its own target, nested in the cargo target.
 #[test]
-#[ignore = "a Flutter output inside a recognised cargo target is recorded as its own target, nested in the cargo target, not as the outermost recognised directory"]
-fn adversary_flutter_output_inside_a_cargo_target_records_the_outermost() {
+fn adversary_flutter_output_inside_a_cargo_target_is_recorded_by_its_own_rule() {
     let mut tag = section(b"x/target/CACHEDIR.TAG");
     tag.signed_tag = true;
     let patch = plan(
@@ -470,5 +470,5 @@ fn adversary_flutter_output_inside_a_cargo_target_records_the_outermost() {
         .iter()
         .map(|target| target.path.as_str())
         .collect();
-    assert_eq!(paths, ["x/target"], "{plan:?}");
+    assert_eq!(paths, ["x/target", "x/target/foo/build"], "{plan:?}");
 }

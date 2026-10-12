@@ -194,7 +194,7 @@ adapter only observes: it reads no file contents and decides nothing. The domain
 signed tag or a profile) and Flutter output directories (`FlutterOutputKind`: `<P>/build` or
 `<P>/.dart_tool`, where HEAD's files or the pure additions hold `<P>/pubspec.yaml` and HEAD holds
 nothing at the directory's own path), and marks the sections to strip, recording each under the
-outermost recognised directory that claims it, cargo target or Flutter output. The report's prune verdict afterwards is `decide_archive_prune` over the
+outermost directory whose rule strips the path that claims it, cargo target or Flutter output. The report's prune verdict afterwards is `decide_archive_prune` over the
 directory as it would be (`contents_after_strip`).
 
 ```mermaid

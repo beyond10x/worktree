@@ -8,7 +8,7 @@
   tree, read from Git, holds as a file or that the patch purely adds (that section is kept), and
   where HEAD's tree holds nothing at the directory's own path. A tracked source directory named
   `build`, and a `build/` or `.dart_tool/` with no `pubspec.yaml` beside it, are never stripped.
-  The outermost recognised directory, cargo target or Flutter output, is recorded as a
+  The outermost directory whose rule strips the path, cargo target or Flutter output, is recorded as a
   `build_output` target with origin `strip`; no manifest field is added and formats 1 to 3 are
   unchanged. `archive`, `finish --archive` and `discard-cache` still recognise only cargo's
   layout. The strip's reasons now say "build layout" rather than "cargo build layout".
