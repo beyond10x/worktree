@@ -516,3 +516,159 @@ fn a_repository_at_an_untagged_target_root_is_kept_and_imaged() {
     let finished = fixture.finish_and_collect();
     assert_eq!(images(&finished), ["target"], "{finished}");
 }
+
+/// A bare repository at `relative` in the tree whose one commit was pushed from a scratch clone
+/// outside the tree, so nothing but that repository holds it; returns the commit.
+fn bare_repository_with_pushed_commit(fixture: &Fixture, relative: &str) -> String {
+    let bare = fixture.tree.join(relative);
+    std::fs::create_dir_all(&bare).unwrap();
+    git(&bare, &["init", "-q", "--bare", "-b", "main"]);
+    let scratch = fixture
+        .root
+        .path()
+        .join(format!("scratch-{}", relative.replace('/', "-")));
+    std::fs::create_dir_all(&scratch).unwrap();
+    git(&scratch, &["init", "-q", "-b", "main"]);
+    write(&scratch.join("work.txt"), "only copy\n");
+    git(&scratch, &["add", "."]);
+    git(&scratch, &["commit", "-q", "-m", "only copy"]);
+    let commit = git(&scratch, &["rev-parse", "HEAD"]);
+    git(
+        &scratch,
+        &["push", "-q", bare.to_str().unwrap(), "HEAD:refs/heads/main"],
+    );
+    std::fs::remove_dir_all(&scratch).unwrap();
+    assert!(holds_commit(&bare, &commit));
+    commit
+}
+
+/// Apply `archive`'s `dirty.patch` over a fresh checkout of the tree's HEAD; returns the
+/// checkout.
+fn restore(fixture: &Fixture, archive: &Path) -> PathBuf {
+    let manifest: Value =
+        serde_json::from_slice(&std::fs::read(archive.join("manifest.json")).unwrap()).unwrap();
+    let restored = fixture.root.path().join("restored");
+    git(
+        fixture.root.path(),
+        &[
+            "clone",
+            "-q",
+            "--no-checkout",
+            fixture.repository.to_str().unwrap(),
+            restored.to_str().unwrap(),
+        ],
+    );
+    git(
+        &restored,
+        &[
+            "checkout",
+            "-q",
+            "--detach",
+            manifest["head"].as_str().unwrap(),
+        ],
+    );
+    git(
+        &restored,
+        &[
+            "apply",
+            "--binary",
+            archive.join("dirty.patch").to_str().unwrap(),
+        ],
+    );
+    restored
+}
+
+/// A bare repository inside a profile `discard-cache` keeps whole. The archive must hold it too:
+/// before, it left the repository's files out as cargo build layout, no image and no blocker,
+/// and `gc --apply` then removed the tree and the only copy of its commit. Outcome: the tree is
+/// collected, `dirty.patch` holds every file of the repository as an ordinary untracked file,
+/// the profile's own layout stays left out, and applying the patch restores the commit.
+#[test]
+fn a_bare_repository_in_a_kept_profile_survives_finish_and_gc() {
+    let fixture = Fixture::new();
+    fixture.tagged_target_with_profile();
+    fixture.profile("target/release");
+    let relative = "target/release/build/one/out/remote.git";
+    let commit = bare_repository_with_pushed_commit(&fixture, relative);
+
+    let finished = fixture.finish_and_collect();
+    let archive = PathBuf::from(finished["archive"]["path"].as_str().unwrap());
+    let manifest = &finished["archive"]["manifest"];
+    assert_eq!(manifest["format"], "worktree.archive/3", "{finished}");
+    assert_eq!(
+        manifest["build_output"]["targets"][0]["path"], "target",
+        "{finished}"
+    );
+    let patch = std::fs::read_to_string(archive.join("dirty.patch")).unwrap();
+    assert!(
+        patch.contains(&format!("b/{relative}/HEAD")),
+        "the archive left the repository out: {patch}"
+    );
+    assert!(patch.contains(&format!("b/{relative}/objects/")), "{patch}");
+    assert!(!patch.contains("target/release/deps/"), "{patch}");
+    assert!(!patch.contains(".fingerprint"), "{patch}");
+
+    let restored = restore(&fixture, &archive);
+    assert!(
+        holds_commit(&restored.join(relative), &commit),
+        "applying the archive did not restore {commit}"
+    );
+}
+
+/// A bare repository directly below a recognised target's `tmp/` while the target still holds a
+/// profile, archived without any discard: `tmp/` is cargo layout, the repository in it is not.
+#[test]
+fn a_bare_repository_in_target_tmp_is_not_left_out_of_the_archive() {
+    let fixture = Fixture::new();
+    fixture.tagged_target_with_profile();
+    write(&fixture.tree.join("target/tmp/scratch/state.json"), "{}\n");
+    let relative = "target/tmp/remote.git";
+    let commit = bare_repository_with_pushed_commit(&fixture, relative);
+
+    let archived = fixture.ok(&["archive", fixture.tree_str()]);
+    let archive = PathBuf::from(archived["archive"]["path"].as_str().unwrap());
+    let manifest = &archived["archive"]["manifest"];
+    assert_eq!(manifest["format"], "worktree.archive/3", "{archived}");
+    let patch = std::fs::read_to_string(archive.join("dirty.patch")).unwrap();
+    assert!(
+        patch.contains(&format!("b/{relative}/HEAD")),
+        "the archive left the repository out: {patch}"
+    );
+    assert!(!patch.contains("target/tmp/scratch/"), "{patch}");
+    assert!(!patch.contains("target/debug/"), "{patch}");
+
+    // The tree still verifies against the archive it was just written from.
+    fixture.ok(&["finish", fixture.tree_str()]);
+    let repo = fixture.repository.to_str().unwrap();
+    let review = fixture.ok(&["gc", "--repo", repo, "--dry-run", "--id", "cache"]);
+    assert_eq!(review["assessments"][0]["eligible"], true, "{review}");
+
+    let restored = restore(&fixture, &archive);
+    assert!(holds_commit(&restored.join(relative), &commit));
+}
+
+/// A bare repository written into a recorded profile after the archive: removal re-observes it
+/// immediately before deleting left-out layout, so it is no build layout, the tree no longer
+/// matches the archive, and `gc --apply` refuses and deletes nothing.
+#[test]
+fn a_bare_repository_made_in_recorded_layout_after_the_archive_is_never_deleted() {
+    let fixture = Fixture::new();
+    fixture.tagged_target_with_profile();
+    let archived = fixture.ok(&["archive", fixture.tree_str()]);
+    let manifest = &archived["archive"]["manifest"];
+    assert_eq!(manifest["format"], "worktree.archive/3", "{archived}");
+    fixture.ok(&["finish", fixture.tree_str()]);
+    let relative = "target/debug/build/one/out/remote.git";
+    let commit = bare_repository_with_pushed_commit(&fixture, relative);
+
+    let repo = fixture.repository.to_str().unwrap();
+    let applied = fixture.ok(&["gc", "--repo", repo, "--apply", "--id", "cache"]);
+    assert_eq!(
+        applied["assessments"][0]["refusal"]["code"], "archive-stale",
+        "{applied}"
+    );
+    assert!(
+        holds_commit(&fixture.tree.join(relative), &commit),
+        "gc deleted the repository as build layout: {applied}"
+    );
+}

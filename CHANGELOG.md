@@ -31,6 +31,24 @@
   `finish --discard-cache --archive` refuse `archive-unsupported-entry` naming its
   `.git/worktrees/<name>`, and a directory in `tmp/` no walk can read makes `gc` refuse
   `worktree-state-unreadable` naming it. Nothing in either is deleted.
+- A repository is never build layout in an archive, cargo's or a Flutter app's. 0.17.0 left a
+  bare repository inside a profile (`target/release/build/<crate>/out/remote.git`) out of a
+  `worktree.archive/3` as cargo build layout, with no image and no blocker; `discard-cache` kept
+  the profile, but `gc --apply` then removed the tree, and the repository's only copy of its
+  commits with it. `archive` and `finish --archive` now keep every path with a `.git` component,
+  or at or below a Git directory observed on disk (the same rule `discard-cache` uses: `HEAD` a
+  regular file, `objects/` and `refs/` real directories, none reached through a symbolic link), in
+  `dirty.patch` as an ordinary untracked file and in the fingerprint. One I/O-free rule in the
+  domain (`repository_path`, `layout_directory`) decides it for `archive`, verification, removal
+  and the strip from the observations each supplies (`GitDirectoryFacts` on disk).
+- Verification computes the fingerprint by the same rule, so such an archive verifies against
+  its tree, and removal through a format 3 archive re-observes it immediately before deleting a
+  left-out file: a path that is now at or below a Git directory, or has a `.git` component, is
+  never deleted as build layout; it must match the archive as any other file does, or refuses.
+- `prune-archives --strip-build-output` never strips a section whose path has a `.git`
+  component, or lies at or below a directory `D` for which the patch purely adds `D/HEAD` and at
+  least one path under `D/objects/` (a Git directory, as the patch can show one). No manifest
+  field, format or protocol version changes.
 
 ## 0.17.0 — 2026-10-12
 

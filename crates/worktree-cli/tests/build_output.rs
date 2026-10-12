@@ -1161,3 +1161,97 @@ fn stage_flutter_output(tree: &Path) {
     }
     assert!(child.wait().unwrap().success());
 }
+
+/// A format 1 archive whose patch purely adds a bare repository below a profile, beside the
+/// profile's own layout: the strip removes the layout and keeps every section of the repository,
+/// so applying the stripped patch still restores the commit only the repository held.
+#[test]
+fn strip_keeps_a_bare_repository_beside_the_layout_it_strips() {
+    let fixture = Fixture::new(false);
+    let relative = "target/debug/x/repo.git";
+    let scratch = fixture.root.path().join("scratch");
+    let commit = std::cell::RefCell::new(String::new());
+    let archive = fixture.legacy_archive("bare", true, &|tree| {
+        let bare = tree.join(relative);
+        std::fs::create_dir_all(&bare).unwrap();
+        git(&bare, &["init", "--quiet", "--bare", "-b", "main"]);
+        std::fs::create_dir_all(&scratch).unwrap();
+        git(&scratch, &["init", "--quiet", "-b", "main"]);
+        write(&scratch.join("work.txt"), "only copy\n");
+        git(&scratch, &["add", "."]);
+        git(&scratch, &["commit", "--quiet", "-m", "only copy"]);
+        *commit.borrow_mut() = git(&scratch, &["rev-parse", "HEAD"]);
+        git(
+            &scratch,
+            &[
+                "push",
+                "--quiet",
+                bare.to_str().unwrap(),
+                "HEAD:refs/heads/main",
+            ],
+        );
+        std::fs::remove_dir_all(&scratch).unwrap();
+    });
+    let commit = commit.into_inner();
+    let before = std::fs::read_to_string(archive.join("dirty.patch")).unwrap();
+    let repository_sections = before
+        .lines()
+        .filter(|line| line.starts_with(&format!("diff --git a/{relative}/")))
+        .count();
+    assert!(repository_sections >= 3, "{before}");
+
+    let item = fixture.strip_assessment("bare");
+    assert_eq!(item["verdict"], "strippable", "{item}");
+    assert_eq!(item["sections_stripped"], PROFILE_FILES.len() + 4, "{item}");
+    assert_eq!(item["sections_kept"], repository_sections, "{item}");
+    fixture.strip(&["--apply", "--id", "bare"]);
+
+    let patch = std::fs::read_to_string(archive.join("dirty.patch")).unwrap();
+    assert!(patch.contains(&format!("b/{relative}/HEAD")), "{patch}");
+    assert!(patch.contains(&format!("b/{relative}/objects/")), "{patch}");
+    assert!(!patch.contains(".fingerprint"), "{patch}");
+    assert!(!patch.contains("target/debug/deps/"), "{patch}");
+
+    let manifest: Value =
+        serde_json::from_slice(&std::fs::read(archive.join("manifest.json")).unwrap()).unwrap();
+    let restored = fixture.root.path().join("restored");
+    git(
+        fixture.root.path(),
+        &[
+            "clone",
+            "--quiet",
+            "--no-checkout",
+            fixture.repository.to_str().unwrap(),
+            restored.to_str().unwrap(),
+        ],
+    );
+    git(
+        &restored,
+        &[
+            "checkout",
+            "--quiet",
+            "--detach",
+            manifest["head"].as_str().unwrap(),
+        ],
+    );
+    git(
+        &restored,
+        &[
+            "apply",
+            "--binary",
+            archive.join("dirty.patch").to_str().unwrap(),
+        ],
+    );
+    let found = Command::new("git")
+        .arg("--git-dir")
+        .arg(restored.join(relative))
+        .args(["cat-file", "-e", &format!("{commit}^{{commit}}")])
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .unwrap();
+    assert!(
+        found.status.success(),
+        "the stripped patch lost {commit}: {found:?}"
+    );
+}

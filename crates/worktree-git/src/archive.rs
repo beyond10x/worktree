@@ -18,7 +18,7 @@ use b10x_worktree_domain::{
     BuildOutputOrigin, BuildOutputTarget, CACHEDIR_TAG_FILE, CARGO_PROFILE_MARKER, FlutterFacts,
     FlutterOutputKind, NestedRepositoryImage, NewFileSize, PatchStripPlan, Refusal, ScannedPatch,
     ScannedSection, TargetFacts, WorktreeRecord, archive_image_file, diff_git_path, flutter_output,
-    is_extended_header, layout_target, outermost_build_directory, relative_path,
+    is_extended_header, layout_directory, layout_target, relative_path,
 };
 use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -1215,14 +1215,17 @@ impl<'a> Recognised<'a> {
     }
 
     /// The outermost directory `path` is build layout below, observed on disk now, and whether
-    /// it is a Flutter app's output. `facts`, `profile` and `flutter` may memoise their
-    /// observations.
+    /// it is a Flutter app's output. A path with a `.git` component or at or below a Git
+    /// directory (`git_directory`, [`cache::git_directory`] on disk) is never build layout
+    /// ([`layout_directory`]). `facts`, `profile`, `flutter` and `git_directory` may memoise
+    /// their observations.
     fn directory_of(
         &self,
         path: &[u8],
         facts: impl FnMut(&[u8]) -> TargetFacts,
         profile: impl FnMut(&[u8], &[u8]) -> bool,
         mut flutter: impl FnMut(&[u8], &[u8]) -> Option<FlutterFacts>,
+        git_directory: impl FnMut(&[u8]) -> bool,
     ) -> Option<(Vec<u8>, bool)> {
         if self.tracked.contains(path) {
             return None;
@@ -1239,7 +1242,7 @@ impl<'a> Recognised<'a> {
             }
             flutter(directory, manifest)
         });
-        let directory = outermost_build_directory(cargo, output)?;
+        let directory = layout_directory(path, cargo, output, git_directory)?;
         Some((directory.to_vec(), output == Some(directory)))
     }
 
@@ -1258,8 +1261,15 @@ impl<'a> Recognised<'a> {
                     &self.indexed,
                 )
             },
+            |directory| git_directory_on_disk(self.worktree, directory),
         )
     }
+}
+
+/// Whether `directory`, relative to `worktree`, is a Git directory on disk now: the one predicate
+/// `discard-cache` keeps a repository by ([`cache::git_directory`]).
+fn git_directory_on_disk(worktree: &Path, directory: &[u8]) -> bool {
+    cache::git_directory(&worktree.join(OsStr::from_bytes(directory)))
 }
 
 /// Which of `paths` are build layout below a directory recognised on disk, restricted to `only`
@@ -1281,6 +1291,7 @@ fn observe_layout(
         .collect::<BTreeMap<_, _>>();
     let mut profiles: BTreeMap<Vec<u8>, bool> = BTreeMap::new();
     let mut outputs: BTreeMap<Vec<u8>, Option<FlutterFacts>> = BTreeMap::new();
+    let mut git_directories: BTreeMap<Vec<u8>, bool> = BTreeMap::new();
     let mut layout = Layout::default();
     for path in paths {
         let found = recognised.directory_of(
@@ -1304,6 +1315,11 @@ fn observe_layout(
                         &recognised.indexed,
                     )
                 })
+            },
+            |directory| {
+                *git_directories
+                    .entry(directory.to_vec())
+                    .or_insert_with(|| git_directory_on_disk(worktree, directory))
             },
         );
         if let Some((directory, flutter)) = found {
@@ -1904,8 +1920,10 @@ impl<'a> LeftOut<'a> {
     }
 
     /// Delete each layout file as cache, re-observed immediately before deletion: still a file or
-    /// symlink that is build layout below the same recorded directory, recognised now. Anything
-    /// else refuses.
+    /// symlink that is build layout below the same recorded directory, recognised now, and
+    /// neither with a `.git` component nor at or below a Git directory on disk now
+    /// ([`Recognised::directory_of`]). Anything else refuses; such a path is never deleted as
+    /// layout.
     fn delete(
         &self,
         layout: LayoutPaths,

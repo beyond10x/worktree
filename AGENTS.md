@@ -55,13 +55,19 @@ independent policy: every decision must come from the public façade.
   supplies; none keeps a rule of its own. A directory that is both a recognised cargo target and
   a Flutter output directory is classified by the cargo rule alone, in `archive`, `discard-cache`
   and the strip alike, so a file below it that is not cargo layout stays archived. The outermost
-  of a cargo target and a Flutter output directory is recorded. Such an archive is `worktree.archive/3` and records per directory the
+  of a cargo target and a Flutter output directory is recorded. A repository is never build
+  layout, cargo's or a Flutter app's: a path with a `.git` component, or at or below a Git
+  directory observed on disk (`HEAD` a regular file, `objects/` and `refs/` real directories, none
+  reached through a symbolic link; the one predicate `discard-cache` uses), stays in `dirty.patch`
+  and the fingerprint; one I/O-free rule in the domain decides it for `archive`, verification,
+  removal and the strip. Such an archive is `worktree.archive/3` and records per directory the
   files and bytes left out; one that left nothing out is written exactly as format 1 or 2. Its
   fingerprint excludes that layout, and verification leaves layout out only below the directories
   the manifest records, so layout below a directory it did not record stays in the fingerprint and
   refuses as `archive-stale`. Removal through it deletes each left-out file only after
   re-observing it, immediately before deletion, as a file or symlink of build layout below the
-  same recorded directory, recognised now; anything else refuses.
+  same recorded directory, recognised now, and still neither with a `.git` component nor at or
+  below a Git directory; anything else refuses, and such a path is never deleted as layout.
 - `prune-archives --strip-build-output` never deletes an archive. A dry-run, the default, writes
   nothing. `--apply` takes exact `--id` values only, re-assesses each, and rewrites only an archive
   whose manifest is valid, whose directory holds only recorded files, whose tree path is absent and
@@ -74,7 +80,9 @@ independent policy: every decision must come from the public façade.
   below a Flutter app's `<P>/build/` or `<P>/.dart_tool/`, where HEAD's tree holds
   `<P>/pubspec.yaml` as anything but a directory or the patch purely adds it (that section stays) and HEAD's tree
   holds nothing at the directory's own path, and the patch recognises no cargo target there (one
-  that is both is classified by the cargo rule alone). The outermost directory whose rule strips the path is recorded. Both halves of
+  that is both is classified by the cargo rule alone). A path with a `.git` component, or at or
+  below a directory `D` for which the patch purely adds `D/HEAD` and at least one path under
+  `D/objects/` (a Git directory, as the patch can show one), is never stripped. The outermost directory whose rule strips the path is recorded. Both halves of
   a type change stay, an undecodable path keeps its section, and nested images are never touched. The new patch is written outside the archive, verified to apply
   over HEAD in a scratch index (never a tree's or the repository's own index), `worktree_tree` is
   recomputed from it, and only then are the patch replaced (or deleted when nothing remains) and

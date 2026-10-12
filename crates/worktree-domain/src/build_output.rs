@@ -22,10 +22,17 @@
 //! observations each caller supplies ([`FlutterFacts`]): the disk and the index, or HEAD's tree and
 //! the patch. Every untracked file strictly below one is build layout. A directory that is a
 //! recognised cargo target too is classified by the cargo rule alone ([`FlutterFacts::cargo_target`]).
+//!
+//! A repository is never build layout, cargo's or a Flutter app's ([`repository_path`]): a path
+//! with a `.git` component, or at or below a Git directory, stays archived, is never deleted as
+//! layout and keeps its section in a strip. On disk a Git directory is observed by the same rule
+//! `discard-cache` keeps it by ([`crate::GitDirectoryFacts`]); in a patch it is a directory for
+//! which the patch purely adds `HEAD` and some path under `objects/`.
 
 use crate::{
     ARCHIVE_PATCH_FILE, ArchiveContents, ArchiveEntryKind, ArchiveManifest, CACHEDIR_TAG_FILE,
-    CARGO_PROFILE_MARKER, CARGO_TARGET_TMP, PruneVerdict, SkippedArchiveEntry, is_cache_tag,
+    CARGO_PROFILE_MARKER, CARGO_TARGET_TMP, GIT_DIRECTORY_HEAD, GIT_DIRECTORY_OBJECTS, GIT_ENTRY,
+    PruneVerdict, SkippedArchiveEntry, is_cache_tag,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -679,6 +686,67 @@ pub fn outermost_build_directory<'a>(
     }
 }
 
+/// Whether `path`, relative to the tree root, is repository content: it has a [`GIT_ENTRY`]
+/// component, or it or one of its ancestors below the tree root is a Git directory.
+///
+/// `git_directory(directory)` reports what its caller's source shows of `directory`: on disk,
+/// [`GitDirectoryFacts::recognises`] observed without following a symbolic link; in a patch, a
+/// directory for which the patch purely adds `HEAD` and some path under `objects/`. Such a path
+/// is never build layout, cargo's or a Flutter app's: a repository there may hold commits no
+/// remote does, so `archive` keeps it, removal never deletes it as layout, and the strip keeps
+/// its section.
+pub fn repository_path(path: &[u8], git_directory: impl FnMut(&[u8]) -> bool) -> bool {
+    if path
+        .split(|byte| *byte == b'/')
+        .any(|component| component == GIT_ENTRY.as_bytes())
+    {
+        return true;
+    }
+    path.iter()
+        .enumerate()
+        .filter(|(_, byte)| **byte == b'/')
+        .map(|(at, _)| &path[..at])
+        .chain(std::iter::once(path))
+        .filter(|directory| !directory.is_empty())
+        .any(git_directory)
+}
+
+/// The directory `path` is build layout below, from the cargo target and Flutter output
+/// directory it lies below ([`outermost_build_directory`]), unless it is repository content
+/// ([`repository_path`]), which is never build layout. `git_directory` is asked only when `path`
+/// lies below one.
+pub fn layout_directory<'a>(
+    path: &[u8],
+    cargo: Option<&'a [u8]>,
+    flutter: Option<&'a [u8]>,
+    git_directory: impl FnMut(&[u8]) -> bool,
+) -> Option<&'a [u8]> {
+    let directory = outermost_build_directory(cargo, flutter)?;
+    (!repository_path(path, git_directory)).then_some(directory)
+}
+
+/// The Git directories a patch's own pure additions show: each directory `D` for which the patch
+/// purely adds `D/HEAD` and at least one path under `D/objects/`. A patch holds no empty
+/// directory, so `refs/` cannot be required of it.
+fn patch_git_directories(added: &[(&[u8], bool)]) -> BTreeSet<Vec<u8>> {
+    let mut heads = BTreeSet::new();
+    let mut objects = BTreeSet::new();
+    for (path, _) in added {
+        let components = path.split(|byte| *byte == b'/').collect::<Vec<_>>();
+        let last = components.len() - 1;
+        let prefix = |count: usize| components[..count].join(&b'/');
+        if last >= 1 && components[last] == GIT_DIRECTORY_HEAD.as_bytes() {
+            heads.insert(prefix(last));
+        }
+        for (index, component) in components.iter().enumerate().take(last).skip(1) {
+            if *component == GIT_DIRECTORY_OBJECTS.as_bytes() {
+                objects.insert(prefix(index));
+            }
+        }
+    }
+    heads.intersection(&objects).cloned().collect()
+}
+
 /// Decide which sections of a patch are build layout: cargo's or a Flutter app's.
 ///
 /// Only a pure addition is stripped: a `new file mode` section whose path decoded, that no other
@@ -686,8 +754,9 @@ pub fn outermost_build_directory<'a>(
 /// path is build layout below a directory the patch's own pure additions recognise as a cargo
 /// target, by a Cargo-signed `CACHEDIR.TAG` or a profile's `.fingerprint/`, or strictly below a
 /// Flutter app's output directory ([`FlutterOutputKind`]) beside a `pubspec.yaml` HEAD holds or
-/// the patch purely adds and that is no cargo target the patch recognises. The outermost such
-/// directory is recorded. Every other section is kept whole: a type change of a tracked path is a
+/// the patch purely adds and that is no cargo target the patch recognises. A path with a `.git`
+/// component, or at or below a Git directory the patch's own pure additions show
+/// ([`repository_path`]), is never stripped. The outermost such directory is recorded. Every other section is kept whole: a type change of a tracked path is a
 /// `deleted file mode` and a `new file mode` section of one path, and both halves stay.
 pub fn plan_patch_strip(patch: &ScannedPatch) -> PatchStripPlan {
     let sections = patch.sections.as_slice();
@@ -727,6 +796,7 @@ pub fn plan_patch_strip(patch: &ScannedPatch) -> PatchStripPlan {
         .collect::<BTreeSet<_>>();
     let recognised = PatchTargets::recognise(&added);
     let targets = &recognised.targets;
+    let git_directories = patch_git_directories(&added);
     let mut plan = PatchStripPlan {
         strip: Vec::with_capacity(sections.len()),
         targets: Vec::new(),
@@ -760,7 +830,9 @@ pub fn plan_patch_strip(patch: &ScannedPatch) -> PatchStripPlan {
                         cargo_target: targets.iter().any(|target| target == directory),
                     })
                 });
-                outermost_build_directory(cargo, flutter)
+                layout_directory(path, cargo, flutter, |directory| {
+                    git_directories.contains(directory)
+                })
             });
         plan.strip.push(target.is_some());
         if let Some(target) = target {
@@ -1871,5 +1943,140 @@ mod tests {
         let mut bad = merged;
         bad.targets[0].path = "../escape".into();
         assert!(bad.defect().is_some());
+    }
+
+    /// A path is repository content when it has a `.git` component or it, or an ancestor below
+    /// the tree root, is a Git directory as its caller observes one; only directories are asked.
+    #[test]
+    fn repository_content_is_a_git_component_or_below_a_git_directory() {
+        let git_directories = [b"target/release/build/one/out/remote.git".as_slice()];
+        let mut asked = Vec::new();
+        let mut observe = |directory: &[u8]| {
+            asked.push(directory.to_vec());
+            git_directories.contains(&directory)
+        };
+        assert!(repository_path(
+            b"target/release/build/one/out/remote.git/objects/ab/cdef",
+            &mut observe
+        ));
+        assert!(repository_path(
+            b"target/release/build/one/out/remote.git/HEAD",
+            &mut observe
+        ));
+        assert!(!repository_path(
+            b"target/release/build/one/out/other",
+            &mut observe
+        ));
+        assert!(!repository_path(
+            b"target/release/deps/libone.rlib",
+            &mut observe
+        ));
+        assert!(!asked.iter().any(Vec::is_empty), "the tree root was asked");
+        for path in [
+            "target/tmp/fixture/.git/HEAD",
+            "target/tmp/.git",
+            ".git/config",
+            "build/app/.git",
+        ] {
+            assert!(repository_path(path.as_bytes(), |_| false), "{path}");
+        }
+        // A name only like `.git` is no `.git` component.
+        for path in [
+            "target/tmp/x.git/HEAD",
+            "target/tmp/.gitignore",
+            "target/.github/a",
+        ] {
+            assert!(!repository_path(path.as_bytes(), |_| false), "{path}");
+        }
+
+        // Layout below a cargo target or Flutter output directory, unless repository content.
+        let path = b"target/release/build/one/out/remote.git/HEAD";
+        assert_eq!(
+            layout_directory(path, Some(b"target"), None, |directory| {
+                git_directories.contains(&directory)
+            }),
+            None
+        );
+        assert_eq!(
+            layout_directory(b"target/release/deps/x", Some(b"target"), None, |_| false),
+            Some(b"target".as_slice())
+        );
+        assert_eq!(
+            layout_directory(b"build/x/.git/HEAD", None, Some(b"build"), |_| false),
+            None
+        );
+        // Nothing to ask when the path lies below no build directory.
+        assert_eq!(
+            layout_directory(b"notes.txt", None, None, |_| panic!("asked")),
+            None
+        );
+    }
+
+    /// The structure that makes a directory a Git directory: all three parts, or none counts.
+    #[test]
+    fn a_git_directory_needs_head_objects_and_refs() {
+        let all = crate::GitDirectoryFacts {
+            head_file: true,
+            objects_directory: true,
+            refs_directory: true,
+        };
+        assert!(all.recognises());
+        for missing in [
+            crate::GitDirectoryFacts {
+                head_file: false,
+                ..all
+            },
+            crate::GitDirectoryFacts {
+                objects_directory: false,
+                ..all
+            },
+            crate::GitDirectoryFacts {
+                refs_directory: false,
+                ..all
+            },
+        ] {
+            assert!(!missing.recognises(), "{missing:?}");
+        }
+    }
+
+    /// A repository is never build layout in a patch: a bare repository the patch purely adds
+    /// below a profile (its `HEAD` and a path under its `objects/`) keeps every section at or
+    /// below it, and so does any path with a `.git` component; the layout beside it is stripped.
+    #[test]
+    fn a_repository_the_patch_adds_below_a_profile_is_never_stripped() {
+        let sections = [
+            section("target/debug/.fingerprint/one/lib", true),
+            section("target/debug/deps/libone.rlib", true),
+            section("target/debug/x/repo.git/HEAD", true),
+            section("target/debug/x/repo.git/config", true),
+            section("target/debug/x/repo.git/objects/ab/cdef", true),
+            section("target/debug/x/repo.git/refs/heads/main", true),
+            section("target/debug/y/.git/config", true),
+            section("target/debug/z/.git", true),
+            // A `HEAD` without any `objects/` path is no Git directory the patch shows.
+            section("target/debug/w/HEAD", true),
+            section("target/debug/w/refs/heads/main", true),
+        ];
+        let plan = strip_plan(&sections);
+        assert_eq!(
+            plan.strip,
+            [
+                true, true, false, false, false, false, false, false, true, true
+            ],
+            "{plan:?}"
+        );
+        assert_eq!(plan.targets, [strip_target("target", 4)]);
+        assert_eq!(plan.sections_kept, 6);
+
+        // The same in a Flutter app's output.
+        let sections = [
+            section("build/out.bin", true),
+            section("build/fixture/HEAD", true),
+            section("build/fixture/objects/pack/one.pack", true),
+            section(".dart_tool/cache/.git/HEAD", true),
+        ];
+        let plan = plan_over_head(&sections, &["pubspec.yaml"], &[]);
+        assert_eq!(plan.strip, [true, false, false, false], "{plan:?}");
+        assert_eq!(plan.targets, [strip_target("build", 1)]);
     }
 }

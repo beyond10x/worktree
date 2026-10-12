@@ -125,6 +125,11 @@ split into its direct entries, those holding none discarded as `cargo-target-tmp
 retained; every other kind holding one is retained whole. The walk runs again immediately before
 each deletion, whatever the kind, and an unreadable directory counts as holding one.
 
+Repository content is never layout. The domain's `layout_directory` asks, besides the cargo and
+Flutter rules, whether a path has a `.git` component or lies at or below a Git directory
+(`GitDirectoryFacts`); the disk side observes that with the one predicate `discard-cache` uses, and
+the strip infers it from the `HEAD` and `objects/` paths a patch purely adds.
+
 Verification of a format 3 archive leaves layout out only below the directories the manifest
 records, so an archive written before a kind of output was recognised still holds it in its
 fingerprint and still verifies; layout below an unrecorded directory stays in the fingerprint and

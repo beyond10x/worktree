@@ -70,6 +70,42 @@ pub const PYTHON_MANIFESTS: [&str; 7] = [
 /// Tool caches recognised when they also carry a valid `CACHEDIR.TAG`.
 pub const TAGGED_TOOL_CACHES: [&str; 3] = [".pytest_cache", ".mypy_cache", ".ruff_cache"];
 
+/// The name of a repository's administrative entry: a file, directory or symbolic link of this
+/// name makes the directory holding it a repository, and a path through it is never cache or
+/// build layout.
+pub const GIT_ENTRY: &str = ".git";
+
+/// The file every Git directory holds at its root ([`GitDirectoryFacts`]).
+pub const GIT_DIRECTORY_HEAD: &str = "HEAD";
+
+/// The object store every Git directory holds at its root ([`GitDirectoryFacts`]).
+pub const GIT_DIRECTORY_OBJECTS: &str = "objects";
+
+/// The reference store every Git directory holds at its root ([`GitDirectoryFacts`]).
+pub const GIT_DIRECTORY_REFS: &str = "refs";
+
+/// What a caller observed of one directory, the input of the one rule that makes a directory a
+/// Git directory whatever its name: a bare repository, or one placed with `--separate-git-dir`,
+/// has no `.git` entry, so only this structure shows it. `discard-cache` and `archive` observe
+/// the disk, without following a symbolic link.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct GitDirectoryFacts {
+    /// [`GIT_DIRECTORY_HEAD`] is a regular file.
+    pub head_file: bool,
+    /// [`GIT_DIRECTORY_OBJECTS`] is a real directory.
+    pub objects_directory: bool,
+    /// [`GIT_DIRECTORY_REFS`] is a real directory.
+    pub refs_directory: bool,
+}
+
+impl GitDirectoryFacts {
+    /// Whether these observations make the directory a Git directory.
+    #[must_use]
+    pub fn recognises(self) -> bool {
+        self.head_file && self.objects_directory && self.refs_directory
+    }
+}
+
 /// Whether `contents` is a valid `CACHEDIR.TAG`.
 #[must_use]
 pub fn is_cache_tag(contents: &[u8]) -> bool {

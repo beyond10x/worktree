@@ -182,6 +182,12 @@ below the directories the manifest records, so an archive written before Flutter
 out still verifies, and layout below a directory an archive did not record refuses as
 `archive-stale`.
 
+A repository is never build layout: a path with a `.git` component, or at or below a Git
+directory (`HEAD` a regular file, `objects/` and `refs/` real directories), stays in the archive
+wherever it lies, and removal never deletes it as layout. `prune-archives --strip-build-output`
+keeps such a path too, recognising a Git directory in a patch by the `HEAD` and `objects/` paths
+it adds.
+
 The fingerprint is a Git tree id computed from every file on disk except the build layout left
 out, read without filters, index flags or attributes. It is recorded for every archive, including
 one of a tree Git reports clean, because Git status can be told not to look at a file. Before

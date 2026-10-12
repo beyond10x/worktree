@@ -10,19 +10,13 @@ use b10x_worktree_domain::{
     CACHEDIR_TAG_FILE, CACHEDIR_TAG_SIGNATURE, CARGO_MANIFEST, CARGO_PROFILE_DEPS,
     CARGO_PROFILE_MARKER, CARGO_TARGET_METADATA, CARGO_TARGET_TMP, CARGO_UNTAGGED_TARGET,
     CacheClassification, CacheKind, DiscardedCache, FlutterFacts, FlutterOutputKind,
+    GIT_DIRECTORY_HEAD, GIT_DIRECTORY_OBJECTS, GIT_DIRECTORY_REFS, GIT_ENTRY, GitDirectoryFacts,
     NODE_LOCKFILES, PYTHON_MANIFESTS, PYTHON_VIRTUALENV_MARKER, Refusal, TAGGED_TOOL_CACHES,
     flutter_output_kind, is_cache_tag,
 };
 use std::collections::BTreeSet;
 use std::io::Read as _;
 use std::path::{Component, Path, PathBuf};
-
-/// The name of a repository's administrative entry; a directory holding one is never cache.
-const GIT_ENTRY: &str = ".git";
-/// What makes a directory a Git directory whatever its name ([`git_directory`]).
-const GIT_HEAD: &str = "HEAD";
-const GIT_OBJECTS: &str = "objects";
-const GIT_REFS: &str = "refs";
 
 /// Classified ignored entries, relative to the tree root.
 #[derive(Default)]
@@ -392,10 +386,15 @@ fn holds_git_entry(directory: &Path) -> bool {
 /// Whether `directory` is itself a Git directory, whatever its name: `HEAD` a regular file, and
 /// `objects/` and `refs/` real directories, none reached through a symbolic link. A bare
 /// repository and a `--separate-git-dir` have no `.git` entry, so only this structure shows them.
-fn git_directory(directory: &Path) -> bool {
-    regular_file(&directory.join(GIT_HEAD))
-        && real_directory(&directory.join(GIT_OBJECTS))
-        && real_directory(&directory.join(GIT_REFS))
+/// The one predicate on disk: `archive` and removal ask it too
+/// ([`b10x_worktree_domain::repository_path`]), so what `discard-cache` keeps is never build layout.
+pub(crate) fn git_directory(directory: &Path) -> bool {
+    GitDirectoryFacts {
+        head_file: regular_file(&directory.join(GIT_DIRECTORY_HEAD)),
+        objects_directory: real_directory(&directory.join(GIT_DIRECTORY_OBJECTS)),
+        refs_directory: real_directory(&directory.join(GIT_DIRECTORY_REFS)),
+    }
+    .recognises()
 }
 
 /// Whether the entry at `path` is named `.git` or, as a real directory, is or holds a repository
