@@ -4,7 +4,7 @@ use b10x_worktree::GitPort;
 #[cfg(unix)]
 use b10x_worktree_domain::{
     ArchiveContents, ArchiveEvidence, ArchiveManifest, ArchiveReference, ArchiveRequest,
-    ArchiveStateCheck, PatchStripPlan, ScannedSection, WorktreeRecord,
+    ArchiveStateCheck, PatchStripPlan, ScannedPatch, WorktreeRecord,
 };
 use b10x_worktree_domain::{
     CacheClassification, CreatePlan, DiscoveredWorktree, RecoveryEvidence, RecoveryKind, Refusal,
@@ -1134,7 +1134,7 @@ impl GitPort for ProcessGit {
         &self,
         archive: &Path,
         manifest: &ArchiveManifest,
-    ) -> Result<Vec<ScannedSection>, Refusal> {
+    ) -> Result<ScannedPatch, Refusal> {
         archive::scan_patch_against_head(archive, manifest)
     }
 

@@ -16,9 +16,9 @@ use b10x_worktree_domain::{
     ArchiveContents, ArchiveDirectoryEntry, ArchiveEntryKind, ArchiveEvidence, ArchiveFile,
     ArchiveManifest, ArchiveReference, ArchiveRequest, ArchiveStateCheck, BuildOutput,
     BuildOutputOrigin, BuildOutputTarget, CACHEDIR_TAG_FILE, CARGO_PROFILE_MARKER,
-    NestedRepositoryImage, NewFileSize, PatchStripPlan, Refusal, ScannedSection, TargetFacts,
-    WorktreeRecord, archive_image_file, diff_git_path, is_extended_header, layout_target,
-    relative_path,
+    NestedRepositoryImage, NewFileSize, PatchStripPlan, Refusal, ScannedPatch, ScannedSection,
+    TargetFacts, WorktreeRecord, archive_image_file, diff_git_path, is_extended_header,
+    layout_target, relative_path,
 };
 use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -2176,27 +2176,16 @@ pub(crate) fn scan_patch(
         .collect())
 }
 
-/// Scan an archive's patch ([`scan_patch`]) and mark each section whose decoded path HEAD's tree
-/// tracks, read from Git and never from the patch's own headers: a file or directory at that
-/// path, or a file at one of its ancestors. Such a section is never stripped.
+/// Scan an archive's patch ([`scan_patch`]) with the paths of HEAD's files and directories, read
+/// from Git and never from the patch's own headers. The domain marks each section HEAD tracks
+/// ([`ScannedPatch::against_head`]) and decides from those paths what is build layout.
 pub(crate) fn scan_patch_against_head(
     archive: &Path,
     manifest: &ArchiveManifest,
-) -> Result<Vec<ScannedSection>, Refusal> {
-    let mut sections = scan_patch(archive, manifest)?;
+) -> Result<ScannedPatch, Refusal> {
+    let sections = scan_patch(archive, manifest)?;
     let (files, directories) = head_paths(archive, manifest)?;
-    for section in &mut sections {
-        let Some(path) = section.path.as_deref() else {
-            continue;
-        };
-        let below_a_file = path
-            .iter()
-            .enumerate()
-            .filter(|(_, byte)| **byte == b'/')
-            .any(|(at, _)| files.contains(&path[..at]));
-        section.tracked = files.contains(path) || directories.contains(path) || below_a_file;
-    }
-    Ok(sections)
+    Ok(ScannedPatch::against_head(sections, files, directories))
 }
 
 /// The paths of the files and of the directories HEAD's tree holds. HEAD is read from the
@@ -2837,7 +2826,16 @@ index 0000000000000000000000000000000000000000..78981922613b2afb6025042ff6bd878a
         let (archive, mut manifest) = patched_archive(PATCH);
         manifest.repository_root = root.to_path_buf();
         manifest.head = head;
-        let sections = scan_patch_against_head(archive.path(), &manifest).unwrap();
+        let scanned = scan_patch_against_head(archive.path(), &manifest).unwrap();
+        // HEAD's paths come with the scan, for the domain's Flutter app roots.
+        assert!(
+            scanned
+                .head_files
+                .contains(&b"target/debug/.fingerprint"[..])
+        );
+        assert!(scanned.head_directories.contains(&b"target/debug"[..]));
+        assert!(!scanned.head_files.contains(&b"notes.txt"[..]));
+        let sections = scanned.sections;
         assert!(sections.iter().all(|section| section.new_file));
         assert_eq!(
             sections

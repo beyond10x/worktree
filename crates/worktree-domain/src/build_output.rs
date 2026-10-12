@@ -14,6 +14,11 @@
 //! rule, and at least one profile); in a patch, `T` is a directory for which the patch purely adds
 //! a Cargo-signed `T/CACHEDIR.TAG` or `T/<p>/.fingerprint/…`. A section that is not a pure addition
 //! of an untracked path, or whose path another section names too, is never stripped.
+//!
+//! The strip alone also recognises a Flutter app's output ([`FlutterOutputKind`]): `P/build/` and
+//! `P/.dart_tool/` beside a `pubspec.yaml` HEAD's tree holds or the patch purely adds, where HEAD
+//! holds nothing at that path. Everything strictly below one is build layout. `archive` and
+//! `discard-cache` stay cargo-only.
 
 use crate::{
     ARCHIVE_PATCH_FILE, ArchiveContents, ArchiveEntryKind, ArchiveManifest, CACHEDIR_TAG_FILE,
@@ -40,6 +45,41 @@ pub const CARGO_LAYOUT_NAMES: [&str; 5] = [
     CACHEDIR_TAG_FILE,
     CARGO_RUSTC_INFO,
 ];
+
+/// The file whose presence beside them makes `build/` and `.dart_tool/` a Flutter app's output.
+pub const FLUTTER_MANIFEST: &str = "pubspec.yaml";
+
+/// The output directories of a Flutter app that `prune-archives --strip-build-output` recognises
+/// in an existing patch (`worktree.archive.FlutterOutputKind`). `P/<name>` is one only when HEAD's
+/// tree holds `P/pubspec.yaml` as a file or the patch purely adds it, and HEAD's tree holds
+/// nothing at `P/<name>`. `archive` and `discard-cache` do not recognise these directories.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum FlutterOutputKind {
+    /// `P/build/`, the output of `flutter build` and `flutter test`.
+    Build,
+    /// `P/.dart_tool/`, the package configuration and tool caches.
+    DartTool,
+}
+
+impl FlutterOutputKind {
+    /// Every kind.
+    pub const ALL: [Self; 2] = [Self::Build, Self::DartTool];
+
+    /// The directory's name beside `pubspec.yaml`.
+    pub fn directory_name(self) -> &'static str {
+        match self {
+            Self::Build => "build",
+            Self::DartTool => ".dart_tool",
+        }
+    }
+
+    /// The kind a directory named `name` would be.
+    pub fn named(name: &[u8]) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|kind| kind.directory_name().as_bytes() == name)
+    }
+}
 
 /// How a left-out file was found to be cargo build layout (`worktree.archive.BuildOutputOrigin`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -344,6 +384,61 @@ pub struct ScannedSection {
     pub content_bytes: u64,
 }
 
+/// An archive's patch as the Git adapter streamed it, with the paths of HEAD's tree read from Git
+/// and never from the patch.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScannedPatch {
+    /// Every `diff --git` section, in patch order.
+    pub sections: Vec<ScannedSection>,
+    /// The paths HEAD's tree holds as anything but a directory.
+    pub head_files: BTreeSet<Vec<u8>>,
+    /// The paths HEAD's tree holds as a directory.
+    pub head_directories: BTreeSet<Vec<u8>>,
+}
+
+impl ScannedPatch {
+    /// The patch of `sections` over a HEAD holding `head_files` and `head_directories`, each
+    /// section marked [`ScannedSection::tracked`] when HEAD holds its path ([`Self::head_tracks`]).
+    pub fn against_head(
+        sections: Vec<ScannedSection>,
+        head_files: BTreeSet<Vec<u8>>,
+        head_directories: BTreeSet<Vec<u8>>,
+    ) -> Self {
+        let mut patch = Self {
+            sections: Vec::new(),
+            head_files,
+            head_directories,
+        };
+        patch.sections = sections
+            .into_iter()
+            .map(|mut section| {
+                section.tracked = section
+                    .path
+                    .as_deref()
+                    .is_some_and(|path| patch.head_tracks(path));
+                section
+            })
+            .collect();
+        patch
+    }
+
+    /// Whether HEAD's tree holds `path` as a file or a directory.
+    pub fn head_holds(&self, path: &[u8]) -> bool {
+        self.head_files.contains(path) || self.head_directories.contains(path)
+    }
+
+    /// Whether HEAD's tree holds `path` as a file or directory, or a file at one of its
+    /// ancestors.
+    pub fn head_tracks(&self, path: &[u8]) -> bool {
+        self.head_holds(path)
+            || path
+                .iter()
+                .enumerate()
+                .filter(|(_, byte)| **byte == b'/')
+                .any(|(at, _)| self.head_files.contains(&path[..at]))
+    }
+}
+
 /// Content bytes of the file one `new file mode` section adds, accumulated line by line: the
 /// `literal <n>` size of a binary section, or the added lines of a text one. It also notes
 /// whether a text file's first line is Cargo's `CACHEDIR.TAG` signature.
@@ -491,15 +586,49 @@ impl PatchTargets {
     }
 }
 
-/// Decide which sections of a patch are cargo build layout.
+/// The outermost Flutter output directory (`worktree.archive.FlutterOutputKind`) strictly below
+/// which `path` lies, if any: an ancestor `P/build` or `P/.dart_tool` of a UTF-8 relative path
+/// such that HEAD's tree holds nothing at it, and HEAD's tree holds `P/pubspec.yaml` as a file or
+/// `added_manifests` (the `pubspec.yaml` files the patch purely adds) names it. `P` may be the
+/// tree root. `head` is the scanned patch, read here only for the paths of HEAD's tree.
+fn flutter_output<'a>(
+    path: &'a [u8],
+    head: &ScannedPatch,
+    added_manifests: &BTreeSet<&[u8]>,
+) -> Option<&'a [u8]> {
+    let mut start = 0;
+    for (at, _) in path.iter().enumerate().filter(|(_, byte)| **byte == b'/') {
+        let directory = &path[..at];
+        let name = &path[start..at];
+        start = at + 1;
+        if FlutterOutputKind::named(name).is_none()
+            || head.head_holds(directory)
+            || !std::str::from_utf8(directory).is_ok_and(relative_path)
+            || path_below(path, directory).is_none()
+        {
+            continue;
+        }
+        let mut manifest = directory[..directory.len() - name.len()].to_vec();
+        manifest.extend_from_slice(FLUTTER_MANIFEST.as_bytes());
+        if head.head_files.contains(&manifest) || added_manifests.contains(manifest.as_slice()) {
+            return Some(directory);
+        }
+    }
+    None
+}
+
+/// Decide which sections of a patch are build layout: cargo's or a Flutter app's.
 ///
 /// Only a pure addition is stripped: a `new file mode` section whose path decoded, that no other
 /// section names, and that HEAD does not track ([`ScannedSection::tracked`]); and only when that
 /// path is build layout below a directory the patch's own pure additions recognise as a cargo
-/// target, by a Cargo-signed `CACHEDIR.TAG` or a profile's `.fingerprint/`. Every other section is
-/// kept whole: a type change of a tracked path is a `deleted file mode` and a `new file mode`
-/// section of one path, and both halves stay.
-pub fn plan_patch_strip(sections: &[ScannedSection]) -> PatchStripPlan {
+/// target, by a Cargo-signed `CACHEDIR.TAG` or a profile's `.fingerprint/`, or strictly below a
+/// Flutter app's output directory ([`FlutterOutputKind`]) beside a `pubspec.yaml` HEAD holds or
+/// the patch purely adds. The outermost such directory is recorded. Every other section is kept
+/// whole: a type change of a tracked path is a `deleted file mode` and a `new file mode` section
+/// of one path, and both halves stay.
+pub fn plan_patch_strip(patch: &ScannedPatch) -> PatchStripPlan {
+    let sections = patch.sections.as_slice();
     // Per decoded path: how many sections name it, and whether every one is a `new file mode`.
     let mut named: BTreeMap<&[u8], (usize, bool)> = BTreeMap::new();
     for section in sections {
@@ -527,6 +656,13 @@ pub fn plan_patch_strip(sections: &[ScannedSection]) -> PatchStripPlan {
                 .map(|path| (path, section.signed_tag))
         })
         .collect::<Vec<_>>();
+    let added_manifests = added
+        .iter()
+        .map(|(path, _)| *path)
+        .filter(|path| {
+            path.rsplit(|byte| *byte == b'/').next() == Some(FLUTTER_MANIFEST.as_bytes())
+        })
+        .collect::<BTreeSet<_>>();
     let recognised = PatchTargets::recognise(&added);
     let targets = &recognised.targets;
     let mut plan = PatchStripPlan {
@@ -537,35 +673,46 @@ pub fn plan_patch_strip(sections: &[ScannedSection]) -> PatchStripPlan {
         strip_bytes: 0,
         kept_bytes: 0,
     };
-    let mut per_target: Vec<(u64, u64)> = vec![(0, 0); targets.len()];
+    // Files and bytes per recorded directory, in path-byte order.
+    let mut per_target: BTreeMap<&[u8], (u64, u64)> = BTreeMap::new();
     for section in sections {
         let target = section
             .path
             .as_deref()
             .filter(|_| pure_addition(section))
             .and_then(|path| {
-                layout_target(
+                let cargo = layout_target(
                     path,
                     targets,
                     |target| recognised.facts(target),
                     |target, prefix| recognised.profile(target, prefix),
                 )
+                .map(|index| targets[index].as_slice());
+                let flutter = flutter_output(path, patch, &added_manifests);
+                // Both are ancestors of `path`, so the shorter one is the outer one.
+                match (cargo, flutter) {
+                    (Some(cargo), Some(flutter)) => Some(if flutter.len() < cargo.len() {
+                        flutter
+                    } else {
+                        cargo
+                    }),
+                    (cargo, flutter) => cargo.or(flutter),
+                }
             });
         plan.strip.push(target.is_some());
-        if let Some(index) = target {
+        if let Some(target) = target {
             plan.sections_stripped += 1;
             plan.strip_bytes += section.patch_bytes;
-            per_target[index].0 += 1;
-            per_target[index].1 += section.content_bytes;
+            let entry = per_target.entry(target).or_default();
+            entry.0 += 1;
+            entry.1 += section.content_bytes;
         } else {
             plan.sections_kept += 1;
             plan.kept_bytes += section.patch_bytes;
         }
     }
-    plan.targets = targets
-        .iter()
-        .zip(per_target)
-        .filter(|(_, (files, _))| *files > 0)
+    plan.targets = per_target
+        .into_iter()
         .map(|(target, (files, bytes))| BuildOutputTarget {
             path: String::from_utf8_lossy(target).into_owned(),
             origin: BuildOutputOrigin::Strip,
@@ -689,7 +836,7 @@ pub fn decide_archive_strip(
     contents: &ArchiveContents,
     tree_present: impl FnOnce(&ArchiveManifest) -> Result<bool, String>,
     repository_gone: impl FnOnce(&ArchiveManifest) -> Result<bool, String>,
-    scan: impl FnOnce(&ArchiveManifest) -> Result<Vec<ScannedSection>, String>,
+    scan: impl FnOnce(&ArchiveManifest) -> Result<ScannedPatch, String>,
 ) -> StripDecision {
     let decision = |verdict, reason: String| StripDecision {
         verdict,
@@ -720,22 +867,22 @@ pub fn decide_archive_strip(
     if manifest.patch.is_none() {
         return decision(StripVerdict::NothingToStrip, "records no patch".into());
     }
-    let sections = match scan(manifest) {
-        Ok(sections) => sections,
+    let patch = match scan(manifest) {
+        Ok(patch) => patch,
         Err(error) => return decision(StripVerdict::PatchUnusable, error),
     };
-    let plan = plan_patch_strip(&sections);
+    let plan = plan_patch_strip(&patch);
     if plan.sections_stripped == 0 {
         return StripDecision {
             verdict: StripVerdict::NothingToStrip,
-            reason: "no section of the patch adds cargo build layout".into(),
+            reason: "no section of the patch adds build layout (cargo or Flutter)".into(),
             plan: Some(plan),
         };
     }
     StripDecision {
         verdict: StripVerdict::Strippable,
         reason: format!(
-            "{} section(s) add cargo build layout below {}",
+            "{} section(s) add build layout below {}",
             plan.sections_stripped,
             plan.targets
                 .iter()
@@ -882,6 +1029,189 @@ mod tests {
             patch_bytes: 10,
             content_bytes: 3,
         }
+    }
+
+    /// The plan for `sections` over an empty HEAD, each section's `tracked` as given.
+    fn strip_plan(sections: &[ScannedSection]) -> PatchStripPlan {
+        plan_patch_strip(&ScannedPatch {
+            sections: sections.to_vec(),
+            ..ScannedPatch::default()
+        })
+    }
+
+    /// The plan for `sections` over a HEAD holding `files` and `directories`.
+    fn plan_over_head(
+        sections: &[ScannedSection],
+        files: &[&str],
+        directories: &[&str],
+    ) -> PatchStripPlan {
+        let set = |paths: &[&str]| paths.iter().map(|path| path.as_bytes().to_vec()).collect();
+        plan_patch_strip(&ScannedPatch::against_head(
+            sections.to_vec(),
+            set(files),
+            set(directories),
+        ))
+    }
+
+    fn strip_target(path: &str, files: u64) -> BuildOutputTarget {
+        BuildOutputTarget {
+            path: path.into(),
+            origin: BuildOutputOrigin::Strip,
+            files,
+            bytes: files * 3,
+        }
+    }
+
+    /// A Flutter app at the tree root: `build/` and `.dart_tool/` beside a tracked
+    /// `pubspec.yaml` are stripped whatever they hold, the app's source is kept.
+    #[test]
+    fn flutter_output_beside_a_pubspec_is_stripped() {
+        let sections = [
+            section("lib/main.dart", false),
+            section(".dart_tool/package_config.json", true),
+            section(".dart_tool/flutter_build/one/app.dill", true),
+            section("build/app/outputs/flutter-apk/app-release.apk", true),
+            section("build/unit_test_assets/AssetManifest.bin", true),
+            section("notes.txt", true),
+        ];
+        let plan = plan_over_head(&sections, &["pubspec.yaml", "lib/main.dart"], &["lib"]);
+        assert_eq!(
+            plan.strip,
+            [false, true, true, true, true, false],
+            "{plan:?}"
+        );
+        assert_eq!(plan.sections_stripped, 4);
+        assert_eq!(plan.sections_kept, 2);
+        assert_eq!(
+            plan.targets,
+            [strip_target(".dart_tool", 2), strip_target("build", 2)]
+        );
+
+        // A nested app root: only its own outputs, never a sibling's `build/`.
+        let sections = [
+            section("app/build/web/main.dart.js", true),
+            section("app/.dart_tool/package_config.json", true),
+            section("other/build/out.bin", true),
+            section("build/out.bin", true),
+        ];
+        let plan = plan_over_head(&sections, &["app/pubspec.yaml"], &["app"]);
+        assert_eq!(plan.strip, [true, true, false, false], "{plan:?}");
+        assert_eq!(
+            plan.targets,
+            [
+                strip_target("app/.dart_tool", 1),
+                strip_target("app/build", 1)
+            ]
+        );
+    }
+
+    /// Without a `pubspec.yaml` beside them, `build/` and `.dart_tool/` are ordinary
+    /// directories; a `pubspec.yaml` HEAD holds as a directory, or one level up, does not count.
+    #[test]
+    fn flutter_output_without_a_pubspec_beside_is_kept() {
+        let sections = [
+            section("build/out.bin", true),
+            section(".dart_tool/package_config.json", true),
+            section("app/build/out.bin", true),
+            section("app/lib/build/out.bin", true),
+            section("tool/build/out.bin", true),
+        ];
+        let plan = plan_over_head(
+            &sections,
+            &["app/pubspec.yaml", "README.md"],
+            &["app", "tool", "tool/pubspec.yaml"],
+        );
+        assert_eq!(plan.strip, [false, false, true, false, false], "{plan:?}");
+        let plan = strip_plan(&sections);
+        assert_eq!(plan.sections_stripped, 0, "{plan:?}");
+    }
+
+    /// A `build` HEAD holds, as a directory or as a file, is the app's own source: nothing
+    /// below it is output, and a file `build` added purely is not below an output directory.
+    #[test]
+    fn a_tracked_build_directory_is_never_flutter_output() {
+        let sections = [
+            section("build/generated.dart", true),
+            section(".dart_tool/package_config.json", true),
+        ];
+        let plan = plan_over_head(&sections, &["pubspec.yaml", "build/build.yaml"], &["build"]);
+        assert_eq!(plan.strip, [false, true], "{plan:?}");
+        assert_eq!(plan.targets, [strip_target(".dart_tool", 1)]);
+
+        // HEAD holds `build` as a file: a section below it is tracked, and kept.
+        let plan = plan_over_head(
+            &[section("build/out.bin", true)],
+            &["pubspec.yaml", "build"],
+            &[],
+        );
+        assert_eq!(plan.strip, [false], "{plan:?}");
+
+        // A file `build` added purely is not strictly below an output directory.
+        let plan = plan_over_head(
+            &[section("build", true), section(".dart_tool", true)],
+            &["pubspec.yaml"],
+            &[],
+        );
+        assert_eq!(plan.strip, [false, false], "{plan:?}");
+    }
+
+    /// A `pubspec.yaml` the patch purely adds recognises its app root, and its own section is
+    /// kept; one that is not a pure addition recognises nothing.
+    #[test]
+    fn a_pubspec_the_patch_adds_recognises_its_app_root() {
+        let sections = [
+            section("example_app/pubspec.yaml", true),
+            section("example_app/lib/main.dart", true),
+            section("example_app/build/out.bin", true),
+            section("example_app/.dart_tool/version", true),
+        ];
+        let plan = plan_over_head(&sections, &["README.md"], &[]);
+        assert_eq!(plan.strip, [false, false, true, true], "{plan:?}");
+        assert_eq!(
+            plan.targets,
+            [
+                strip_target("example_app/.dart_tool", 1),
+                strip_target("example_app/build", 1)
+            ]
+        );
+
+        // Named twice, or not a `new file mode`: no app root.
+        for pubspec in [
+            vec![
+                section("example_app/pubspec.yaml", true),
+                section("example_app/pubspec.yaml", true),
+            ],
+            vec![section("example_app/pubspec.yaml", false)],
+        ] {
+            let mut sections = pubspec;
+            sections.push(section("example_app/build/out.bin", true));
+            let plan = plan_over_head(&sections, &[], &[]);
+            assert_eq!(plan.sections_stripped, 0, "{plan:?}");
+        }
+    }
+
+    /// The outermost recognised directory, cargo target or Flutter output, is recorded: a
+    /// cargo target inside `build/` counts as `build`.
+    #[test]
+    fn the_outermost_of_cargo_targets_and_flutter_outputs_is_recorded() {
+        let sections = [
+            section("build/rust/target/debug/.fingerprint/one/lib", true),
+            section("build/rust/target/debug/deps/libone.rlib", true),
+            section("build/app.dill", true),
+            section("native/target/debug/.fingerprint/one/lib", true),
+            section("native/target/debug/deps/libone.rlib", true),
+        ];
+        let plan = plan_over_head(&sections, &["pubspec.yaml"], &["native"]);
+        assert_eq!(plan.strip, [true, true, true, true, true], "{plan:?}");
+        assert_eq!(
+            plan.targets,
+            [strip_target("build", 3), strip_target("native/target", 2)]
+        );
+        assert_eq!(
+            FlutterOutputKind::named(b".dart_tool"),
+            Some(FlutterOutputKind::DartTool)
+        );
+        assert_eq!(FlutterOutputKind::named(b"target"), None);
     }
 
     #[test]
@@ -1039,7 +1369,7 @@ mod tests {
                 content_bytes: 3,
             },
         ];
-        let plan = plan_patch_strip(&sections);
+        let plan = strip_plan(&sections);
         assert_eq!(
             plan.strip,
             [true, true, true, true, true, false, false, false, false]
@@ -1057,7 +1387,7 @@ mod tests {
             }]
         );
         // Without any recognising file nothing is a target.
-        let plan = plan_patch_strip(&[section("target/debug/deps/libone.rlib", true)]);
+        let plan = strip_plan(&[section("target/debug/deps/libone.rlib", true)]);
         assert_eq!(plan.sections_stripped, 0);
     }
 
@@ -1080,7 +1410,7 @@ mod tests {
             tracked,
             section("target/debug/deps/libone.rlib", true),
         ];
-        let plan = plan_patch_strip(&sections);
+        let plan = strip_plan(&sections);
         assert_eq!(
             plan.strip,
             [true, false, false, false, false, false, true],
@@ -1094,7 +1424,7 @@ mod tests {
             },
             section("target/debug/.fingerprint/one/lib", false),
         ] {
-            let plan = plan_patch_strip(&[
+            let plan = strip_plan(&[
                 disguised,
                 section("target/debug/.fingerprint/one/lib", true),
                 section("target/debug/deps/libone.rlib", true),
@@ -1124,11 +1454,11 @@ mod tests {
                 section("target/debug/deps/libone.rlib", true),
             ],
         ] {
-            let plan = plan_patch_strip(&unrecognised);
+            let plan = strip_plan(&unrecognised);
             assert_eq!(plan.sections_stripped, 0, "{plan:?}");
         }
         // A signed tag recognises the target, but its `tmp/` stays without a profile.
-        let plan = plan_patch_strip(&[
+        let plan = strip_plan(&[
             signed("target/CACHEDIR.TAG"),
             section("target/.rustc_info.json", true),
             section("target/tmp/scratch", true),
@@ -1136,7 +1466,7 @@ mod tests {
         ]);
         assert_eq!(plan.strip, [true, true, false, true], "{plan:?}");
         // Beside a profile, even a cross-target one, `tmp/` goes; an unsigned tag stays.
-        let plan = plan_patch_strip(&[
+        let plan = strip_plan(&[
             section("target/CACHEDIR.TAG", true),
             section(
                 "target/x86_64-unknown-linux-gnu/debug/.fingerprint/one/lib",
@@ -1145,7 +1475,7 @@ mod tests {
             section("target/tmp/scratch", true),
         ]);
         assert_eq!(plan.strip, [false, true, false], "{plan:?}");
-        let plan = plan_patch_strip(&[
+        let plan = strip_plan(&[
             signed("target/CACHEDIR.TAG"),
             section(
                 "target/x86_64-unknown-linux-gnu/debug/.fingerprint/one/lib",

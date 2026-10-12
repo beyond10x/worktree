@@ -7,7 +7,7 @@ use b10x_worktree_domain::{
     CreateRequest, DiscoveredWorktree, GitRevision, Lifecycle, OperationEvidence, PatchStripPlan,
     PruneVerdict, ReconciliationAction, ReconciliationAssessment, RecoveryEvidence, RecoveryKind,
     RecoveryProof, Refusal, RelocationIntent, RemoteObservation, RemovalIntent, RepositorySnapshot,
-    ScannedSection, SkippedArchiveEntry, StripVerdict, SweepItem, WorkspacePolicy, WorktreeId,
+    ScannedPatch, SkippedArchiveEntry, StripVerdict, SweepItem, WorkspacePolicy, WorktreeId,
     WorktreeRecord, WorktreeSnapshot, contents_after_strip, decide_archive_prune,
     decide_archive_strip, require_child,
 };
@@ -241,13 +241,14 @@ pub trait GitPort: Send + Sync {
         Err(archive_unsupported(archive))
     }
     /// Stream an archive's `dirty.patch` into its `diff --git` sections, verifying the digest
-    /// `manifest` records, and mark each section whose path HEAD's tree tracks, read from Git.
-    /// Writes nothing to the archive or the repository. The default refuses.
+    /// `manifest` records, with the paths of HEAD's files and directories read from Git, each
+    /// section marked as [`ScannedPatch::against_head`] does. Writes nothing to the archive or the
+    /// repository. The default refuses.
     fn scan_archive_patch(
         &self,
         archive: &Path,
         _manifest: &ArchiveManifest,
-    ) -> Result<Vec<ScannedSection>, Refusal> {
+    ) -> Result<ScannedPatch, Refusal> {
         Err(archive_unsupported(archive))
     }
     /// Remove the sections `plan` marks from an archive assessed strippable: the new patch is

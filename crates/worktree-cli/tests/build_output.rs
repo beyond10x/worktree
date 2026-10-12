@@ -962,3 +962,165 @@ fn gc_removes_a_tree_with_a_tracked_file_under_its_target() {
 
     fixture.retire("tracked", &tree);
 }
+
+impl Fixture {
+    /// A retired tree whose format-1 archive holds a Flutter app's work: `pubspec` commits a
+    /// `pubspec.yaml` at the root beside `lib/main.dart`, both pushed; `work` then writes what
+    /// the archive captures.
+    fn flutter_archive(&self, id: &str, pubspec: bool, work: &dyn Fn(&Path)) -> PathBuf {
+        let tree = self.tree(id, true);
+        if pubspec {
+            write(&tree.join("pubspec.yaml"), "name: app\n");
+        }
+        write(&tree.join("lib/main.dart"), "void main() {}\n");
+        write(
+            &tree.join(".gitignore"),
+            "/target/\n/build/\n/.dart_tool/\n",
+        );
+        git(&tree, &["add", "."]);
+        git(&tree, &["commit", "--quiet", "-m", "a Flutter app"]);
+        let branch = format!("HEAD:refs/heads/{id}");
+        git(&tree, &["push", "--quiet", "--force", "origin", &branch]);
+        work(&tree);
+        let archive = self.archive(id);
+        assert_eq!(
+            archive["manifest"]["format"], "worktree.archive/1",
+            "{archive}"
+        );
+        self.retire(id, &tree);
+        PathBuf::from(archive["path"].as_str().unwrap())
+    }
+}
+
+/// What `flutter build` and `flutter test` leave beside `pubspec.yaml`; files and bytes.
+fn flutter_build(tree: &Path) -> (u64, u64) {
+    let files: [(&str, &[u8]); 4] = [
+        (".dart_tool/package_config.json", b"{\"configVersion\":2}\n"),
+        (".dart_tool/flutter_build/one/app.dill", &[0, 1, 2, 3, 255]),
+        (
+            "build/app/outputs/flutter-apk/app-release.apk",
+            &[80, 75, 3, 4, 0, 0, 9],
+        ),
+        ("build/unit_test_assets/AssetManifest.bin", &[7; 120]),
+    ];
+    for (path, bytes) in files {
+        write(&tree.join(path), bytes);
+    }
+    (
+        files.len() as u64,
+        files.iter().map(|(_, bytes)| bytes.len() as u64).sum(),
+    )
+}
+
+#[test]
+fn strip_removes_flutter_build_output_beside_a_pubspec() {
+    let fixture = Fixture::new(false);
+    let archive = fixture.flutter_archive("app", true, &|tree| {
+        flutter_build(tree);
+        write(&tree.join("lib/main.dart"), "void main() { run(); }\n");
+    });
+    let patch = std::fs::read_to_string(archive.join("dirty.patch")).unwrap();
+    assert!(
+        patch.contains("b/.dart_tool/package_config.json"),
+        "{patch}"
+    );
+    assert!(patch.contains("b/build/app/outputs/"), "{patch}");
+    let before = snapshot(&archive);
+    let patch_bytes = patch.len() as u64;
+
+    let item = fixture.strip_assessment("app");
+    assert_eq!(item["verdict"], "strippable", "{item}");
+    assert_eq!(item["sections_stripped"], 4, "{item}");
+    assert_eq!(item["sections_kept"], 1, "{item}");
+    let strip = item["strip_bytes"].as_u64().unwrap();
+    assert!(strip > 0, "{item}");
+    assert_eq!(
+        strip + item["kept_patch_bytes"].as_u64().unwrap(),
+        patch_bytes
+    );
+    assert_eq!(item["prune_verdict_after"], "uncommitted-state", "{item}");
+    assert!(
+        !item["reason"].as_str().unwrap().contains("cargo"),
+        "{item}"
+    );
+    assert_eq!(snapshot(&archive), before);
+
+    fixture.strip(&["--apply", "--id", "app"]);
+    let patch = std::fs::read_to_string(archive.join("dirty.patch")).unwrap();
+    assert!(!patch.contains(".dart_tool/"), "{patch}");
+    assert!(!patch.contains("b/build/"), "{patch}");
+    assert!(patch.contains("b/lib/main.dart"), "{patch}");
+    assert!(patch.contains("+void main() { run(); }"), "{patch}");
+    let manifest: Value =
+        serde_json::from_slice(&std::fs::read(archive.join("manifest.json")).unwrap()).unwrap();
+    assert_eq!(manifest["format"], "worktree.archive/3", "{manifest}");
+    let output = &manifest["build_output"];
+    let targets: Vec<(&str, &str, u64)> = output["targets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|target| {
+            (
+                target["path"].as_str().unwrap(),
+                target["origin"].as_str().unwrap(),
+                target["files"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        targets,
+        [(".dart_tool", "strip", 2), ("build", "strip", 2)],
+        "{output}"
+    );
+    assert!(
+        applied_listing(&fixture.repository, &archive).contains("\tlib/main.dart"),
+        "the stripped patch still applies over HEAD"
+    );
+    assert_eq!(fixture.prune_verdict("app"), "uncommitted-state");
+
+    // An app whose only work is build output: the archive becomes removable.
+    let built = std::cell::Cell::new((0, 0));
+    let clean = fixture.flutter_archive("built", true, &|tree| built.set(flutter_build(tree)));
+    let (files, bytes) = built.get();
+    assert_eq!(fixture.prune_verdict("built"), "uncommitted-state");
+    let dry = fixture.strip_assessment("built");
+    assert_eq!(dry["prune_verdict_after"], "removable", "{dry}");
+    assert_eq!(dry["sections_kept"], 0, "{dry}");
+    fixture.strip(&["--apply", "--id", "built"]);
+    let manifest: Value =
+        serde_json::from_slice(&std::fs::read(clean.join("manifest.json")).unwrap()).unwrap();
+    assert!(manifest["patch"].is_null(), "{manifest}");
+    assert_eq!(manifest["build_output"]["files"], files, "{manifest}");
+    assert_eq!(manifest["build_output"]["bytes"], bytes, "{manifest}");
+    assert_eq!(fixture.prune_verdict("built"), "removable");
+    let removed = fixture.ok(&[
+        "prune-archives",
+        "--repo",
+        fixture.repository.to_str().unwrap(),
+        "--apply",
+        "--id",
+        "built",
+    ]);
+    assert_eq!(removed["archives"][0]["removed"], true, "{removed}");
+    assert!(!clean.exists());
+}
+
+#[test]
+fn strip_keeps_a_build_directory_with_no_pubspec_beside() {
+    let fixture = Fixture::new(false);
+    let archive = fixture.flutter_archive("plain", false, &|tree| {
+        flutter_build(tree);
+        // A `pubspec.yaml` one level down is not beside the root's `build/`.
+        write(&tree.join("lib/pubspec.yaml"), "name: nested\n");
+    });
+    let item = fixture.strip_assessment("plain");
+    assert_eq!(item["verdict"], "nothing-to-strip", "{item}");
+    assert_eq!(item["sections_stripped"], 0, "{item}");
+    fixture.strip_apply_is_refused(&archive, "nothing-to-strip");
+    let patch = std::fs::read_to_string(archive.join("dirty.patch")).unwrap();
+    assert!(patch.contains("b/build/app/outputs/"), "{patch}");
+    assert!(
+        patch.contains("b/.dart_tool/package_config.json"),
+        "{patch}"
+    );
+}
