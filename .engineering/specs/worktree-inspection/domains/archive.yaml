@@ -61,12 +61,12 @@ types:
 
   # The output directories of a Flutter app (a Dart package) that `--strip-build-output`
   # recognises in an existing patch. P is an app root, the tree root included: a directory for
-  # which HEAD's tree, read from Git, holds `P/pubspec.yaml` as a file, or the patch purely adds
+  # which HEAD's tree, read from Git, holds `P/pubspec.yaml` as anything but a directory, or the patch purely adds
   # `P/pubspec.yaml` (that section is kept). `P/<name>` is an output directory only when HEAD's
   # tree holds nothing at that path, as a file or a directory, so a tracked source directory named
   # `build` is never one; a `build/` or `.dart_tool/` with no `pubspec.yaml` beside it is never
   # one. Every pure-addition section strictly below an output directory is build layout, whatever
-  # it holds; the outermost recognised directory, cargo target or Flutter output, is recorded as
+  # it holds; the outermost directory whose rule strips the path, cargo target or Flutter output, is recorded as
   # the BuildOutputTarget. `archive` and `discard-cache` do not recognise these directories.
   #   Build: `P/build/`, the output of `flutter build` and `flutter test`.
   #   DartTool: `P/.dart_tool/`, the package configuration and tool caches.
