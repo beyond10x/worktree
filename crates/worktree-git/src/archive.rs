@@ -15,10 +15,10 @@ use b10x_worktree_domain::{
     ARCHIVE_BUNDLE_FILE, ARCHIVE_HEAD_REF, ARCHIVE_MANIFEST_FILE, ARCHIVE_PATCH_FILE,
     ArchiveContents, ArchiveDirectoryEntry, ArchiveEntryKind, ArchiveEvidence, ArchiveFile,
     ArchiveManifest, ArchiveReference, ArchiveRequest, ArchiveStateCheck, BuildOutput,
-    BuildOutputOrigin, BuildOutputTarget, CACHEDIR_TAG_FILE, CARGO_PROFILE_MARKER,
-    NestedRepositoryImage, NewFileSize, PatchStripPlan, Refusal, ScannedPatch, ScannedSection,
-    TargetFacts, WorktreeRecord, archive_image_file, diff_git_path, is_extended_header,
-    layout_target, relative_path,
+    BuildOutputOrigin, BuildOutputTarget, CACHEDIR_TAG_FILE, CARGO_PROFILE_MARKER, FlutterFacts,
+    FlutterOutputKind, NestedRepositoryImage, NewFileSize, PatchStripPlan, Refusal, ScannedPatch,
+    ScannedSection, TargetFacts, WorktreeRecord, archive_image_file, diff_git_path, flutter_output,
+    is_extended_header, layout_target, outermost_build_directory, relative_path,
 };
 use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -32,8 +32,8 @@ use std::process::{Command, Stdio};
 /// Nested repository roots relative to the tree root, as raw bytes in path-byte order.
 type NestedRoots = Vec<Vec<u8>>;
 
-/// Untracked build layout paths, each with the index of its target.
-type LayoutPaths = Vec<(Vec<u8>, usize)>;
+/// Untracked build layout paths, each with the directory it is layout below.
+type LayoutPaths = Vec<(Vec<u8>, Vec<u8>)>;
 
 /// Paths relative to a tree root, as raw bytes.
 type PathSet = BTreeSet<Vec<u8>>;
@@ -1004,24 +1004,41 @@ fn hash_files(
         .collect())
 }
 
-/// Whether a capture leaves cargo build layout out.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Whether a capture leaves build layout out: cargo's, and a Flutter app's output.
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum LeaveOut<'a> {
     /// Every file counts: formats 1 and 2.
     Nothing,
-    /// Build layout below a recognised cargo target, untracked in HEAD and the index, is left out.
+    /// Build layout below a recognised cargo target or Flutter output directory, untracked in
+    /// HEAD and the index, is left out.
     BuildLayout {
         /// HEAD the tracked paths are read from.
         head: &'a str,
+        /// The only directories layout may be left out below, when given: verifying an archive
+        /// leaves out layout only below the directories its manifest records.
+        only: Option<BTreeSet<Vec<u8>>>,
     },
 }
 
 impl<'a> LeaveOut<'a> {
-    /// What verifying against `manifest` leaves out: build layout only for a format 3 archive.
+    /// What writing an archive at `head` leaves out: layout below every recognised directory.
+    fn everything(head: &'a str) -> Self {
+        Self::BuildLayout { head, only: None }
+    }
+
+    /// What verifying against `manifest` leaves out: for a format 3 archive, build layout below
+    /// the directories it records and nowhere else, so an archive written before a kind of
+    /// output was recognised still holds that output in its fingerprint and still verifies.
     fn for_manifest(manifest: &'a ArchiveManifest) -> Self {
         if manifest.build_output.is_some() {
             Self::BuildLayout {
                 head: &manifest.head,
+                only: Some(
+                    left_out_targets(manifest)
+                        .into_iter()
+                        .map(<[u8]>::to_vec)
+                        .collect(),
+                ),
             }
         } else {
             Self::Nothing
@@ -1029,28 +1046,26 @@ impl<'a> LeaveOut<'a> {
     }
 }
 
-/// Cargo build layout observed on disk.
+/// Build layout observed on disk.
 #[derive(Debug, Default)]
 struct Layout {
-    /// Recognised targets relative to the tree root, as raw bytes.
-    targets: Vec<Vec<u8>>,
-    /// Each left-out file, with the index of its target in [`Self::targets`] and its size.
-    files: BTreeMap<Vec<u8>, (usize, u64)>,
+    /// Each left-out file, with the directory it was left out below and its size.
+    files: BTreeMap<Vec<u8>, (Vec<u8>, u64)>,
+    /// The directories among them that are a Flutter app's output rather than a cargo target.
+    flutter: BTreeSet<Vec<u8>>,
 }
 
 impl Layout {
-    /// The record of what was left out, per target; `None` when nothing was.
+    /// The record of what was left out, per directory; `None` when nothing was.
     fn build_output(&self) -> Option<BuildOutput> {
-        let mut per_target = vec![(0u64, 0u64); self.targets.len()];
-        for (index, bytes) in self.files.values() {
-            per_target[*index].0 += 1;
-            per_target[*index].1 += bytes;
+        let mut per_directory: BTreeMap<&[u8], (u64, u64)> = BTreeMap::new();
+        for (directory, bytes) in self.files.values() {
+            let entry = per_directory.entry(directory).or_default();
+            entry.0 += 1;
+            entry.1 += bytes;
         }
-        let targets = self
-            .targets
-            .iter()
-            .zip(per_target)
-            .filter(|(_, (files, _))| *files > 0)
+        let targets = per_directory
+            .into_iter()
             .map(|(path, (files, bytes))| BuildOutputTarget {
                 path: String::from_utf8_lossy(path).into_owned(),
                 origin: BuildOutputOrigin::Archive,
@@ -1061,12 +1076,21 @@ impl Layout {
         BuildOutput::merged(None, targets)
     }
 
-    /// Paths of the targets something was left out below.
+    /// Paths of the directories something was left out below.
     fn used_targets(&self) -> BTreeSet<&[u8]> {
         self.files
             .values()
-            .map(|(index, _)| self.targets[*index].as_slice())
+            .map(|(directory, _)| directory.as_slice())
             .collect()
+    }
+
+    /// How a message names the layout below `directory`.
+    fn describe(&self, directory: &[u8]) -> String {
+        if self.flutter.contains(directory) {
+            format!("a Flutter app's output below {}", lossy(directory))
+        } else {
+            format!("cargo build layout below {}", lossy(directory))
+        }
     }
 }
 
@@ -1123,21 +1147,6 @@ fn facts_on_disk(worktree: &Path, target: &[u8]) -> TargetFacts {
     }
 }
 
-/// Every path HEAD or the tree's index tracks: such a file is never build layout.
-fn tracked_paths(worktree: &Path, head: &str) -> Result<BTreeSet<Vec<u8>>, Refusal> {
-    let indexed = ProcessGit::output_bytes(worktree, ["ls-files", "-z"])?;
-    let committed = ProcessGit::output_bytes(
-        worktree,
-        ["ls-tree", "-r", "-z", "--name-only", "--full-tree", head],
-    )?;
-    Ok(indexed
-        .split(|byte| *byte == 0)
-        .chain(committed.split(|byte| *byte == 0))
-        .filter(|path| !path.is_empty())
-        .map(<[u8]>::to_vec)
-        .collect())
-}
-
 /// Whether `target/prefix` below `worktree` is a cargo profile directory now.
 fn profile_on_disk(worktree: &Path, target: &[u8], prefix: &[u8]) -> bool {
     let mut directory = target.to_vec();
@@ -1146,26 +1155,121 @@ fn profile_on_disk(worktree: &Path, target: &[u8], prefix: &[u8]) -> bool {
     cache::cargo_profile(&worktree.join(OsStr::from_bytes(&directory)))
 }
 
-/// Which of `paths` are build layout below a target recognised on disk.
-fn observe_layout(worktree: &Path, head: &str, paths: &[Vec<u8>]) -> Result<Layout, Refusal> {
-    let targets = recognised_targets(worktree, paths)?;
-    if targets.is_empty() {
+/// Whether any of `paths` has an ancestor named like a Flutter app's output directory: only
+/// then can the one classifier recognise one, and only then are tracked paths read for it.
+fn names_flutter_output(paths: &[Vec<u8>]) -> bool {
+    paths.iter().any(|path| {
+        let mut components = path.split(|byte| *byte == b'/').collect::<Vec<_>>();
+        components.pop();
+        components
+            .into_iter()
+            .any(|component| FlutterOutputKind::named(component).is_some())
+    })
+}
+
+/// The build output directories of a tree as seen on disk: recognised cargo targets, and the
+/// observations the one classifier needs for a Flutter app's output.
+struct Recognised<'a> {
+    worktree: &'a Path,
+    /// Recognised cargo targets, restricted to `only` when given.
+    targets: Vec<Vec<u8>>,
+    /// Every path HEAD or the index tracks.
+    tracked: BTreeSet<Vec<u8>>,
+    /// The only directories that count, when given.
+    only: Option<BTreeSet<Vec<u8>>>,
+}
+
+impl<'a> Recognised<'a> {
+    /// Observe the directories `paths` may be build layout below, at `head`.
+    fn observe(
+        worktree: &'a Path,
+        head: &str,
+        paths: &[Vec<u8>],
+        only: Option<&BTreeSet<Vec<u8>>>,
+    ) -> Result<Self, Refusal> {
+        let mut targets = recognised_targets(worktree, paths)?;
+        if let Some(only) = only {
+            targets.retain(|target| only.contains(target));
+        }
+        let flutter = names_flutter_output(paths);
+        let tracked = if targets.is_empty() && !flutter {
+            BTreeSet::new()
+        } else {
+            cache::head_or_index_paths(worktree, head)?
+        };
+        Ok(Self {
+            worktree,
+            targets,
+            tracked,
+            only: only.cloned(),
+        })
+    }
+
+    /// The outermost directory `path` is build layout below, observed on disk now, and whether
+    /// it is a Flutter app's output. `facts`, `profile` and `flutter` may memoise their
+    /// observations.
+    fn directory_of(
+        &self,
+        path: &[u8],
+        facts: impl FnMut(&[u8]) -> TargetFacts,
+        profile: impl FnMut(&[u8], &[u8]) -> bool,
+        mut flutter: impl FnMut(&[u8], &[u8]) -> Option<FlutterFacts>,
+    ) -> Option<(Vec<u8>, bool)> {
+        if self.tracked.contains(path) {
+            return None;
+        }
+        let cargo = layout_target(path, &self.targets, facts, profile)
+            .map(|index| self.targets[index].as_slice());
+        let output = flutter_output(path, |directory, manifest| {
+            if self
+                .only
+                .as_ref()
+                .is_some_and(|only| !only.contains(directory))
+            {
+                return None;
+            }
+            flutter(directory, manifest)
+        });
+        let directory = outermost_build_directory(cargo, output)?;
+        Some((directory.to_vec(), output == Some(directory)))
+    }
+
+    /// The same, observed afresh with nothing memoised.
+    fn directory_now(&self, path: &[u8]) -> Option<(Vec<u8>, bool)> {
+        self.directory_of(
+            path,
+            |target| facts_on_disk(self.worktree, target),
+            |target, prefix| profile_on_disk(self.worktree, target, prefix),
+            |directory, manifest| {
+                cache::flutter_facts(self.worktree, directory, manifest, &self.tracked)
+            },
+        )
+    }
+}
+
+/// Which of `paths` are build layout below a directory recognised on disk, restricted to `only`
+/// when given.
+fn observe_layout(
+    worktree: &Path,
+    head: &str,
+    paths: &[Vec<u8>],
+    only: Option<&BTreeSet<Vec<u8>>>,
+) -> Result<Layout, Refusal> {
+    let recognised = Recognised::observe(worktree, head, paths, only)?;
+    if recognised.targets.is_empty() && !names_flutter_output(paths) {
         return Ok(Layout::default());
     }
-    let tracked = tracked_paths(worktree, head)?;
-    let facts = targets
+    let facts = recognised
+        .targets
         .iter()
         .map(|target| (target.clone(), facts_on_disk(worktree, target)))
         .collect::<BTreeMap<_, _>>();
     let mut profiles: BTreeMap<Vec<u8>, bool> = BTreeMap::new();
-    let mut files = BTreeMap::new();
+    let mut outputs: BTreeMap<Vec<u8>, Option<FlutterFacts>> = BTreeMap::new();
+    let mut layout = Layout::default();
     for path in paths {
-        if tracked.contains(path) {
-            continue;
-        }
-        let target = layout_target(
+        let found = recognised.directory_of(
             path,
-            &targets,
             |target| facts[target],
             |target, prefix| {
                 let mut key = target.to_vec();
@@ -1175,15 +1279,25 @@ fn observe_layout(worktree: &Path, head: &str, paths: &[Vec<u8>]) -> Result<Layo
                     .entry(key)
                     .or_insert_with(|| profile_on_disk(worktree, target, prefix))
             },
+            |directory, manifest| {
+                *outputs.entry(directory.to_vec()).or_insert_with(|| {
+                    cache::flutter_facts(worktree, directory, manifest, &recognised.tracked)
+                })
+            },
         );
-        if let Some(index) = target {
+        if let Some((directory, flutter)) = found {
             let absolute = worktree.join(OsStr::from_bytes(path));
             let metadata = std::fs::symlink_metadata(&absolute)
                 .map_err(|error| io_refusal("worktree-state-unreadable", &absolute, &error))?;
-            files.insert(path.clone(), (index, metadata.len()));
+            if flutter {
+                layout.flutter.insert(directory.clone());
+            }
+            layout
+                .files
+                .insert(path.clone(), (directory, metadata.len()));
         }
     }
-    Ok(Layout { targets, files })
+    Ok(layout)
 }
 
 /// The tree id of the on-disk content outside every nested repository root and whatever
@@ -1201,7 +1315,9 @@ fn capture(
     let (mut paths, roots) = list_files(worktree, scratch, None)?;
     let layout = match leave_out {
         LeaveOut::Nothing => Layout::default(),
-        LeaveOut::BuildLayout { head } => observe_layout(worktree, head, &paths)?,
+        LeaveOut::BuildLayout { head, only } => {
+            observe_layout(worktree, head, &paths, only.as_ref())?
+        }
     };
     paths.retain(|path| !layout.files.contains_key(path));
     let entries = hash_files(worktree, scratch, paths, write)?;
@@ -1404,7 +1520,7 @@ pub(crate) fn write(request: &ArchiveRequest<'_>) -> Result<ArchiveEvidence, Ref
         )?)
     };
     // Fingerprint every archive, even of a tree Git reports clean: status can be told not to look.
-    // Cargo build layout is left out: the next build recreates it from tracked sources.
+    // Build layout, cargo's or a Flutter app's, is left out: the next build recreates it.
     let (worktree_tree, patch, roots, build_output) =
         write_patch(worktree, head, staging.path(), &scratch)?;
     let nested_repositories = write_images(worktree, head, &roots, staging.path())?;
@@ -1430,7 +1546,7 @@ pub(crate) fn write(request: &ArchiveRequest<'_>) -> Result<ArchiveEvidence, Ref
     // repositories, each re-walked to its recorded fingerprint.
     let after = ProcessGit.worktree_snapshot(repository, worktree)?;
     let (after_tree, _, after_roots, _) =
-        capture(worktree, &scratch, false, LeaveOut::BuildLayout { head })?;
+        capture(worktree, &scratch, false, LeaveOut::everything(head))?;
     if after.head != head
         || after_tree != manifest.worktree_tree
         || !nested_state_matches(&manifest, worktree, &after_roots)?
@@ -1500,7 +1616,7 @@ fn write_bundle(
     describe(staging, ARCHIVE_BUNDLE_FILE)
 }
 
-/// Fingerprint the tree's content outside every nested repository and its cargo build layout and,
+/// Fingerprint the tree's content outside every nested repository and its build layout and,
 /// when it differs from HEAD, write and verify the binary patch that recreates it over HEAD. Also
 /// return the nested repository roots the fingerprint excludes and the build layout it left out.
 fn write_patch(
@@ -1517,8 +1633,7 @@ fn write_patch(
     ),
     Refusal,
 > {
-    let (tree, _, roots, layout) =
-        capture(worktree, scratch, true, LeaveOut::BuildLayout { head })?;
+    let (tree, _, roots, layout) = capture(worktree, scratch, true, LeaveOut::everything(head))?;
     let build_output = layout.build_output();
     let head_tree = ProcessGit::output(worktree, ["rev-parse", &format!("{head}^{{tree}}")])?;
     if head_tree.trim() == tree {
@@ -1673,10 +1788,11 @@ pub(crate) fn verify(
 }
 
 /// Refuse a linked tree whose complete on-disk content is not the archived state: the fingerprint
-/// outside the nested repositories and, for a format 3 archive, outside the cargo build layout,
-/// and each nested repository's image and fingerprint. Layout below a target the archive did not
-/// leave out is refused too. Return the outer fingerprint with the per-file entries it was
-/// computed from.
+/// outside the nested repositories and, for a format 3 archive, outside the build layout below the
+/// directories it records, and each nested repository's image and fingerprint. Layout below a
+/// directory the archive did not record stays in the fingerprint, so it refuses; the refusal names
+/// that directory when one is recognised now. Return the outer fingerprint with the per-file
+/// entries it was computed from.
 fn require_state(
     manifest: &ArchiveManifest,
     archive: &Path,
@@ -1686,69 +1802,74 @@ fn require_state(
         require_file(archive, patch, ARCHIVE_PATCH_FILE)?;
     }
     let scratch = Scratch::new(worktree, archive.parent().unwrap_or(archive))?;
-    let (tree, entries, roots, layout) =
+    let (tree, entries, roots, _) =
         capture(worktree, &scratch, false, LeaveOut::for_manifest(manifest))?;
     if tree != manifest.worktree_tree {
+        if manifest.build_output.is_some() {
+            let recorded = left_out_targets(manifest);
+            let (paths, _) = list_files(worktree, &scratch, None)?;
+            let layout = observe_layout(worktree, &manifest.head, &paths, None)?;
+            if let Some(other) = layout
+                .used_targets()
+                .into_iter()
+                .find(|target| !recorded.contains(*target))
+            {
+                return Err(Refusal::new(
+                    "archive-stale",
+                    format!(
+                        "{} was not left out by {}; rerun `worktree archive --replace`",
+                        layout.describe(other),
+                        archive.display()
+                    ),
+                ));
+            }
+        }
         return Err(stale_state(archive));
-    }
-    let recorded = left_out_targets(manifest);
-    if let Some(other) = layout
-        .used_targets()
-        .into_iter()
-        .find(|target| !recorded.contains(*target))
-    {
-        return Err(Refusal::new(
-            "archive-stale",
-            format!(
-                "cargo build layout below {} was not left out by {}; rerun `worktree archive \
-                 --replace`",
-                lossy(other),
-                archive.display()
-            ),
-        ));
     }
     require_images(manifest, archive, worktree, &roots)?;
     Ok((tree, entries, scratch))
 }
 
-/// The recognised targets whose build layout an archive left out, re-observed on disk.
+/// The recognised directories whose build layout an archive left out, re-observed on disk.
 struct LeftOut<'a> {
-    worktree: &'a Path,
-    /// Targets recognised now that the archive's manifest names.
-    targets: Vec<Vec<u8>>,
+    /// The tree's directories recognised now, restricted to those the manifest records.
+    recognised: Option<Recognised<'a>>,
 }
 
 impl<'a> LeftOut<'a> {
-    /// Recognise the tree's targets now, keeping those `manifest` left layout out below. A format
-    /// 1 or 2 archive left nothing out.
+    /// Recognise the tree's build output directories now, keeping those `manifest` left layout
+    /// out below. A format 1 or 2 archive left nothing out.
     fn observe(
         manifest: &ArchiveManifest,
         worktree: &'a Path,
         paths: &[Vec<u8>],
     ) -> Result<Self, Refusal> {
-        let recorded = left_out_targets(manifest);
-        let targets = if recorded.is_empty() {
-            Vec::new()
+        let recorded = left_out_targets(manifest)
+            .into_iter()
+            .map(<[u8]>::to_vec)
+            .collect::<BTreeSet<_>>();
+        let recognised = if recorded.is_empty() {
+            None
         } else {
-            recognised_targets(worktree, paths)?
-                .into_iter()
-                .filter(|target| recorded.contains(target.as_slice()))
-                .collect()
+            Some(Recognised::observe(
+                worktree,
+                &manifest.head,
+                paths,
+                Some(&recorded),
+            )?)
         };
-        Ok(Self { worktree, targets })
+        Ok(Self { recognised })
     }
 
-    /// The target `path` is build layout below, observed on disk now.
-    fn target_of(&self, path: &[u8]) -> Option<usize> {
-        layout_target(
-            path,
-            &self.targets,
-            |target| facts_on_disk(self.worktree, target),
-            |target, prefix| profile_on_disk(self.worktree, target, prefix),
-        )
+    /// The recorded directory `path` is build layout below, observed on disk now.
+    fn target_of(&self, path: &[u8]) -> Option<Vec<u8>> {
+        self.recognised
+            .as_ref()
+            .and_then(|recognised| recognised.directory_now(path))
+            .map(|(directory, _)| directory)
     }
 
-    /// Split untracked paths into build layout, each with its target, and everything else.
+    /// Split untracked paths into build layout, each with its directory, and everything else.
     fn split(&self, paths: Vec<Vec<u8>>) -> (LayoutPaths, Vec<Vec<u8>>) {
         let mut layout = Vec::new();
         let mut others = Vec::new();
@@ -1762,21 +1883,30 @@ impl<'a> LeftOut<'a> {
     }
 
     /// Delete each layout file as cache, re-observed immediately before deletion: still a file or
-    /// symlink below a layout name or profile of the same target. Anything else refuses.
+    /// symlink that is build layout below the same recorded directory, recognised now. Anything
+    /// else refuses.
     fn delete(
         &self,
         layout: LayoutPaths,
         changed: &dyn Fn(&[u8]) -> Refusal,
     ) -> Result<(), Refusal> {
+        let Some(recognised) = &self.recognised else {
+            return match layout.first() {
+                Some((relative, _)) => Err(changed(relative)),
+                None => Ok(()),
+            };
+        };
         for (relative, target) in layout {
-            let path = self.worktree.join(OsStr::from_bytes(&relative));
+            let path = recognised.worktree.join(OsStr::from_bytes(&relative));
             let kind = std::fs::symlink_metadata(&path)
                 .map_err(|error| io_refusal("worktree-state-unreadable", &path, &error))?
                 .file_type();
-            if !(kind.is_file() || kind.is_symlink()) || self.target_of(&relative) != Some(target) {
+            if !(kind.is_file() || kind.is_symlink())
+                || self.target_of(&relative).as_ref() != Some(&target)
+            {
                 return Err(changed(&relative));
             }
-            make_parents_owner_writable(self.worktree, &relative)?;
+            make_parents_owner_writable(recognised.worktree, &relative)?;
             std::fs::remove_file(&path)
                 .map_err(|error| io_refusal("archive-discard-failed", &path, &error))?;
         }

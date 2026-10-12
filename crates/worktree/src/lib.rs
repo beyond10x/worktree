@@ -652,7 +652,7 @@ where
         Ok(ArchivePruneReport::new(apply, archives, skipped))
     }
 
-    /// Assess every archive in scope for cargo build layout in its patch and, with `apply`,
+    /// Assess every archive in scope for build layout in its patch and, with `apply`,
     /// rewrite the selected strippable ones (`worktree.archive.ArchiveStripAssessment`).
     ///
     /// Selection is exactly [`Self::prune_archives`]'s, and `apply` requires `selected`. Each

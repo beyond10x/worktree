@@ -1,7 +1,8 @@
-//! Cargo build layout an archive leaves out, and the strip of it from an archive written before.
+//! Build layout an archive leaves out, and the strip of it from an archive written before.
 //!
-//! An archive holds what no remote recovers. Cargo's own build layout is recreated from tracked
-//! sources by the next build, so `archive` leaves it out of `dirty.patch` and the fingerprint and
+//! An archive holds what no remote recovers. Cargo's own build layout and a Flutter app's output
+//! are recreated from tracked sources by the next build, so `archive` leaves them out of
+//! `dirty.patch` and the fingerprint and
 //! records what it left out (`worktree.archive.BuildOutputTarget`), and `prune-archives
 //! --strip-build-output` removes it from an existing patch. Every decision here is I/O-free: the
 //! Git adapter observes the disk or streams the patch and asks.
@@ -15,10 +16,11 @@
 //! a Cargo-signed `T/CACHEDIR.TAG` or `T/<p>/.fingerprint/…`. A section that is not a pure addition
 //! of an untracked path, or whose path another section names too, is never stripped.
 //!
-//! The strip alone also recognises a Flutter app's output ([`FlutterOutputKind`]): `P/build/` and
-//! `P/.dart_tool/` beside a `pubspec.yaml` HEAD's tree holds or the patch purely adds, where HEAD
-//! holds nothing at that path. Everything strictly below one is build layout. `archive` and
-//! `discard-cache` stay cargo-only.
+//! A Flutter app's output ([`FlutterOutputKind`]) is `P/build/` and `P/.dart_tool/` beside a
+//! `pubspec.yaml`, where nothing is tracked at that path. One classifier
+//! ([`flutter_output_kind`]) decides it for `archive`, `discard-cache` and the strip, from
+//! observations each caller supplies ([`FlutterFacts`]): the disk and the index, or HEAD's tree and
+//! the patch. Every untracked file strictly below one is build layout.
 
 use crate::{
     ARCHIVE_PATCH_FILE, ArchiveContents, ArchiveEntryKind, ArchiveManifest, CACHEDIR_TAG_FILE,
@@ -28,7 +30,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
-/// Independent, immutable manifest format identifier of an archive that left cargo build layout
+/// Independent, immutable manifest format identifier of an archive that left build layout
 /// out, recorded in [`ArchiveManifest::build_output`]. It may also image nested repositories.
 pub const ARCHIVE_FORMAT_V3: &str = "worktree.archive/3";
 
@@ -49,11 +51,11 @@ pub const CARGO_LAYOUT_NAMES: [&str; 5] = [
 /// The file whose presence beside them makes `build/` and `.dart_tool/` a Flutter app's output.
 pub const FLUTTER_MANIFEST: &str = "pubspec.yaml";
 
-/// The output directories of a Flutter app that `prune-archives --strip-build-output` recognises
-/// in an existing patch (`worktree.archive.FlutterOutputKind`). `P/<name>` is one only when HEAD's
-/// tree holds `P/pubspec.yaml` as anything but a directory or the patch purely adds it, and HEAD's
-/// tree holds nothing at `P/<name>`. `archive` and `discard-cache` do not recognise these
-/// directories.
+/// The output directories of a Flutter app (`worktree.archive.FlutterOutputKind`), recognised by
+/// one classifier ([`flutter_output_kind`]) for `archive`, `finish --archive`, `discard-cache` and
+/// `prune-archives --strip-build-output`. `P/<name>` is one only when `P/pubspec.yaml` is present
+/// beside it as anything but a directory and nothing is tracked at `P/<name>`; on disk it must
+/// also be a real directory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum FlutterOutputKind {
     /// `P/build/`, the output of `flutter build` and `flutter test`.
@@ -82,17 +84,20 @@ impl FlutterOutputKind {
     }
 }
 
-/// How a left-out file was found to be cargo build layout (`worktree.archive.BuildOutputOrigin`).
+/// How a left-out file was found to be build layout (`worktree.archive.BuildOutputOrigin`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum BuildOutputOrigin {
-    /// `archive` observed it on disk below a target `discard-cache` recognises.
+    /// `archive` observed it on disk below a target `discard-cache` recognises, or below a
+    /// Flutter app's output directory.
     Archive,
     /// `prune-archives --strip-build-output` removed its section from an existing patch.
     Strip,
 }
 
-/// Build layout left out below one cargo target (`worktree.archive.BuildOutputTarget`).
+/// Build layout left out below one cargo target or Flutter output directory
+/// (`worktree.archive.BuildOutputTarget`). No field says which: removal re-recognises the
+/// recorded directory on disk.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BuildOutputTarget {
@@ -587,36 +592,84 @@ impl PatchTargets {
     }
 }
 
-/// The outermost Flutter output directory (`worktree.archive.FlutterOutputKind`) strictly below
-/// which `path` lies, if any: an ancestor `P/build` or `P/.dart_tool` of a UTF-8 relative path
-/// such that HEAD's tree holds nothing at it, and HEAD's tree holds `P/pubspec.yaml` as anything
-/// but a directory or `added_manifests` (the `pubspec.yaml` files the patch purely adds) names
-/// it. `P` may be the tree root. `head` is the scanned patch, read here only for the paths of
-/// HEAD's tree.
-fn flutter_output<'a>(
-    path: &'a [u8],
-    head: &ScannedPatch,
-    added_manifests: &BTreeSet<&[u8]>,
-) -> Option<&'a [u8]> {
-    let mut start = 0;
-    for (at, _) in path.iter().enumerate().filter(|(_, byte)| **byte == b'/') {
-        let directory = &path[..at];
-        let name = &path[start..at];
-        start = at + 1;
-        if FlutterOutputKind::named(name).is_none()
-            || head.head_holds(directory)
-            || !std::str::from_utf8(directory).is_ok_and(relative_path)
-            || path_below(path, directory).is_none()
-        {
-            continue;
-        }
-        let mut manifest = directory[..directory.len() - name.len()].to_vec();
-        manifest.extend_from_slice(FLUTTER_MANIFEST.as_bytes());
-        if head.head_files.contains(&manifest) || added_manifests.contains(manifest.as_slice()) {
-            return Some(directory);
-        }
+/// What a caller observed of one candidate Flutter output directory `P/<name>`, the input of the
+/// one classifier ([`flutter_output_kind`]). Only the source differs: `archive` and
+/// `discard-cache` observe the disk and the index, the strip observes HEAD's tree and the patch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FlutterFacts {
+    /// `P/pubspec.yaml` is present beside the directory as anything but a directory: on disk a
+    /// regular file, tracked or not; for the strip, a path HEAD's tree holds as anything but a
+    /// directory, or a `pubspec.yaml` the patch purely adds.
+    pub manifest_beside: bool,
+    /// Something is tracked at the directory's path, as a file or a directory: on disk, HEAD's
+    /// tree or the index holds the path or anything below it; for the strip, HEAD's tree holds
+    /// it.
+    pub tracked: bool,
+}
+
+impl FlutterFacts {
+    /// Whether these observations make the directory a Flutter app's output.
+    pub fn recognises(self) -> bool {
+        self.manifest_beside && !self.tracked
     }
-    None
+}
+
+/// Whether `directory`, a path relative to the tree root, is a Flutter app's output directory
+/// (`worktree.archive.FlutterOutputKind`), and which.
+///
+/// `directory` must be a UTF-8 relative path whose last component is `build` or `.dart_tool`;
+/// its parent `P` is the app root, the tree root included. `observe(directory, manifest)` reports
+/// what its caller's source shows of `directory` and of `manifest`, `P/pubspec.yaml`, or `None`
+/// when that source holds no such directory at all (on disk: a symbolic link or anything but a
+/// real directory). It is called only for a candidate that passed the name and path checks.
+pub fn flutter_output_kind(
+    directory: &[u8],
+    observe: impl FnOnce(&[u8], &[u8]) -> Option<FlutterFacts>,
+) -> Option<FlutterOutputKind> {
+    let name = directory
+        .rsplit(|byte| *byte == b'/')
+        .next()
+        .unwrap_or(directory);
+    let kind = FlutterOutputKind::named(name)?;
+    if !std::str::from_utf8(directory).is_ok_and(relative_path) {
+        return None;
+    }
+    let mut manifest = directory[..directory.len() - name.len()].to_vec();
+    manifest.extend_from_slice(FLUTTER_MANIFEST.as_bytes());
+    observe(directory, &manifest)
+        .is_some_and(FlutterFacts::recognises)
+        .then_some(kind)
+}
+
+/// The outermost Flutter output directory ([`flutter_output_kind`]) strictly below which `path`
+/// lies, if any. Every ancestor of `path` named `build` or `.dart_tool` is a candidate, outermost
+/// first, and `observe` is asked about each in turn.
+pub fn flutter_output(
+    path: &[u8],
+    mut observe: impl FnMut(&[u8], &[u8]) -> Option<FlutterFacts>,
+) -> Option<&[u8]> {
+    path.iter()
+        .enumerate()
+        .filter(|(_, byte)| **byte == b'/')
+        .map(|(at, _)| &path[..at])
+        .filter(|directory| path_below(path, directory).is_some())
+        .find(|directory| flutter_output_kind(directory, &mut observe).is_some())
+}
+
+/// Of the cargo target and the Flutter output directory a path lies below, the outer one: both
+/// are its ancestors, so the shorter is the outer.
+pub fn outermost_build_directory<'a>(
+    cargo: Option<&'a [u8]>,
+    flutter: Option<&'a [u8]>,
+) -> Option<&'a [u8]> {
+    match (cargo, flutter) {
+        (Some(cargo), Some(flutter)) => Some(if flutter.len() < cargo.len() {
+            flutter
+        } else {
+            cargo
+        }),
+        (cargo, flutter) => cargo.or(flutter),
+    }
 }
 
 /// Decide which sections of a patch are build layout: cargo's or a Flutter app's.
@@ -690,16 +743,16 @@ pub fn plan_patch_strip(patch: &ScannedPatch) -> PatchStripPlan {
                     |target, prefix| recognised.profile(target, prefix),
                 )
                 .map(|index| targets[index].as_slice());
-                let flutter = flutter_output(path, patch, &added_manifests);
-                // Both are ancestors of `path`, so the shorter one is the outer one.
-                match (cargo, flutter) {
-                    (Some(cargo), Some(flutter)) => Some(if flutter.len() < cargo.len() {
-                        flutter
-                    } else {
-                        cargo
-                    }),
-                    (cargo, flutter) => cargo.or(flutter),
-                }
+                // The patch's observations: HEAD's tree read from Git, and the manifests the
+                // patch purely adds.
+                let flutter = flutter_output(path, |directory, manifest| {
+                    Some(FlutterFacts {
+                        manifest_beside: patch.head_files.contains(manifest)
+                            || added_manifests.contains(manifest),
+                        tracked: patch.head_holds(directory),
+                    })
+                });
+                outermost_build_directory(cargo, flutter)
             });
         plan.strip.push(target.is_some());
         if let Some(target) = target {
@@ -1214,6 +1267,202 @@ mod tests {
             Some(FlutterOutputKind::DartTool)
         );
         assert_eq!(FlutterOutputKind::named(b"target"), None);
+    }
+
+    /// A tree as `archive` and `discard-cache` would observe it on disk: the regular files and
+    /// real directories present, and every path HEAD or the index tracks.
+    struct Disk {
+        files: BTreeSet<Vec<u8>>,
+        directories: BTreeSet<Vec<u8>>,
+        tracked: BTreeSet<Vec<u8>>,
+    }
+
+    impl Disk {
+        fn new(files: &[&str], directories: &[&str], tracked: &[&str]) -> Self {
+            let set = |paths: &[&str]| paths.iter().map(|path| path.as_bytes().to_vec()).collect();
+            Self {
+                files: set(files),
+                directories: set(directories),
+                tracked: set(tracked),
+            }
+        }
+
+        /// The observations `archive` supplies: `None` unless `directory` is a real directory;
+        /// the manifest as a regular file; anything tracked at or below the directory.
+        fn observe(&self, directory: &[u8], manifest: &[u8]) -> Option<FlutterFacts> {
+            self.directories.contains(directory).then(|| FlutterFacts {
+                manifest_beside: self.files.contains(manifest),
+                tracked: self.tracked.iter().any(|path| {
+                    path.as_slice() == directory || path_below(path, directory).is_some()
+                }),
+            })
+        }
+    }
+
+    /// The same classifier decides a Flutter app's output from on-disk observations and from a
+    /// patch's; only the source of the observations differs, and both agree on the same tree.
+    #[test]
+    fn one_classifier_decides_flutter_output_for_disk_and_patch() {
+        // HEAD: an app at the root and one in `app/`, with a tracked source directory `tool/build`
+        // beside `tool/pubspec.yaml`.
+        let head_files = [
+            "pubspec.yaml",
+            "lib/main.dart",
+            "app/pubspec.yaml",
+            "tool/pubspec.yaml",
+            "tool/build/build.yaml",
+        ];
+        let head_directories = ["lib", "app", "tool", "tool/build"];
+        let untracked = [
+            "build/app/outputs/app-release.apk",
+            ".dart_tool/package_config.json",
+            "app/build/web/main.dart.js",
+            "app/.dart_tool/version",
+            "tool/build/generated.dart",
+            "other/build/out.bin",
+            "notes.txt",
+        ];
+        let expected: [Option<&str>; 7] = [
+            Some("build"),
+            Some(".dart_tool"),
+            Some("app/build"),
+            Some("app/.dart_tool"),
+            None,
+            None,
+            None,
+        ];
+
+        let mut directories = head_directories.to_vec();
+        directories.extend([
+            "build",
+            "build/app",
+            "build/app/outputs",
+            ".dart_tool",
+            "app/build",
+            "app/build/web",
+            "app/.dart_tool",
+            "other",
+            "other/build",
+        ]);
+        let mut files = head_files.to_vec();
+        files.extend(untracked);
+        let disk = Disk::new(&files, &directories, &head_files);
+        for (path, expected) in untracked.iter().zip(expected) {
+            let on_disk = flutter_output(path.as_bytes(), |directory, manifest| {
+                disk.observe(directory, manifest)
+            });
+            assert_eq!(on_disk, expected.map(str::as_bytes), "disk: {path}");
+        }
+
+        let sections = untracked
+            .iter()
+            .map(|path| section(path, true))
+            .collect::<Vec<_>>();
+        let plan = plan_over_head(&sections, &head_files, &head_directories);
+        let stripped = expected.map(|target| target.is_some());
+        assert_eq!(plan.strip, stripped, "{plan:?}");
+        assert_eq!(
+            plan.targets,
+            [
+                strip_target(".dart_tool", 1),
+                strip_target("app/.dart_tool", 1),
+                strip_target("app/build", 1),
+                strip_target("build", 1),
+            ]
+        );
+
+        // The directory itself, as `discard-cache` asks of an ignored entry.
+        let kind = |directory: &str| {
+            flutter_output_kind(directory.as_bytes(), |directory, manifest| {
+                disk.observe(directory, manifest)
+            })
+        };
+        assert_eq!(kind("build"), Some(FlutterOutputKind::Build));
+        assert_eq!(kind("app/.dart_tool"), Some(FlutterOutputKind::DartTool));
+        assert_eq!(kind("tool/build"), None, "tracked source directory");
+        assert_eq!(kind("other/build"), None, "no pubspec.yaml beside it");
+        assert_eq!(kind("app"), None, "not an output name");
+
+        // On disk a symbolic link named `build` is no real directory, so no observation exists.
+        let linked = Disk::new(&["pubspec.yaml"], &[], &["pubspec.yaml"]);
+        assert_eq!(
+            flutter_output(b"build/out.bin", |directory, manifest| linked
+                .observe(directory, manifest)),
+            None
+        );
+    }
+
+    /// Without `pubspec.yaml` beside it, as anything but a directory, a `build/` or `.dart_tool/`
+    /// is an ordinary directory, whatever the source of the observations.
+    #[test]
+    fn a_build_directory_with_no_pubspec_beside_is_not_flutter_output() {
+        // On disk: no manifest, one only above or below, or a manifest that is a directory.
+        let disk = Disk::new(
+            &["pubspec.yaml", "app/lib/pubspec.yaml"],
+            &[
+                "app",
+                "app/build",
+                "app/lib",
+                "tool",
+                "tool/pubspec.yaml",
+                "tool/build",
+                "build",
+            ],
+            &["pubspec.yaml"],
+        );
+        for path in [
+            "app/build/out.bin",
+            "app/lib/x/build/out.bin",
+            "tool/build/out.bin",
+        ] {
+            assert_eq!(
+                flutter_output(path.as_bytes(), |directory, manifest| disk
+                    .observe(directory, manifest)),
+                None,
+                "{path}"
+            );
+        }
+        for directory in ["app/build", "tool/build"] {
+            assert_eq!(
+                flutter_output_kind(directory.as_bytes(), |directory, manifest| disk
+                    .observe(directory, manifest)),
+                None,
+                "{directory}"
+            );
+        }
+        // The root app's `build` does have one beside it.
+        assert_eq!(
+            flutter_output(b"build/out.bin", |directory, manifest| disk
+                .observe(directory, manifest)),
+            Some(&b"build"[..])
+        );
+
+        // The classifier never asks about a path that is not below an output name, and a
+        // manifest observed absent decides it whatever else holds.
+        let mut asked = Vec::new();
+        let absent = flutter_output(b"src/build/x/.dart_tool/y", |directory, _| {
+            asked.push(directory.to_vec());
+            Some(FlutterFacts {
+                manifest_beside: false,
+                tracked: false,
+            })
+        });
+        assert_eq!(absent, None);
+        assert_eq!(
+            asked,
+            [b"src/build".to_vec(), b"src/build/x/.dart_tool".to_vec()]
+        );
+
+        // In a patch: no `pubspec.yaml` in HEAD or added beside it.
+        let plan = plan_over_head(
+            &[
+                section("build/out.bin", true),
+                section("app/build/out.bin", true),
+            ],
+            &["README.md", "app/lib/pubspec.yaml"],
+            &["app", "app/lib"],
+        );
+        assert_eq!(plan.strip, [false, false], "{plan:?}");
     }
 
     #[test]

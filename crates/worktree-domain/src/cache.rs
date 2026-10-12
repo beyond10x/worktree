@@ -92,6 +92,11 @@ pub enum CacheKind {
     /// `tmp/` directly below a tagged Cargo target that holds a profile: Cargo's
     /// `CARGO_TARGET_TMPDIR`, which test binaries fill with scratch, whatever it holds.
     CargoTargetTmp,
+    /// A real `P/build/` or `P/.dart_tool/` that the one build-output classifier
+    /// ([`crate::flutter_output_kind`]) recognises as a Flutter app's output: `P/pubspec.yaml` is
+    /// a regular file beside it, and neither HEAD's tree nor the index holds anything at or below
+    /// it.
+    FlutterOutput,
     /// `node_modules` at or below a directory holding a tracked lockfile.
     NodeModules,
     /// A directory holding `pyvenv.cfg` beside, or at the root of, a tracked Python manifest.

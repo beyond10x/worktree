@@ -8,8 +8,9 @@ use crate::ProcessGit;
 use b10x_worktree_domain::{
     CACHEDIR_TAG_FILE, CACHEDIR_TAG_SIGNATURE, CARGO_MANIFEST, CARGO_PROFILE_DEPS,
     CARGO_PROFILE_MARKER, CARGO_TARGET_METADATA, CARGO_TARGET_TMP, CARGO_UNTAGGED_TARGET,
-    CacheClassification, CacheKind, DiscardedCache, NODE_LOCKFILES, PYTHON_MANIFESTS,
-    PYTHON_VIRTUALENV_MARKER, Refusal, TAGGED_TOOL_CACHES, is_cache_tag,
+    CacheClassification, CacheKind, DiscardedCache, FlutterFacts, FlutterOutputKind,
+    NODE_LOCKFILES, PYTHON_MANIFESTS, PYTHON_VIRTUALENV_MARKER, Refusal, TAGGED_TOOL_CACHES,
+    flutter_output_kind, is_cache_tag,
 };
 use std::collections::BTreeSet;
 use std::io::Read as _;
@@ -102,10 +103,11 @@ fn classify_tree(worktree: &Path) -> Result<Plan, Refusal> {
         ],
     )?;
     let tracked = tracked_paths(worktree)?;
+    let mut committed = None;
     let mut plan = Plan::default();
     for (relative, directory) in ignored_entries(&status)? {
         if directory {
-            classify(worktree, &relative, &tracked, &mut plan)?;
+            classify(worktree, &relative, &tracked, &mut committed, &mut plan)?;
         } else {
             plan.retained.push(relative);
         }
@@ -194,10 +196,13 @@ pub(crate) fn tracked_paths(worktree: &Path) -> Result<BTreeSet<PathBuf>, Refusa
         .collect()
 }
 
+/// Classify one ignored directory. `committed` holds, once a candidate needs it, every path HEAD
+/// or the index tracks ([`head_or_index_paths`]).
 fn classify(
     worktree: &Path,
     relative: &Path,
     tracked: &BTreeSet<PathBuf>,
+    committed: &mut Option<BTreeSet<Vec<u8>>>,
     plan: &mut Plan,
 ) -> Result<(), Refusal> {
     let path = worktree.join(relative);
@@ -237,6 +242,10 @@ fn classify(
                 plan.discarded.extend(inner.discarded);
                 plan.retained.extend(inner.retained);
             }
+            TargetShape::NotCargo(_) if flutter_output(worktree, relative, committed)? => {
+                plan.discarded
+                    .push((relative.to_path_buf(), CacheKind::FlutterOutput));
+            }
             TargetShape::NotCargo(children) if children.is_empty() => {
                 plan.retained.push(relative.to_path_buf());
             }
@@ -244,8 +253,90 @@ fn classify(
         }
         return Ok(());
     }
+    if flutter_output(worktree, relative, committed)? {
+        plan.discarded
+            .push((relative.to_path_buf(), CacheKind::FlutterOutput));
+        return Ok(());
+    }
     plan.retained.push(relative.to_path_buf());
     Ok(())
+}
+
+/// Whether the ignored directory `relative` is a Flutter app's output by the one build-output
+/// classifier ([`flutter_output_kind`]), observed on disk. HEAD's and the index's paths are read
+/// into `committed` only for a directory whose name could make it one.
+fn flutter_output(
+    worktree: &Path,
+    relative: &Path,
+    committed: &mut Option<BTreeSet<Vec<u8>>>,
+) -> Result<bool, Refusal> {
+    let Some(directory) = relative.to_str().map(str::as_bytes) else {
+        return Ok(false);
+    };
+    let named = relative
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| FlutterOutputKind::named(name.as_bytes()).is_some());
+    if !named {
+        return Ok(false);
+    }
+    let committed = match committed {
+        Some(paths) => paths,
+        None => committed.insert(head_or_index_paths(worktree, "HEAD")?),
+    };
+    Ok(flutter_output_kind(directory, |directory, manifest| {
+        flutter_facts(worktree, directory, manifest, committed)
+    })
+    .is_some())
+}
+
+/// Every path HEAD's tree (`head`) or the tree's index tracks, as raw bytes: such a file is
+/// never build layout, and a directory holding one is no Flutter output.
+pub(crate) fn head_or_index_paths(
+    worktree: &Path,
+    head: &str,
+) -> Result<BTreeSet<Vec<u8>>, Refusal> {
+    let indexed = ProcessGit::output_bytes(worktree, ["ls-files", "-z"])?;
+    let committed = ProcessGit::output_bytes(
+        worktree,
+        ["ls-tree", "-r", "-z", "--name-only", "--full-tree", head],
+    )?;
+    Ok(indexed
+        .split(|byte| *byte == 0)
+        .chain(committed.split(|byte| *byte == 0))
+        .filter(|path| !path.is_empty())
+        .map(<[u8]>::to_vec)
+        .collect())
+}
+
+/// What the disk shows of one candidate Flutter output directory, the observations the one
+/// classifier takes: `None` unless `directory` is a real directory; `manifest` present as a
+/// regular file; anything `tracked` (HEAD's and the index's paths) at or below `directory`.
+/// Both paths are relative to `worktree` and UTF-8, as the classifier passes them.
+pub(crate) fn flutter_facts(
+    worktree: &Path,
+    directory: &[u8],
+    manifest: &[u8],
+    tracked: &BTreeSet<Vec<u8>>,
+) -> Option<FlutterFacts> {
+    let at = |relative: &[u8]| {
+        std::str::from_utf8(relative)
+            .ok()
+            .map(|relative| worktree.join(relative))
+    };
+    if !real_directory(&at(directory)?) {
+        return None;
+    }
+    let mut below = directory.to_vec();
+    below.push(b'/');
+    Some(FlutterFacts {
+        manifest_beside: at(manifest).is_some_and(|manifest| regular_file(&manifest)),
+        tracked: tracked.contains(directory)
+            || tracked
+                .range(below.clone()..)
+                .next()
+                .is_some_and(|path| path.starts_with(&below)),
+    })
 }
 
 /// Whether `relative` is a Cargo target classified as tagged: it carries a valid `CACHEDIR.TAG`,
