@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased
+
+- `discard-cache` (and `finish --discard-cache`, `sweep`) never deletes a nested Git repository,
+  whatever kind of recognised directory holds it. 0.17.0 deleted a Cargo target, or its `tmp/`,
+  whatever it held, including a fixture repository a test wrote into `CARGO_TARGET_TMPDIR` with
+  commits no remote holds; `finish --discard-cache --archive` discards before it archives, so it
+  lost those commits before the archive could image them.
+- The walk 0.17.0 used only for a Flutter app's output now decides for every cache kind: a
+  recognised directory holding a `.git` (a file, a directory or a symbolic link) at any depth
+  below it, found by a walk that follows no symbolic link (an entry or directory it cannot read
+  counts as one), is never deleted whole. A whole Cargo target holding one is no longer
+  `cargo-target` and falls to its parts, each profile, nested target and `tmp/` under its own
+  rule. A `tmp/` holding one deletes each direct entry holding none (a file or symbolic link
+  included) as `cargo-target-tmp`, reported per entry as `<target>/tmp/<entry>`, and retains each
+  entry holding one. A profile, `node_modules`, virtual environment, tool cache or Flutter output
+  directory holding one is retained whole.
+- The walk is repeated immediately before each deletion for every kind, not only Flutter output;
+  a directory that holds a `.git` then is retained whole.
+- Retained repositories appear in `retained_ignored`; `finish --discard-cache --archive` images
+  each one, and the tree is still collected through that archive. No cache kind, JSON field or
+  protocol version changes.
+
 ## 0.17.0 — 2026-10-12
 
 - `archive`, `finish --archive`, `discard-cache` (and `finish --discard-cache`, `sweep`) and

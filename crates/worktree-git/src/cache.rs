@@ -1,8 +1,9 @@
 //! Recognise, and on request delete, the build cache among a tree's ignored entries.
 //!
 //! The walk follows no symbolic link and deletes only real directories inside the tree that a
-//! rule in [`b10x_worktree_domain::CacheKind`] recognises. Every other ignored entry is reported
-//! as retained and left alone.
+//! rule in [`b10x_worktree_domain::CacheKind`] recognises, and the direct entries of Cargo's
+//! `tmp/` it splits around a nested repository. A directory holding a `.git` at any depth is
+//! never deleted whole. Every other ignored entry is reported as retained and left alone.
 
 use crate::ProcessGit;
 use b10x_worktree_domain::{
@@ -15,6 +16,9 @@ use b10x_worktree_domain::{
 use std::collections::BTreeSet;
 use std::io::Read as _;
 use std::path::{Component, Path, PathBuf};
+
+/// The name of a repository's administrative entry; a directory holding one is never cache.
+const GIT_ENTRY: &str = ".git";
 
 /// Classified ignored entries, relative to the tree root.
 #[derive(Default)]
@@ -129,15 +133,15 @@ fn finish_discard(
     let mut retained = plan.retained;
     for (relative, kind) in plan.discarded {
         let path = worktree.join(&relative);
-        // Re-observed immediately before deletion: a `.git` that appeared below a Flutter
-        // output directory since it was classified keeps it whole.
-        if kind == CacheKind::FlutterOutput && holds_git_entry(&path) {
+        // Re-observed immediately before deletion, whatever the kind: a `.git` that appeared
+        // at or below the entry since it was classified keeps it whole.
+        if is_or_holds_git_entry(&path) {
             retained.push(relative);
             continue;
         }
         let allocated_bytes = allocated_bytes(&path);
         if apply {
-            remove(&path)?;
+            remove(&path, kind)?;
         }
         discarded.push(DiscardedCache {
             path: relative,
@@ -233,11 +237,12 @@ fn classify(
         None
     };
     if let Some(kind) = kind {
-        plan.discarded.push((relative.to_path_buf(), kind));
+        plan.discard_unless_repository(worktree, relative.to_path_buf(), kind);
         return Ok(());
     }
     if cargo_target_root(worktree, relative, tracked) {
         match cargo_target(worktree, relative, true)? {
+            // Whole only when nothing in it was retained, so by construction it holds no `.git`.
             TargetShape::Whole => {
                 plan.targets.push(relative.to_path_buf());
                 plan.discarded
@@ -249,8 +254,11 @@ fn classify(
                 plan.retained.extend(inner.retained);
             }
             TargetShape::NotCargo(_) if flutter_output(worktree, relative, tracked, committed)? => {
-                plan.discarded
-                    .push((relative.to_path_buf(), CacheKind::FlutterOutput));
+                plan.discard_unless_repository(
+                    worktree,
+                    relative.to_path_buf(),
+                    CacheKind::FlutterOutput,
+                );
             }
             TargetShape::NotCargo(children) if children.is_empty() => {
                 plan.retained.push(relative.to_path_buf());
@@ -260,19 +268,65 @@ fn classify(
         return Ok(());
     }
     if flutter_output(worktree, relative, tracked, committed)? {
-        plan.discarded
-            .push((relative.to_path_buf(), CacheKind::FlutterOutput));
+        plan.discard_unless_repository(worktree, relative.to_path_buf(), CacheKind::FlutterOutput);
         return Ok(());
     }
     plan.retained.push(relative.to_path_buf());
     Ok(())
 }
 
+impl Plan {
+    /// Plan the recognised directory `relative` for deletion as `kind`, or retain it whole when
+    /// it holds a `.git` at any depth below it ([`holds_git_entry`]): a nested repository is
+    /// never cache, whatever kind of directory holds it.
+    fn discard_unless_repository(&mut self, worktree: &Path, relative: PathBuf, kind: CacheKind) {
+        if holds_git_entry(&worktree.join(&relative)) {
+            self.retained.push(relative);
+        } else {
+            self.discarded.push((relative, kind));
+        }
+    }
+
+    /// Plan Cargo's `tmp/` (`scratch`) beside a profile, keeping both lists in path order: whole
+    /// as `cargo-target-tmp` when it holds no `.git`; otherwise each direct entry holding none
+    /// as `cargo-target-tmp` and each holding one retained. A `tmp/` whose names cannot be read
+    /// is retained whole.
+    fn scratch(&mut self, worktree: &Path, scratch: PathBuf) {
+        let directory = worktree.join(&scratch);
+        if !holds_git_entry(&directory) {
+            self.discard_sorted(scratch, CacheKind::CargoTargetTmp);
+            return;
+        }
+        let Ok(mut names) = read_names(&directory) else {
+            self.retain_sorted(scratch);
+            return;
+        };
+        names.sort();
+        for name in names {
+            let entry = scratch.join(name);
+            if is_or_holds_git_entry(&worktree.join(&entry)) {
+                self.retain_sorted(entry);
+            } else {
+                self.discard_sorted(entry, CacheKind::CargoTargetTmp);
+            }
+        }
+    }
+
+    fn discard_sorted(&mut self, relative: PathBuf, kind: CacheKind) {
+        let at = self.discarded.partition_point(|(path, _)| *path < relative);
+        self.discarded.insert(at, (relative, kind));
+    }
+
+    fn retain_sorted(&mut self, relative: PathBuf) {
+        let at = self.retained.partition_point(|path| *path < relative);
+        self.retained.insert(at, relative);
+    }
+}
+
 /// Whether the ignored directory `relative` is a Flutter app's output by the one build-output
-/// classifier ([`flutter_output_kind`]), observed on disk, that `discard-cache` may delete: one
-/// holding a `.git` at any depth below it is retained whole ([`holds_git_entry`]). HEAD's and the
-/// index's paths are read into `committed` only for a directory whose name could make it one;
-/// `tracked` holds the index's paths.
+/// classifier ([`flutter_output_kind`]), observed on disk. HEAD's and the index's paths are read
+/// into `committed` only for a directory whose name could make it one; `tracked` holds the
+/// index's paths.
 fn flutter_output(
     worktree: &Path,
     relative: &Path,
@@ -296,14 +350,14 @@ fn flutter_output(
     Ok(flutter_output_kind(directory, |directory, manifest| {
         flutter_facts(worktree, directory, manifest, committed, tracked)
     })
-    .is_some()
-        && !holds_git_entry(&worktree.join(relative)))
+    .is_some())
 }
 
 /// Whether `directory` holds an entry named `.git` (a file, a directory or a symbolic link) at
 /// any depth below it: a repository there may hold commits no remote does, so `discard-cache`
-/// retains the Flutter output directory whole. The walk follows no symbolic link. An entry whose
-/// type or a directory whose names cannot be read counts as one, so it is retained too.
+/// never deletes the directory whole, whatever kind of cache it is. The walk follows no symbolic
+/// link. An entry whose type or a directory whose names cannot be read counts as one, so it is
+/// retained too.
 fn holds_git_entry(directory: &Path) -> bool {
     let mut pending = vec![directory.to_path_buf()];
     while let Some(current) = pending.pop() {
@@ -314,7 +368,7 @@ fn holds_git_entry(directory: &Path) -> bool {
             let Ok(entry) = entry else {
                 return true;
             };
-            if entry.file_name() == ".git" {
+            if entry.file_name() == GIT_ENTRY {
                 return true;
             }
             match entry.file_type() {
@@ -325,6 +379,21 @@ fn holds_git_entry(directory: &Path) -> bool {
         }
     }
     false
+}
+
+/// Whether the entry at `path` is named `.git` or, as a real directory, holds one
+/// ([`holds_git_entry`]). A file or symbolic link of another name holds none; an entry whose type
+/// cannot be read counts as holding one, and a missing one as holding none (its deletion then
+/// refuses as changed state).
+fn is_or_holds_git_entry(path: &Path) -> bool {
+    if path.file_name() == Some(std::ffi::OsStr::new(GIT_ENTRY)) {
+        return true;
+    }
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() => holds_git_entry(path),
+        Ok(_) => false,
+        Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+    }
 }
 
 /// Every path HEAD's tree (`head`) or the tree's index tracks, as raw bytes: such a file is
@@ -423,12 +492,17 @@ fn cargo_target(worktree: &Path, relative: &Path, tagged: bool) -> Result<Target
     children.sort();
     let mut inner = Plan::default();
     let mut found_profile = false;
-    // Cargo's `tmp` below a tagged target is cache whatever it holds, but only beside a
-    // profile, which is known once every child was read.
+    // Cargo's `tmp` below a tagged target is cache, but only beside a profile, which is known
+    // once every child was read.
     let mut scratch = None;
     for name in children {
         let child = relative.join(&name);
         let path = worktree.join(&child);
+        // A repository's `.git` is never a target's part, whatever it holds.
+        if name == GIT_ENTRY {
+            inner.retained.push(child);
+            continue;
+        }
         if real_directory(&path) {
             if tagged && name == CARGO_TARGET_TMP {
                 scratch = Some(child);
@@ -436,7 +510,7 @@ fn cargo_target(worktree: &Path, relative: &Path, tagged: bool) -> Result<Target
             }
             if cargo_profile(&path) {
                 found_profile = true;
-                inner.discarded.push((child, CacheKind::CargoProfile));
+                inner.discard_unless_repository(worktree, child, CacheKind::CargoProfile);
                 continue;
             }
             let nested_tag = cache_tagged(&path);
@@ -464,13 +538,9 @@ fn cargo_target(worktree: &Path, relative: &Path, tagged: bool) -> Result<Target
     }
     if let Some(scratch) = scratch {
         if found_profile {
-            let at = inner.discarded.partition_point(|(path, _)| *path < scratch);
-            inner
-                .discarded
-                .insert(at, (scratch, CacheKind::CargoTargetTmp));
+            inner.scratch(worktree, scratch);
         } else if !read_names(&worktree.join(&scratch))?.is_empty() {
-            let at = inner.retained.partition_point(|path| *path < scratch);
-            inner.retained.insert(at, scratch);
+            inner.retain_sorted(scratch);
         }
     }
     Ok(if !found_profile {
@@ -591,7 +661,21 @@ pub(crate) fn last_activity(worktree: &Path) -> Option<i64> {
         .max()
 }
 
-fn remove(path: &Path) -> Result<(), Refusal> {
+/// Delete one planned entry. Only a direct entry of Cargo's `tmp/` (`cargo-target-tmp`) may be a
+/// file or symbolic link, which is unlinked, never followed; every other entry must still be a
+/// real directory.
+fn remove(path: &Path, kind: CacheKind) -> Result<(), Refusal> {
+    let unlinkable = kind == CacheKind::CargoTargetTmp
+        && std::fs::symlink_metadata(path)
+            .is_ok_and(|metadata| metadata.is_file() || metadata.is_symlink());
+    if unlinkable {
+        return std::fs::remove_file(path).map_err(|error| {
+            Refusal::new(
+                "cache-delete-failed",
+                format!("{}: {error}", path.display()),
+            )
+        });
+    }
     if !real_directory(path) {
         return Err(Refusal::new(
             "cache-state-changed",
@@ -684,4 +768,72 @@ fn own_ancestry() -> BTreeSet<u32> {
         pid = parent;
     }
     chain
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const KINDS: [CacheKind; 7] = [
+        CacheKind::CargoProfile,
+        CacheKind::CargoTarget,
+        CacheKind::CargoTargetTmp,
+        CacheKind::FlutterOutput,
+        CacheKind::NodeModules,
+        CacheKind::PythonVirtualenv,
+        CacheKind::ToolCache,
+    ];
+
+    /// A `.git` that appears below a planned directory after classification, as a file, a
+    /// directory or a symbolic link, keeps the directory whole at deletion, whatever its kind.
+    #[cfg(unix)]
+    #[test]
+    fn a_git_entry_found_immediately_before_deletion_retains_every_kind_whole() {
+        for (index, kind) in KINDS.into_iter().enumerate() {
+            for shape in ["file", "directory", "symlink"] {
+                let root = tempfile::tempdir().unwrap();
+                let relative = PathBuf::from(format!("cache-{index}"));
+                let nested = root.path().join(&relative).join("deep/fixture");
+                std::fs::create_dir_all(&nested).unwrap();
+                std::fs::write(nested.join("file"), "only copy\n").unwrap();
+                let git = nested.join(".git");
+                match shape {
+                    "file" => std::fs::write(&git, "gitdir: elsewhere\n").unwrap(),
+                    "directory" => std::fs::create_dir(&git).unwrap(),
+                    _ => std::os::unix::fs::symlink("elsewhere", &git).unwrap(),
+                }
+                let plan = Plan {
+                    discarded: vec![(relative.clone(), kind)],
+                    ..Plan::default()
+                };
+
+                let result = finish_discard(root.path(), plan, true).unwrap();
+                assert!(result.discarded.is_empty(), "{kind:?} with a {shape} .git");
+                assert_eq!(result.retained_ignored, [relative]);
+                assert!(
+                    nested.join("file").is_file(),
+                    "{kind:?} with a {shape} .git"
+                );
+            }
+        }
+    }
+
+    /// A direct entry of Cargo's `tmp/` may be a file; it is deleted as `cargo-target-tmp`.
+    #[test]
+    fn a_file_in_target_tmp_is_discarded_as_target_tmp() {
+        let root = tempfile::tempdir().unwrap();
+        let relative = PathBuf::from("target/tmp/output.log");
+        std::fs::create_dir_all(root.path().join("target/tmp")).unwrap();
+        std::fs::write(root.path().join(&relative), "scratch\n").unwrap();
+        let plan = Plan {
+            discarded: vec![(relative.clone(), CacheKind::CargoTargetTmp)],
+            ..Plan::default()
+        };
+
+        let result = finish_discard(root.path(), plan, true).unwrap();
+        assert_eq!(result.discarded.len(), 1);
+        assert_eq!(result.discarded[0].path, relative);
+        assert_eq!(result.retained_ignored, [] as [PathBuf; 0]);
+        assert!(!root.path().join(&relative).exists());
+    }
 }

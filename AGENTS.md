@@ -102,17 +102,23 @@ independent policy: every decision must come from the public façade.
 - The only command that deletes files a tree's owner wrote is `discard-cache` (and `finish
   --discard-cache`), and it deletes only ignored, real directories recognised as build cache by
   structure: a Cargo profile holding `.fingerprint/` inside a validly tagged target, that target's
-  own real `tmp/` (Cargo's `CARGO_TARGET_TMPDIR`, whatever it holds) when the target holds a
-  profile, `node_modules` at or below a tracked lockfile, a virtual environment beside a tracked
-  Python manifest, a Flutter app's `<P>/build/` or `<P>/.dart_tool/` that the one classifier
-  recognises on disk (a regular `<P>/pubspec.yaml` beside it, nothing HEAD or the index tracks at
-  or below it, no cargo target at it) and that holds no `.git` (file, directory or symbolic link)
-  at any depth below it, found by a walk that follows no symbolic link and repeated immediately
-  before deletion (one that holds a `.git`, or that the walk cannot read, is retained whole), and a tagged `.pytest_cache`, `.mypy_cache` or `.ruff_cache`. Cargo tags only a
-  target it creates, so a real directory named `target` without a valid tag counts as tagged when
-  a tracked `Cargo.toml` sits beside it and a direct child other than `tmp/` holds both
-  `.fingerprint/` and `deps/` as real directories. A name alone never qualifies; anything
-  unrecognised is retained and reported. It refuses for a live lease, a Git lock, or another
+  own real `tmp/` (Cargo's `CARGO_TARGET_TMPDIR`) when the target holds a profile,
+  `node_modules` at or below a tracked lockfile, a virtual environment beside a tracked Python
+  manifest, a Flutter app's `<P>/build/` or `<P>/.dart_tool/` that the one classifier recognises
+  on disk (a regular `<P>/pubspec.yaml` beside it, nothing HEAD or the index tracks at or below
+  it, no cargo target at it), and a tagged `.pytest_cache`, `.mypy_cache` or `.ruff_cache`. Cargo
+  tags only a target it creates, so a real directory named `target` without a valid tag counts as
+  tagged when a tracked `Cargo.toml` sits beside it and a direct child other than `tmp/` holds
+  both `.fingerprint/` and `deps/` as real directories. A nested repository is never cache: a
+  recognised directory of any kind that holds a `.git` (file, directory or symbolic link) at any
+  depth below it, found by one walk that follows no symbolic link (an entry whose type or a
+  directory whose names it cannot read counts as one), is never deleted whole. A whole target
+  holding one falls to its parts, each profile, nested target and `tmp/` under its own rule;
+  a `tmp/` holding one deletes each direct entry (file, symbolic link or directory) holding none
+  as `cargo-target-tmp` and retains each that holds one; every other directory holding one is
+  retained whole. The walk is repeated immediately before each deletion, and a directory that
+  holds a `.git` then is retained whole. A name alone never qualifies; anything unrecognised is
+  retained and reported. It refuses for a live lease, a Git lock, or another
   process using the tree. The one other deletion of such files is removal through a
   `worktree.archive/3` archive, and only of the build layout it left out, re-observed as above.
 - `sweep` composes only `discard-cache` and `archive`. It never changes lifecycle, never removes a

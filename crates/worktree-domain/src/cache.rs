@@ -82,15 +82,22 @@ pub fn is_cache_tag(contents: &[u8]) -> bool {
 /// when it is named [`CARGO_UNTAGGED_TARGET`], a tracked [`CARGO_MANIFEST`] sits beside it, and a
 /// direct child is a profile holding both [`CARGO_PROFILE_MARKER`] and [`CARGO_PROFILE_DEPS`] as
 /// real directories. The Cargo kinds below then apply to it unchanged.
+///
+/// A nested repository is never cache, whatever kind of directory holds it: a recognised
+/// directory holding a `.git` (file, directory or symbolic link) at any depth is not deleted
+/// whole. A whole target holding one falls to its parts, `tmp/` to its direct entries, and every
+/// other kind is retained.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum CacheKind {
     /// A directory holding `.fingerprint/` inside a tagged Cargo target.
     CargoProfile,
-    /// A tagged Cargo target holding nothing but profiles, Cargo's own metadata and its `tmp/`.
+    /// A tagged Cargo target holding nothing but profiles, Cargo's own metadata and its `tmp/`,
+    /// and no `.git` at any depth.
     CargoTarget,
     /// `tmp/` directly below a tagged Cargo target that holds a profile: Cargo's
-    /// `CARGO_TARGET_TMPDIR`, which test binaries fill with scratch, whatever it holds.
+    /// `CARGO_TARGET_TMPDIR`, which test binaries fill with scratch. When it holds a `.git` at
+    /// any depth, each of its direct entries holding none instead, one by one.
     CargoTargetTmp,
     /// A real `P/build/` or `P/.dart_tool/` that the one build-output classifier
     /// ([`crate::flutter_output_kind`]) recognises as a Flutter app's output: `P/pubspec.yaml` is

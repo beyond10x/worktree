@@ -113,10 +113,15 @@ or the index tracks at or below it, and `cache::archive_target` for the cargo ta
 observes HEAD's tree and the patch's pure additions, and its own recognised targets. The archive
 records the outer of a cargo target and a Flutter output directory (`outermost_build_directory`),
 as the strip does; `discard-cache` deletes an ignored directory the classifier recognises as
-`CacheKind::FlutterOutput`, after its cargo rules, unless a walk that follows no symbolic link
-finds a `.git` (file, directory or symbolic link) at any depth below it (`cache::holds_git_entry`):
-a repository there may hold commits no remote does, so the directory is retained whole. The walk
-runs again immediately before deletion, and an unreadable directory counts as holding one.
+`CacheKind::FlutterOutput`, after its cargo rules. For every kind, one walk that follows no
+symbolic link (`cache::holds_git_entry`) decides whether a recognised directory holds a `.git`
+(file, directory or symbolic link) at any depth below it: a repository there may hold commits no
+remote does, so the directory is never deleted whole. A whole Cargo target holding one falls to
+its parts (each profile, nested target and `tmp/` under its own rule; a target is `cargo-target`
+only when nothing in it was retained, so by construction it holds none); a `tmp/` holding one is
+split into its direct entries, those holding none discarded as `cargo-target-tmp` and the rest
+retained; every other kind holding one is retained whole. The walk runs again immediately before
+each deletion, whatever the kind, and an unreadable directory counts as holding one.
 
 Verification of a format 3 archive leaves layout out only below the directories the manifest
 records, so an archive written before a kind of output was recognised still holds it in its
