@@ -34,6 +34,22 @@
   immediately before each deletion.
 - `ignored-output` is a new `kind` value; the CLI JSON protocol stays 4 and no field changes.
   `archive` never reads the keep file and never modifies the tree; `sweep` never removes a tree.
+- `prune-archives --strip-build-output` also strips ignored output from existing archives: a
+  section that purely adds an untracked file whose path Git's exclude engine ignores under HEAD's
+  rules (every `.gitignore` HEAD's tree holds, read from Git, and the repository's
+  `info/exclude`) and the keep file does not keep. A non-layout file below an ignored `target/`,
+  `node_modules/` or `build/` is stripped now; 0.17.1 kept it. The rules are asked in one
+  `git check-ignore --no-index --stdin -z` over a scratch work tree beside the archive, removed
+  on every path out; no primary checkout's working files and no user `core.excludesFile` are
+  read, so a path only the user's global rules ignore stays.
+- The strip never strips a path the keep file keeps, layout or ignored output. The keep file is
+  read from HEAD's tree, or from the patch when it purely adds `.worktreekeep` (that section
+  stays); a patch that changes a tracked keep file, or a keep file that is not a regular text
+  file, keeps every path. Repository content (a `.git` component, or a Git directory the patch
+  shows) stays whatever the rules say.
+- Stripped ignored output is recorded as a `build_output` target of origin `strip`, per outermost
+  ignored directory HEAD does not hold and that holds no path whose section stays, or per file.
+  The archive format stays `worktree.archive/3` and the CLI JSON protocol stays 4.
 
 ## 0.17.1 — 2026-10-12
 

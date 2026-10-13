@@ -706,9 +706,10 @@ fn discard_cache_splits_flutter_output_holding_a_git_entry_at_any_depth() {
 
 /// A cargo target named `build/` beside a `pubspec.yaml` is classified by the cargo rule alone in
 /// the strip as in `archive` and `discard-cache`: cargo's layout below it is stripped from an
-/// archive written before, and `build/notes.md`, which is no layout, stays in `dirty.patch`.
+/// archive written before. `build/notes.md`, which is no layout, is stripped too, but only as
+/// ignored output: HEAD's `.gitignore` ignores every `build/`.
 #[test]
-fn strip_keeps_a_non_layout_file_in_a_cargo_target_named_build_beside_a_pubspec() {
+fn strip_takes_a_non_layout_file_in_a_cargo_target_named_build_only_as_ignored_output() {
     let fixture = Fixture::new(&[("Cargo.toml", "[package]\nname = \"one\"\n")]);
     let tree = fixture.tree("strip");
     write(&tree.join("build/CACHEDIR.TAG"), TAG);
@@ -745,9 +746,11 @@ fn strip_keeps_a_non_layout_file_in_a_cargo_target_named_build_beside_a_pubspec(
         args.extend_from_slice(extra);
         fixture.ok(&args)
     };
+    // Cargo's layout is stripped as layout; `build/notes.md`, no layout, only as ignored output
+    // under HEAD's `build/` rule, recorded with it under `build`.
     let dry = strip(&[]);
     assert_eq!(dry["archives"][0]["verdict"], "strippable", "{dry}");
-    assert_eq!(dry["archives"][0]["sections_stripped"], 3, "{dry}");
+    assert_eq!(dry["archives"][0]["sections_stripped"], 4, "{dry}");
     strip(&["--apply", "--id", "strip"]);
     let directory = PathBuf::from(archive["path"].as_str().unwrap());
     let manifest: Value =
@@ -763,8 +766,6 @@ fn strip_keeps_a_non_layout_file_in_a_cargo_target_named_build_beside_a_pubspec(
             )
         })
         .collect();
-    assert_eq!(recorded, [("build", 3)], "{manifest}");
-    let patch = std::fs::read_to_string(directory.join("dirty.patch")).unwrap();
-    assert!(patch.contains("b/build/notes.md"), "{patch}");
-    assert!(!patch.contains("b/build/debug/"), "{patch}");
+    assert_eq!(recorded, [("build", 4)], "{manifest}");
+    assert!(!directory.join("dirty.patch").exists(), "{manifest}");
 }

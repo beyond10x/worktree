@@ -28,11 +28,15 @@
 //! layout and keeps its section in a strip. On disk a Git directory is observed by the same rule
 //! `discard-cache` keeps it by ([`crate::GitDirectoryFacts`]); in a patch it is a directory for
 //! which the patch purely adds `HEAD` and some path under `objects/`.
+//!
+//! The strip also removes ignored output: a pure addition whose path Git's exclude engine ignores
+//! under HEAD's exclude rules ([`ExcludeObservations`], observed by the Git adapter for the paths
+//! [`exclude_queries`] names). A path the keep file keeps is never stripped ([`keep_source`]).
 
 use crate::{
     ARCHIVE_PATCH_FILE, ArchiveContents, ArchiveEntryKind, ArchiveManifest, CACHEDIR_TAG_FILE,
     CARGO_PROFILE_MARKER, CARGO_TARGET_TMP, GIT_DIRECTORY_HEAD, GIT_DIRECTORY_OBJECTS, GIT_ENTRY,
-    PruneVerdict, SkippedArchiveEntry, is_cache_tag,
+    KEEP_FILE, PruneVerdict, SkippedArchiveEntry, is_cache_tag,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -408,11 +412,166 @@ pub struct ScannedPatch {
     pub head_files: BTreeSet<Vec<u8>>,
     /// The paths HEAD's tree holds as a directory.
     pub head_directories: BTreeSet<Vec<u8>>,
+    /// What Git's exclude engine says of the paths [`exclude_queries`] names. Empty, nothing is
+    /// ignored output and nothing is kept.
+    pub exclusion: ExcludeObservations,
+}
+
+/// What Git's exclude engine says of a patch's pure additions ([`exclude_queries`]), observed by
+/// the Git adapter without reading any tree's working files: under HEAD's exclude rules (every
+/// `.gitignore` HEAD's tree holds, read from Git, and the repository's `info/exclude`; never a
+/// `core.excludesFile`), and under the keep file ([`KEEP_FILE`], from the source
+/// [`keep_source`] names).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExcludeObservations {
+    /// Queried paths HEAD's exclude rules ignore, as a file or below an ignored directory.
+    pub ignored: BTreeSet<Vec<u8>>,
+    /// Queried directories HEAD's exclude rules ignore as directories.
+    pub ignored_directories: BTreeSet<Vec<u8>>,
+    /// Queried paths the keep file keeps: a pattern matches the path or one of its ancestors.
+    pub kept: BTreeSet<Vec<u8>>,
+    /// The keep file could not be read ([`KeepSource::Unreadable`]): every path counts as kept.
+    pub keep_unreadable: bool,
+}
+
+/// The paths a strip asks Git's exclude engine about ([`exclude_queries`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExcludeQueries {
+    /// Every pure addition whose path can be asked ([`exclude_query_path`]) and is no repository
+    /// content, in patch order.
+    pub paths: Vec<Vec<u8>>,
+    /// Every ancestor directory of those paths that HEAD's tree does not hold, in path-byte
+    /// order.
+    pub directories: Vec<Vec<u8>>,
+}
+
+/// Where the keep file ([`KEEP_FILE`]) a strip honours is read from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeepSource {
+    /// Neither HEAD's tree nor the patch holds one: nothing is kept.
+    Absent,
+    /// HEAD's tree holds it, and the patch does not change it: read from Git. Held as anything
+    /// but a regular file, it is unreadable.
+    Head,
+    /// The patch purely adds it, in the section of this index; that section is kept. A binary
+    /// section is unreadable.
+    Patch(usize),
+    /// HEAD holds it as a directory, or the patch changes it other than by adding it once: no
+    /// one file says what the tree kept, so every path is kept.
+    Unreadable,
+}
+
+/// Whether `path` is one Git's exclude engine can be asked about as given: a relative path of
+/// plain components, none of them `.git`, and no leading `:`, which Git would read as pathspec
+/// magic. Any other path is never ignored output, and counts as kept.
+pub fn exclude_query_path(path: &[u8]) -> bool {
+    !path.is_empty()
+        && !path.starts_with(b":")
+        && !path.starts_with(b"/")
+        && path.split(|byte| *byte == b'/').all(|component| {
+            !matches!(component, b"" | b"." | b"..") && component != GIT_ENTRY.as_bytes()
+        })
+}
+
+/// The proper ancestor directories of `path`, outermost first.
+fn ancestors(path: &[u8]) -> impl Iterator<Item = &[u8]> {
+    path.iter()
+        .enumerate()
+        .filter(|(_, byte)| **byte == b'/')
+        .map(move |(at, _)| &path[..at])
+}
+
+/// One flag per section: whether it purely adds an untracked file. That is a `new file mode`
+/// section whose path decoded, that no other section names, and that HEAD does not track
+/// ([`ScannedSection::tracked`]).
+fn pure_additions(sections: &[ScannedSection]) -> Vec<bool> {
+    // Per decoded path: how many sections name it, and whether every one is a `new file mode`.
+    let mut named: BTreeMap<&[u8], (usize, bool)> = BTreeMap::new();
+    for section in sections {
+        if let Some(path) = section.path.as_deref() {
+            let entry = named.entry(path).or_insert((0, true));
+            entry.0 += 1;
+            entry.1 &= section.new_file;
+        }
+    }
+    sections
+        .iter()
+        .map(|section| {
+            section.new_file
+                && !section.tracked
+                && section
+                    .path
+                    .as_deref()
+                    .is_some_and(|path| named.get(path) == Some(&(1, true)))
+        })
+        .collect()
+}
+
+/// The paths of the pure additions, each with whether its content is a signed tag.
+fn added_paths<'a>(sections: &'a [ScannedSection], pure: &[bool]) -> Vec<(&'a [u8], bool)> {
+    sections
+        .iter()
+        .zip(pure)
+        .filter(|(_, pure)| **pure)
+        .filter_map(|(section, _)| {
+            section
+                .path
+                .as_deref()
+                .map(|path| (path, section.signed_tag))
+        })
+        .collect()
+}
+
+/// What a strip asks Git's exclude engine ([`ExcludeQueries`]): each pure addition that can be
+/// asked and is no repository content ([`repository_path`], by the Git directories the patch's
+/// own pure additions show), and each of its ancestor directories HEAD's tree does not hold.
+pub fn exclude_queries(patch: &ScannedPatch) -> ExcludeQueries {
+    let pure = pure_additions(&patch.sections);
+    let added = added_paths(&patch.sections, &pure);
+    let git_directories = patch_git_directories(&added);
+    let paths = added
+        .iter()
+        .map(|(path, _)| *path)
+        .filter(|path| exclude_query_path(path))
+        .filter(|path| !repository_path(path, |directory| git_directories.contains(directory)))
+        .collect::<Vec<_>>();
+    let directories = paths
+        .iter()
+        .flat_map(|path| ancestors(path))
+        .filter(|directory| !patch.head_directories.contains(*directory))
+        .collect::<BTreeSet<_>>();
+    ExcludeQueries {
+        paths: paths.into_iter().map(<[u8]>::to_vec).collect(),
+        directories: directories.into_iter().map(<[u8]>::to_vec).collect(),
+    }
+}
+
+/// Where the strip reads the keep file from ([`KeepSource`]): the patch when it purely adds
+/// [`KEEP_FILE`] once, HEAD's tree when it holds it and no section names it, and nowhere when
+/// neither holds one. Anything else is [`KeepSource::Unreadable`].
+pub fn keep_source(patch: &ScannedPatch) -> KeepSource {
+    let pure = pure_additions(&patch.sections);
+    let keep = KEEP_FILE.as_bytes();
+    let naming = patch
+        .sections
+        .iter()
+        .enumerate()
+        .filter(|(_, section)| section.path.as_deref() == Some(keep))
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    match naming.as_slice() {
+        [] if patch.head_files.contains(keep) => KeepSource::Head,
+        [] if patch.head_directories.contains(keep) => KeepSource::Unreadable,
+        [] => KeepSource::Absent,
+        [index] if pure[*index] => KeepSource::Patch(*index),
+        _ => KeepSource::Unreadable,
+    }
 }
 
 impl ScannedPatch {
     /// The patch of `sections` over a HEAD holding `head_files` and `head_directories`, each
     /// section marked [`ScannedSection::tracked`] when HEAD holds its path ([`Self::head_tracks`]).
+    /// Nothing is observed of the exclude rules yet ([`Self::exclusion`]).
     pub fn against_head(
         sections: Vec<ScannedSection>,
         head_files: BTreeSet<Vec<u8>>,
@@ -422,6 +581,7 @@ impl ScannedPatch {
             sections: Vec::new(),
             head_files,
             head_directories,
+            exclusion: ExcludeObservations::default(),
         };
         patch.sections = sections
             .into_iter()
@@ -747,56 +907,117 @@ fn patch_git_directories(added: &[(&[u8], bool)]) -> BTreeSet<Vec<u8>> {
     heads.intersection(&objects).cloned().collect()
 }
 
-/// Decide which sections of a patch are build layout: cargo's or a Flutter app's.
+/// Why one section is stripped.
+enum Stripped<'a> {
+    /// Build layout below this cargo target or Flutter output directory.
+    Layout(&'a [u8]),
+    /// Ignored output at this path.
+    Ignored(&'a [u8]),
+}
+
+/// Decide which sections of a patch are build layout, cargo's or a Flutter app's, or ignored
+/// output.
 ///
 /// Only a pure addition is stripped: a `new file mode` section whose path decoded, that no other
-/// section names, and that HEAD does not track ([`ScannedSection::tracked`]); and only when that
-/// path is build layout below a directory the patch's own pure additions recognise as a cargo
-/// target, by a Cargo-signed `CACHEDIR.TAG` or a profile's `.fingerprint/`, or strictly below a
-/// Flutter app's output directory ([`FlutterOutputKind`]) beside a `pubspec.yaml` HEAD holds or
-/// the patch purely adds and that is no cargo target the patch recognises. A path with a `.git`
-/// component, or at or below a Git directory the patch's own pure additions show
-/// ([`repository_path`]), is never stripped. The outermost such directory is recorded. Every other section is kept whole: a type change of a tracked path is a
-/// `deleted file mode` and a `new file mode` section of one path, and both halves stay.
+/// section names, and that HEAD does not track ([`ScannedSection::tracked`]); and never one the
+/// keep file keeps ([`ExcludeObservations::kept`]; the root [`KEEP_FILE`] itself, and every
+/// path when the keep file is unreadable). It is build layout when its path lies below a
+/// directory the patch's own pure additions recognise as a cargo target, by a Cargo-signed
+/// `CACHEDIR.TAG` or a profile's `.fingerprint/`, or strictly below a Flutter app's output
+/// directory ([`FlutterOutputKind`]) beside a `pubspec.yaml` HEAD holds or the patch purely adds
+/// and that is no cargo target the patch recognises; the outermost such directory is recorded.
+/// It is ignored output when HEAD's exclude rules ignore its path
+/// ([`ExcludeObservations::ignored`]); it is recorded under its outermost ancestor directory
+/// those rules ignore that HEAD does not hold and that holds no path whose section is kept, or
+/// as itself when there is none. A path with a `.git` component, or at or below a Git directory
+/// the patch's own pure additions show ([`repository_path`]), is never stripped. Every other
+/// section is kept whole: a type change of a tracked path is a `deleted file mode` and a
+/// `new file mode` section of one path, and both halves stay.
 pub fn plan_patch_strip(patch: &ScannedPatch) -> PatchStripPlan {
     let sections = patch.sections.as_slice();
-    // Per decoded path: how many sections name it, and whether every one is a `new file mode`.
-    let mut named: BTreeMap<&[u8], (usize, bool)> = BTreeMap::new();
-    for section in sections {
-        if let Some(path) = section.path.as_deref() {
-            let entry = named.entry(path).or_insert((0, true));
-            entry.0 += 1;
-            entry.1 &= section.new_file;
-        }
-    }
-    let pure_addition = |section: &ScannedSection| {
-        section.new_file
-            && !section.tracked
-            && section
-                .path
-                .as_deref()
-                .is_some_and(|path| named.get(path) == Some(&(1, true)))
-    };
-    let added = sections
-        .iter()
-        .filter(|section| pure_addition(section))
-        .filter_map(|section| {
-            section
-                .path
-                .as_deref()
-                .map(|path| (path, section.signed_tag))
-        })
-        .collect::<Vec<_>>();
+    let pure = pure_additions(sections);
+    let added = added_paths(sections, &pure);
     let added_manifests = added
         .iter()
-        .map(|(path, _)| *path)
-        .filter(|path| {
-            path.rsplit(|byte| *byte == b'/').next() == Some(FLUTTER_MANIFEST.as_bytes())
+        .map(|(added, _)| *added)
+        .filter(|added| {
+            added.rsplit(|byte| *byte == b'/').next() == Some(FLUTTER_MANIFEST.as_bytes())
         })
         .collect::<BTreeSet<_>>();
     let recognised = PatchTargets::recognise(&added);
     let targets = &recognised.targets;
     let git_directories = patch_git_directories(&added);
+    let exclusion = &patch.exclusion;
+    let kept = |file: &[u8]| {
+        exclusion.keep_unreadable
+            || file == KEEP_FILE.as_bytes()
+            || !exclude_query_path(file)
+            || exclusion.kept.contains(file)
+    };
+    let decisions = sections
+        .iter()
+        .zip(&pure)
+        .map(|(section, pure)| {
+            let file = section.path.as_deref().filter(|_| *pure)?;
+            if kept(file) || repository_path(file, |directory| git_directories.contains(directory))
+            {
+                return None;
+            }
+            let cargo = layout_target(
+                file,
+                targets,
+                |target| recognised.facts(target),
+                |target, prefix| recognised.profile(target, prefix),
+            )
+            .map(|index| targets[index].as_slice());
+            // The patch's observations: HEAD's tree read from Git, and the manifests the patch
+            // purely adds.
+            let flutter = flutter_output(file, |directory, manifest| {
+                Some(FlutterFacts {
+                    manifest_beside: patch.head_files.contains(manifest)
+                        || added_manifests.contains(manifest),
+                    tracked: patch.head_holds(directory),
+                    cargo_target: targets.iter().any(|target| target == directory),
+                })
+            });
+            match outermost_build_directory(cargo, flutter) {
+                Some(directory) => Some(Stripped::Layout(directory)),
+                None => exclusion
+                    .ignored
+                    .contains(file)
+                    .then_some(Stripped::Ignored(file)),
+            }
+        })
+        .collect::<Vec<_>>();
+    // Every directory holding a path whose section is kept: none of them is recorded as ignored
+    // output, since not all it holds was stripped.
+    let holds_kept = sections
+        .iter()
+        .zip(&decisions)
+        .filter(|(_, decision)| decision.is_none())
+        .filter_map(|(section, _)| section.path.as_deref())
+        .flat_map(ancestors)
+        .collect::<BTreeSet<_>>();
+    let recorded = decisions
+        .iter()
+        .map(|decision| {
+            decision.as_ref().map(|decision| match decision {
+                Stripped::Layout(directory) => *directory,
+                Stripped::Ignored(file) => ancestors(file)
+                    .find(|directory| {
+                        exclusion.ignored_directories.contains(*directory)
+                            && !patch.head_directories.contains(*directory)
+                            && !holds_kept.contains(directory)
+                    })
+                    .unwrap_or(file),
+            })
+        })
+        .collect::<Vec<_>>();
+    tally(sections, &recorded)
+}
+
+/// The plan that strips each section `recorded` names a directory (or file) for, recorded there.
+fn tally(sections: &[ScannedSection], recorded: &[Option<&[u8]>]) -> PatchStripPlan {
     let mut plan = PatchStripPlan {
         strip: Vec::with_capacity(sections.len()),
         targets: Vec::new(),
@@ -807,33 +1028,7 @@ pub fn plan_patch_strip(patch: &ScannedPatch) -> PatchStripPlan {
     };
     // Files and bytes per recorded directory, in path-byte order.
     let mut per_target: BTreeMap<&[u8], (u64, u64)> = BTreeMap::new();
-    for section in sections {
-        let target = section
-            .path
-            .as_deref()
-            .filter(|_| pure_addition(section))
-            .and_then(|path| {
-                let cargo = layout_target(
-                    path,
-                    targets,
-                    |target| recognised.facts(target),
-                    |target, prefix| recognised.profile(target, prefix),
-                )
-                .map(|index| targets[index].as_slice());
-                // The patch's observations: HEAD's tree read from Git, and the manifests the
-                // patch purely adds.
-                let flutter = flutter_output(path, |directory, manifest| {
-                    Some(FlutterFacts {
-                        manifest_beside: patch.head_files.contains(manifest)
-                            || added_manifests.contains(manifest),
-                        tracked: patch.head_holds(directory),
-                        cargo_target: targets.iter().any(|target| target == directory),
-                    })
-                });
-                layout_directory(path, cargo, flutter, |directory| {
-                    git_directories.contains(directory)
-                })
-            });
+    for (section, target) in sections.iter().zip(recorded) {
         plan.strip.push(target.is_some());
         if let Some(target) = target {
             plan.sections_stripped += 1;
@@ -863,9 +1058,9 @@ pub fn plan_patch_strip(patch: &ScannedPatch) -> PatchStripPlan {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum StripVerdict {
-    /// At least one `new file mode` section adds a file under build layout.
+    /// At least one `new file mode` section adds a file under build layout, or ignored output.
     Strippable,
-    /// No patch, or nothing in it is build layout.
+    /// No patch, or nothing in it is build layout or ignored output.
     NothingToStrip,
     /// `manifest.json` is missing, unreadable or of an unknown format.
     InvalidManifest,
@@ -1010,14 +1205,16 @@ pub fn decide_archive_strip(
     if plan.sections_stripped == 0 {
         return StripDecision {
             verdict: StripVerdict::NothingToStrip,
-            reason: "no section of the patch adds build layout (cargo or Flutter)".into(),
+            reason:
+                "no section of the patch adds build layout (cargo or Flutter) or ignored output"
+                    .into(),
             plan: Some(plan),
         };
     }
     StripDecision {
         verdict: StripVerdict::Strippable,
         reason: format!(
-            "{} section(s) add build layout below {}",
+            "{} section(s) add build layout or ignored output below {}",
             plan.sections_stripped,
             plan.targets
                 .iter()

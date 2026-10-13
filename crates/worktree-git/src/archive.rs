@@ -15,10 +15,12 @@ use b10x_worktree_domain::{
     ARCHIVE_BUNDLE_FILE, ARCHIVE_HEAD_REF, ARCHIVE_MANIFEST_FILE, ARCHIVE_PATCH_FILE,
     ArchiveContents, ArchiveDirectoryEntry, ArchiveEntryKind, ArchiveEvidence, ArchiveFile,
     ArchiveManifest, ArchiveReference, ArchiveRequest, ArchiveStateCheck, BuildOutput,
-    BuildOutputOrigin, BuildOutputTarget, CACHEDIR_TAG_FILE, CARGO_PROFILE_MARKER, FlutterFacts,
-    FlutterOutputKind, NestedRepositoryImage, NewFileSize, PatchStripPlan, Refusal, ScannedPatch,
-    ScannedSection, TargetFacts, WorktreeRecord, archive_image_file, diff_git_path, flutter_output,
-    is_extended_header, layout_directory, layout_target, relative_path,
+    BuildOutputOrigin, BuildOutputTarget, CACHEDIR_TAG_FILE, CARGO_PROFILE_MARKER,
+    ExcludeObservations, FlutterFacts, FlutterOutputKind, KEEP_FILE, KeepSource,
+    NestedRepositoryImage, NewFileSize, PatchStripPlan, Refusal, ScannedPatch, ScannedSection,
+    TargetFacts, WorktreeRecord, archive_image_file, diff_git_path, exclude_queries,
+    exclude_query_path, flutter_output, is_extended_header, keep_source, layout_directory,
+    layout_target, relative_path,
 };
 use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -2293,25 +2295,86 @@ fn require_streamed(
     Ok(())
 }
 
+/// The text a `new file mode` section adds, collected line by line: its added lines, with the
+/// newline a `\ No newline at end of file` marker removes taken off. A binary section has none.
+#[derive(Debug, Default)]
+struct AddedText {
+    binary: bool,
+    in_hunk: bool,
+    after_added: bool,
+    bytes: Vec<u8>,
+}
+
+impl AddedText {
+    /// Observe one line of the section after its `diff --git` line, newline included.
+    fn observe(&mut self, line: &[u8]) {
+        if self.binary {
+            return;
+        }
+        if !self.in_hunk
+            && (line.starts_with(b"GIT binary patch") || line.starts_with(b"Binary files "))
+        {
+            self.binary = true;
+            return;
+        }
+        if line.starts_with(b"@@") {
+            self.in_hunk = true;
+            self.after_added = false;
+            return;
+        }
+        if !self.in_hunk {
+            return;
+        }
+        if let Some(added) = line.strip_prefix(b"+") {
+            self.bytes.extend_from_slice(added);
+            self.after_added = true;
+            return;
+        }
+        if line.starts_with(b"\\") && self.after_added && self.bytes.last() == Some(&b'\n') {
+            self.bytes.pop();
+        }
+        self.after_added = false;
+    }
+
+    /// The text added, or `None` for a binary section.
+    fn text(self) -> Option<Vec<u8>> {
+        (!self.binary).then_some(self.bytes)
+    }
+}
+
+/// Per index of a section naming the root keep file, the text it adds (`None`: binary).
+type KeepTexts = BTreeMap<usize, Option<Vec<u8>>>;
+
 /// Stream an archive's `dirty.patch` into its `diff --git` sections, verifying the digest the
 /// manifest records. Nothing is written.
+#[cfg(test)]
 pub(crate) fn scan_patch(
     archive: &Path,
     manifest: &ArchiveManifest,
 ) -> Result<Vec<ScannedSection>, Refusal> {
+    scan_sections(archive, manifest).map(|(sections, _)| sections)
+}
+
+/// [`scan_patch`], also collecting the text each section naming the root keep file adds.
+fn scan_sections(
+    archive: &Path,
+    manifest: &ArchiveManifest,
+) -> Result<(Vec<ScannedSection>, KeepTexts), Refusal> {
     let recorded = manifest
         .patch
         .as_ref()
         .ok_or_else(|| unusable(format!("{} records no patch", archive.display())))?;
     let patch = archive.join(ARCHIVE_PATCH_FILE);
-    let mut sections: Vec<(ScannedSection, NewFileSize)> = Vec::new();
+    let mut sections: Vec<(ScannedSection, NewFileSize, Option<AddedText>)> = Vec::new();
     let mut in_header = false;
     let digest = walk_patch(&patch, |line, starts| {
         if starts {
             let header = line.strip_suffix(b"\n").unwrap_or(line);
+            let decoded = diff_git_path(header);
+            let keep = (decoded.as_deref() == Some(KEEP_FILE.as_bytes())).then(AddedText::default);
             sections.push((
                 ScannedSection {
-                    path: diff_git_path(header),
+                    path: decoded,
                     new_file: false,
                     tracked: false,
                     signed_tag: false,
@@ -2319,11 +2382,12 @@ pub(crate) fn scan_patch(
                     content_bytes: 0,
                 },
                 NewFileSize::default(),
+                keep,
             ));
             in_header = true;
             return Ok(());
         }
-        if let Some((section, size)) = sections.last_mut() {
+        if let Some((section, size, keep)) = sections.last_mut() {
             section.patch_bytes += line.len() as u64;
             if in_header && is_extended_header(line) {
                 section.new_file |= line.starts_with(b"new file mode ");
@@ -2331,74 +2395,380 @@ pub(crate) fn scan_patch(
                 in_header = false;
             }
             size.observe(line);
+            if let Some(keep) = keep {
+                keep.observe(line);
+            }
         }
         Ok(())
     })?;
     require_streamed(&patch, recorded, &digest)?;
-    Ok(sections
+    let mut keep_texts = KeepTexts::new();
+    let sections = sections
         .into_iter()
-        .map(|(mut section, size)| {
+        .enumerate()
+        .map(|(index, (mut section, size, keep))| {
             section.content_bytes = size.bytes();
             section.signed_tag = size.signed_tag();
+            if let Some(keep) = keep {
+                keep_texts.insert(index, keep.text());
+            }
             section
         })
-        .collect())
+        .collect();
+    Ok((sections, keep_texts))
 }
 
 /// Scan an archive's patch ([`scan_patch`]) with the paths of HEAD's files and directories, read
-/// from Git and never from the patch's own headers. The domain marks each section HEAD tracks
-/// ([`ScannedPatch::against_head`]) and decides from those paths what is build layout.
+/// from Git and never from the patch's own headers, and what Git's exclude engine says of the
+/// paths the domain asks about ([`observe_exclusion`]). The domain marks each section HEAD tracks
+/// ([`ScannedPatch::against_head`]) and decides from those observations what is build layout or
+/// ignored output.
 pub(crate) fn scan_patch_against_head(
     archive: &Path,
     manifest: &ArchiveManifest,
 ) -> Result<ScannedPatch, Refusal> {
-    let sections = scan_patch(archive, manifest)?;
-    let (files, directories) = head_paths(archive, manifest)?;
-    Ok(ScannedPatch::against_head(sections, files, directories))
+    let (sections, keep_texts) = scan_sections(archive, manifest)?;
+    let head = HeadTree::read(archive, manifest)?;
+    let mut patch =
+        ScannedPatch::against_head(sections, head.files.clone(), head.directories.clone());
+    patch.exclusion = observe_exclusion(archive, manifest, &patch, &head, &keep_texts)?;
+    Ok(patch)
 }
 
-/// The paths of the files and of the directories HEAD's tree holds. HEAD is read from the
-/// repository, or from the archive's own bundle through scratch objects when the repository no
-/// longer holds it; nothing is written to the repository.
-fn head_paths(archive: &Path, manifest: &ArchiveManifest) -> Result<(PathSet, PathSet), Refusal> {
-    ProcessGit::validate_object_id(&manifest.head)?;
-    let repository = manifest.repository_root.as_path();
-    let arguments =
-        |tree: &str| ["ls-tree", "-r", "-t", "-z", "--full-tree", tree].map(String::from);
-    let listing =
-        if let Ok(listing) = ProcessGit::output_bytes(repository, arguments(&manifest.head)) {
-            listing
-        } else {
-            let scratch = Scratch::new(repository, archive.parent().unwrap_or(archive))?;
-            let tree = archived_head_tree(&scratch, repository, archive, manifest)?;
-            run(scratch.git(repository, None).args(arguments(&tree)), None)?
+/// The name of a per-directory exclude file.
+const GITIGNORE: &str = ".gitignore";
+
+/// HEAD's tree as `git ls-tree` lists it, read from the repository, or from the archive's own
+/// bundle through scratch objects when the repository no longer holds it; nothing is written to
+/// the repository.
+struct HeadTree {
+    /// The paths HEAD's tree holds as anything but a directory.
+    files: PathSet,
+    /// The paths HEAD's tree holds as a directory.
+    directories: PathSet,
+    /// Path and blob of every `.gitignore` HEAD's tree holds as a regular file.
+    ignore_files: Vec<(Vec<u8>, String)>,
+    /// The blob of the root keep file, when HEAD's tree holds it as a regular file.
+    keep_blob: Option<String>,
+    /// The scratch objects HEAD was unbundled into, when the repository does not hold it.
+    scratch: Option<Scratch>,
+}
+
+impl HeadTree {
+    fn read(archive: &Path, manifest: &ArchiveManifest) -> Result<Self, Refusal> {
+        ProcessGit::validate_object_id(&manifest.head)?;
+        let repository = manifest.repository_root.as_path();
+        let arguments =
+            |tree: &str| ["ls-tree", "-r", "-t", "-z", "--full-tree", tree].map(String::from);
+        let (listing, scratch) =
+            if let Ok(listing) = ProcessGit::output_bytes(repository, arguments(&manifest.head)) {
+                (listing, None)
+            } else {
+                let scratch = Scratch::new(repository, archive.parent().unwrap_or(archive))?;
+                let tree = archived_head_tree(&scratch, repository, archive, manifest)?;
+                let listing = run(scratch.git(repository, None).args(arguments(&tree)), None)?;
+                (listing, Some(scratch))
+            };
+        let mut head = Self {
+            files: BTreeSet::new(),
+            directories: BTreeSet::new(),
+            ignore_files: Vec::new(),
+            keep_blob: None,
+            scratch,
         };
-    let mut files = BTreeSet::new();
-    let mut directories = BTreeSet::new();
-    for record in listing
-        .split(|byte| *byte == 0)
-        .filter(|record| !record.is_empty())
-    {
-        let malformed = || {
-            unusable(format!(
-                "git ls-tree {} wrote a malformed record",
-                manifest.head
-            ))
-        };
-        let tab = record
-            .iter()
-            .position(|byte| *byte == b'\t')
-            .ok_or_else(malformed)?;
-        let (info, path) = (&record[..tab], record[tab + 1..].to_vec());
-        match info.split(|byte| *byte == b' ').nth(1) {
-            Some(b"tree") => directories.insert(path),
-            Some(_) => files.insert(path),
-            None => return Err(malformed()),
-        };
+        for record in listing
+            .split(|byte| *byte == 0)
+            .filter(|record| !record.is_empty())
+        {
+            let malformed = || {
+                unusable(format!(
+                    "git ls-tree {} wrote a malformed record",
+                    manifest.head
+                ))
+            };
+            let tab = record
+                .iter()
+                .position(|byte| *byte == b'\t')
+                .ok_or_else(malformed)?;
+            let (info, path) = (&record[..tab], record[tab + 1..].to_vec());
+            let mut fields = info.split(|byte| *byte == b' ');
+            let (Some(mode), Some(kind), Some(object)) =
+                (fields.next(), fields.next(), fields.next())
+            else {
+                return Err(malformed());
+            };
+            if kind == b"tree" {
+                head.directories.insert(path);
+                continue;
+            }
+            // Git reads an exclude file only when it is a regular file, never through a link.
+            if matches!(mode, b"100644" | b"100755") {
+                let object = String::from_utf8(object.to_vec()).map_err(|_| malformed())?;
+                ProcessGit::validate_object_id(&object)?;
+                if path == KEEP_FILE.as_bytes() {
+                    head.keep_blob = Some(object);
+                } else if path.rsplit(|byte| *byte == b'/').next() == Some(GITIGNORE.as_bytes())
+                    && exclude_query_path(&path)
+                {
+                    head.ignore_files.push((path.clone(), object));
+                }
+            }
+            head.files.insert(path);
+        }
+        Ok(head)
     }
-    Ok((files, directories))
+
+    /// The content of each blob in `objects`, read in one `git cat-file --batch`.
+    fn blobs(&self, repository: &Path, objects: &[&str]) -> Result<Vec<Vec<u8>>, Refusal> {
+        if objects.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut command = if let Some(scratch) = &self.scratch {
+            scratch.git(repository, None)
+        } else {
+            let mut command = Command::new("git");
+            command.arg("-C").arg(repository);
+            command
+        };
+        command.args(["cat-file", "--batch"]);
+        let mut input = objects.join("\n").into_bytes();
+        input.push(b'\n');
+        let output = run(&mut command, Some(input))?;
+        let malformed = || unusable("git cat-file --batch wrote a malformed record".into());
+        let mut rest = output.as_slice();
+        let mut blobs = Vec::with_capacity(objects.len());
+        for object in objects {
+            let newline = rest
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .ok_or_else(malformed)?;
+            let header = std::str::from_utf8(&rest[..newline]).map_err(|_| malformed())?;
+            rest = &rest[newline + 1..];
+            let fields = header.split(' ').collect::<Vec<_>>();
+            let [found, "blob", size] = fields.as_slice() else {
+                return Err(unusable(format!(
+                    "{object} is no blob HEAD holds: {header}"
+                )));
+            };
+            let size = size.parse::<usize>().map_err(|_| malformed())?;
+            if found != object || rest.len() <= size || rest[size] != b'\n' {
+                return Err(malformed());
+            }
+            blobs.push(rest[..size].to_vec());
+            rest = &rest[size + 1..];
+        }
+        Ok(blobs)
+    }
 }
 
+/// What Git's exclude engine says of the paths the domain asks about ([`exclude_queries`]),
+/// observed in scratch work trees beside the archive and never in a tree's or the primary
+/// checkout's working files: under HEAD's exclude rules, every `.gitignore` HEAD's tree holds
+/// (read from Git) and the repository's `info/exclude`; and under the keep file, from the source
+/// the domain names ([`keep_source`]). No `core.excludesFile` is read. The scratch is removed on
+/// every path out.
+fn observe_exclusion(
+    archive: &Path,
+    manifest: &ArchiveManifest,
+    patch: &ScannedPatch,
+    head: &HeadTree,
+    keep_texts: &KeepTexts,
+) -> Result<ExcludeObservations, Refusal> {
+    let mut observed = ExcludeObservations::default();
+    let queries = exclude_queries(patch);
+    if queries.paths.is_empty() {
+        return Ok(observed);
+    }
+    let repository = manifest.repository_root.as_path();
+    let keep = match keep_source(patch) {
+        KeepSource::Absent => None,
+        KeepSource::Head => {
+            if let Some(blob) = &head.keep_blob {
+                head.blobs(repository, &[blob.as_str()])?.pop()
+            } else {
+                observed.keep_unreadable = true;
+                None
+            }
+        }
+        KeepSource::Patch(index) => {
+            if let Some(Some(text)) = keep_texts.get(&index) {
+                Some(text.clone())
+            } else {
+                observed.keep_unreadable = true;
+                None
+            }
+        }
+        KeepSource::Unreadable => {
+            observed.keep_unreadable = true;
+            None
+        }
+    };
+    if observed.keep_unreadable {
+        // Every path counts as kept: nothing is stripped, so nothing more is asked.
+        return Ok(observed);
+    }
+    let info_exclude =
+        ProcessGit::absolute_git_path(repository, "--git-common-dir")?.join("info/exclude");
+    let exclude = match std::fs::read(&info_exclude) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => return Err(io_refusal("archive-unreadable", &info_exclude, &error)),
+    };
+    let objects = head
+        .ignore_files
+        .iter()
+        .map(|(_, object)| object.as_str())
+        .collect::<Vec<_>>();
+    let ignore_files = head.blobs(repository, &objects)?;
+    let ignores = !ignore_files.is_empty() || !exclude.is_empty();
+    let keeps = keep.as_ref().is_some_and(|keep| !keep.is_empty());
+    if !ignores && !keeps {
+        return Ok(observed);
+    }
+    let owned;
+    let scratch = if let Some(scratch) = &head.scratch {
+        scratch
+    } else {
+        owned = Scratch::new(repository, archive.parent().unwrap_or(archive))?;
+        &owned
+    };
+    if ignores {
+        let tree = scratch_directory(scratch, "exclude-tree")?;
+        for ((path, _), content) in head.ignore_files.iter().zip(&ignore_files) {
+            let file = tree.join(OsStr::from_bytes(path));
+            if let Some(parent) = file.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|error| io_refusal("archive-scratch-failed", parent, &error))?;
+            }
+            std::fs::write(&file, content)
+                .map_err(|error| io_refusal("archive-scratch-failed", &file, &error))?;
+        }
+        let mut input = Vec::new();
+        for path in &queries.paths {
+            input.extend_from_slice(path);
+            input.push(0);
+        }
+        for directory in &queries.directories {
+            input.extend_from_slice(directory);
+            input.extend_from_slice(b"/\0");
+        }
+        for path in check_ignore(scratch, &tree, &exclude, input)? {
+            match path.strip_suffix(b"/") {
+                Some(directory) => observed.ignored_directories.insert(directory.to_vec()),
+                None => observed.ignored.insert(path),
+            };
+        }
+    }
+    if let Some(keep) = keep.filter(|_| keeps) {
+        let tree = scratch_directory(scratch, "keep-tree")?;
+        let mut input = Vec::new();
+        for path in &queries.paths {
+            input.extend_from_slice(path);
+            input.push(0);
+        }
+        observed.kept = check_ignore(scratch, &tree, &keep, input)?
+            .into_iter()
+            .collect();
+    }
+    Ok(observed)
+}
+
+/// A new, empty directory below the scratch directory, as an absolute path.
+fn scratch_directory(scratch: &Scratch, name: &str) -> Result<PathBuf, Refusal> {
+    let path = scratch.path(name);
+    std::fs::create_dir(&path)
+        .map_err(|error| io_refusal("archive-scratch-failed", &path, &error))?;
+    std::path::absolute(&path).map_err(|error| io_refusal("archive-scratch-failed", &path, &error))
+}
+
+/// The NUL-separated `input` paths Git's exclude engine ignores in `tree`, a scratch work tree,
+/// with `exclude` as the repository's `info/exclude` and nothing else beside the `.gitignore`
+/// files `tree` holds: `git check-ignore --no-index --stdin -z` in a scratch repository, with
+/// `core.excludesFile` pointing at an empty file and no user or system configuration. A path
+/// ending in `/` is asked as a directory. Every path is asked in this one process.
+fn check_ignore(
+    scratch: &Scratch,
+    tree: &Path,
+    exclude: &[u8],
+    input: Vec<u8>,
+) -> Result<Vec<Vec<u8>>, Refusal> {
+    let failed =
+        |path: &Path, error: &std::io::Error| io_refusal("archive-scratch-failed", path, error);
+    let git_dir = scratch_directory(scratch, "exclude-git")?;
+    let isolated = |command: &mut Command| {
+        command
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env_remove("GIT_CONFIG_PARAMETERS")
+            .env_remove("GIT_CONFIG_COUNT")
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .env_remove("GIT_OBJECT_DIRECTORY")
+            .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+            .env_remove("GIT_LITERAL_PATHSPECS")
+            .env_remove("GIT_GLOB_PATHSPECS")
+            .env_remove("GIT_NOGLOB_PATHSPECS")
+            .env_remove("GIT_ICASE_PATHSPECS");
+    };
+    let mut init = Command::new("git");
+    init.args(["init", "--quiet", "--bare"]).arg(&git_dir);
+    isolated(&mut init);
+    run(&mut init, None)?;
+    let info = git_dir.join("info");
+    std::fs::create_dir_all(&info).map_err(|error| failed(&info, &error))?;
+    let exclude_file = info.join("exclude");
+    std::fs::write(&exclude_file, exclude).map_err(|error| failed(&exclude_file, &error))?;
+    let no_excludes =
+        std::path::absolute(scratch.path("no-excludes")).map_err(|error| failed(tree, &error))?;
+    std::fs::write(&no_excludes, b"").map_err(|error| failed(&no_excludes, &error))?;
+    let mut setting = OsString::from("core.excludesFile=");
+    setting.push(&no_excludes);
+    let mut command = Command::new("git");
+    command
+        .current_dir(tree)
+        .arg("-c")
+        .arg(setting)
+        .arg("--git-dir")
+        .arg(&git_dir)
+        .arg("--work-tree")
+        .arg(tree)
+        .args(["check-ignore", "--no-index", "--stdin", "-z"]);
+    isolated(&mut command);
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| Refusal::new("git-unavailable", error.to_string()))?;
+    let mut stdin = child.stdin.take().expect("stdin was piped");
+    // Feed stdin from another thread so that a large output cannot deadlock against it.
+    let writer = std::thread::spawn(move || stdin.write_all(&input));
+    let output = child
+        .wait_with_output()
+        .map_err(|error| Refusal::new("git-command-failed", error.to_string()))?;
+    writer
+        .join()
+        .map_err(|_| Refusal::new("git-command-failed", "stdin writer panicked"))?
+        .map_err(|error| Refusal::new("git-command-failed", error.to_string()))?;
+    // `check-ignore` exits 1 when it ignores none of the paths.
+    match output.status.code() {
+        Some(0) => {}
+        Some(1) if output.stdout.is_empty() => return Ok(Vec::new()),
+        _ => {
+            return Err(unusable(format!(
+                "git check-ignore failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+    }
+    Ok(output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .map(<[u8]>::to_vec)
+        .collect())
+}
 /// Stream `source` into a new file at `destination`, keeping each whole section `strip` does not
 /// mark, and verify that `source` still has its recorded digest and the scanned section count.
 fn rewrite_patch(

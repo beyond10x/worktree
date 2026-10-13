@@ -740,7 +740,7 @@ fn strip_keeps_tracked_file_changes_under_target() {
 
     let item = fixture.strip_assessment("tracked");
     assert_eq!(item["verdict"], "strippable", "{item}");
-    assert_eq!(item["sections_kept"], 2, "{item}");
+    assert_eq!(item["sections_kept"], 1, "{item}");
     fixture.strip(&["--apply", "--id", "tracked"]);
 
     let manifest: Value =
@@ -752,10 +752,19 @@ fn strip_keeps_tracked_file_changes_under_target() {
         "{patch}"
     );
     assert!(patch.contains("+edited"), "{patch}");
+    // No cargo layout, but ignored output under HEAD's `/target/`: stripped, and recorded under
+    // its own directory, since `target` holds the tracked file's kept section.
     assert!(
-        patch.contains("b/target/ess-conformance/report.json"),
+        !patch.contains("b/target/ess-conformance/report.json"),
         "{patch}"
     );
+    let recorded = manifest["build_output"]["targets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|target| target["path"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(recorded, ["target", "target/ess-conformance"], "{manifest}");
     assert!(!patch.contains(".fingerprint"), "{patch}");
     assert!(!patch.contains("rustc_info"), "{patch}");
     assert_eq!(
@@ -1108,8 +1117,11 @@ fn strip_removes_flutter_build_output_beside_a_pubspec() {
     assert!(!clean.exists());
 }
 
+/// Without a `pubspec.yaml` beside them, `build/` and `.dart_tool/` are no Flutter output; what
+/// they hold is stripped only as ignored output, because HEAD's `.gitignore` ignores them, and the
+/// `pubspec.yaml` one level down, which HEAD does not ignore, stays.
 #[test]
-fn strip_keeps_a_build_directory_with_no_pubspec_beside() {
+fn a_build_directory_with_no_pubspec_beside_is_stripped_only_as_ignored_output() {
     let fixture = Fixture::new(false);
     let archive = fixture.flutter_archive("plain", false, &|tree| {
         flutter_build(tree);
@@ -1117,15 +1129,14 @@ fn strip_keeps_a_build_directory_with_no_pubspec_beside() {
         write(&tree.join("lib/pubspec.yaml"), "name: nested\n");
     });
     let item = fixture.strip_assessment("plain");
-    assert_eq!(item["verdict"], "nothing-to-strip", "{item}");
-    assert_eq!(item["sections_stripped"], 0, "{item}");
-    fixture.strip_apply_is_refused(&archive, "nothing-to-strip");
+    assert_eq!(item["verdict"], "strippable", "{item}");
+    assert_eq!(item["sections_stripped"], 4, "{item}");
+    assert_eq!(item["sections_kept"], 1, "{item}");
+    fixture.strip(&["--apply", "--id", "plain"]);
     let patch = std::fs::read_to_string(archive.join("dirty.patch")).unwrap();
-    assert!(patch.contains("b/build/app/outputs/"), "{patch}");
-    assert!(
-        patch.contains("b/.dart_tool/package_config.json"),
-        "{patch}"
-    );
+    assert!(patch.contains("b/lib/pubspec.yaml"), "{patch}");
+    assert!(!patch.contains("b/build/"), "{patch}");
+    assert!(!patch.contains("b/.dart_tool/"), "{patch}");
 }
 
 /// Stage every untracked file below a directory named `build` or `.dart_tool`. While they are
