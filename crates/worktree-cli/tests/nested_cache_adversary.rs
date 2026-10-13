@@ -431,7 +431,22 @@ fn finish_collects_a_tree_whose_triple_profile_holds_a_repository() {
     let commit = fixture.nested_repository("target/x86_64-unknown-linux-gnu/debug/build/out/fx");
 
     let applied = fixture.ok(&["discard-cache", fixture.tree_str()])["cache"].clone();
-    assert_eq!(paths(&applied, "discarded"), ["target/debug"], "{applied}");
+    // The triple's profile holds the repository, so it falls to its parts.
+    assert_eq!(
+        paths(&applied, "discarded"),
+        [
+            "target/CACHEDIR.TAG",
+            "target/debug",
+            "target/x86_64-unknown-linux-gnu/debug/.fingerprint",
+            "target/x86_64-unknown-linux-gnu/debug/deps"
+        ],
+        "{applied}"
+    );
+    assert_eq!(
+        paths(&applied, "retained_ignored"),
+        ["target/x86_64-unknown-linux-gnu/debug/build/out/fx"],
+        "{applied}"
+    );
     assert!(holds_commit(
         &fixture
             .tree
@@ -469,8 +484,8 @@ fn a_nested_target_inside_target_tmp_keeps_its_fixture_repository() {
 }
 
 /// `tmp/` entries that are symbolic links (to a repository outside, and one named `.git`) and a
-/// file named `.git` directly in `tmp/`: links are unlinked, never followed, and every `.git`
-/// stays.
+/// file named `.git` directly in `tmp/`: that file makes `tmp/` itself a repository's root, so
+/// `tmp/` is retained whole; no link is followed and every `.git` stays.
 #[test]
 fn links_and_git_files_in_target_tmp_never_reach_a_repository() {
     let fixture = Fixture::new();
@@ -496,7 +511,13 @@ fn links_and_git_files_in_target_tmp_never_reach_a_repository() {
         std::fs::symlink_metadata(scratch.join("linked/.git")).is_ok(),
         "{applied}"
     );
-    assert!(std::fs::symlink_metadata(scratch.join("outside")).is_err());
+    assert_eq!(paths(&applied, "retained_ignored"), ["target/tmp"]);
+    assert!(
+        std::fs::symlink_metadata(scratch.join("outside"))
+            .unwrap()
+            .is_symlink()
+    );
+    assert!(!fixture.tree.join("target/debug").exists());
 }
 
 /// A `.git` directly in an untagged target's root (`git init target`): the target falls to its
@@ -583,11 +604,15 @@ fn restore(fixture: &Fixture, archive: &Path) -> PathBuf {
 /// and `gc --apply` then removed the tree and the only copy of its commit. Outcome: the tree is
 /// collected, `dirty.patch` holds every file of the repository as an ordinary untracked file,
 /// the profile's own layout stays left out, and applying the patch restores the commit.
+///
+/// A profile holding a repository now falls to its parts, so the keep file keeps this profile
+/// whole, which is the case the archive must get right.
 #[test]
 fn a_bare_repository_in_a_kept_profile_survives_finish_and_gc() {
     let fixture = Fixture::new();
     fixture.tagged_target_with_profile();
     fixture.profile("target/release");
+    write(&fixture.tree.join(".worktreekeep"), "/target/release/\n");
     let relative = "target/release/build/one/out/remote.git";
     let commit = bare_repository_with_pushed_commit(&fixture, relative);
 

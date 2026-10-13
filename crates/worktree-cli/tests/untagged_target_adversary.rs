@@ -191,52 +191,72 @@ fn kinds(cache: &Value) -> Vec<String> {
         .collect()
 }
 
+/// `(path, kind)` of every discarded entry.
+fn discarded(cache: &Value) -> Vec<(String, String)> {
+    paths(cache, "discarded")
+        .into_iter()
+        .zip(kinds(cache))
+        .collect()
+}
+
+fn pairs(expected: &[(&str, &str)]) -> Vec<(String, String)> {
+    expected
+        .iter()
+        .map(|(path, kind)| ((*path).to_owned(), (*kind).to_owned()))
+        .collect()
+}
+
 /// `tmp/` is Cargo's `CARGO_TARGET_TMPDIR`; `CARGO_TARGET_TMP` documents that "no profile is ever
 /// called this", and the classifier never treats it as one. So a `tmp/` holding `.fingerprint/`
 /// and `deps/` is not "a profile holding both", and the only profile here holds `.fingerprint/`
-/// alone: the story's contract retains this target ("with no profile holding both markers").
+/// alone: the target is no Cargo target, and goes whole as `ignored-output`.
 #[test]
 fn a_tmp_holding_both_markers_does_not_qualify_an_untagged_target() {
     let fixture = Fixture::new("/target\n", &[MANIFEST]);
     fixture.profile("target/tmp");
     write(&fixture.tree.join("target/tmp/output.log"), "scratch\n");
     fixture.fingerprint_only("target/debug");
-    write(&fixture.tree.join("target/debug/notes.md"), "kept\n");
+    write(&fixture.tree.join("target/debug/notes.md"), "not kept\n");
     write(&fixture.tree.join("target/.rustc_info.json"), "{}");
 
     let applied = fixture.discard(&[]);
-    assert!(paths(&applied, "discarded").is_empty(), "{applied}");
-    assert_eq!(paths(&applied, "retained_ignored"), ["target"], "{applied}");
-    assert_eq!(fixture.read("target/debug/notes.md"), "kept\n");
-    assert_eq!(fixture.read("target/tmp/output.log"), "scratch\n");
+    assert_eq!(
+        discarded(&applied),
+        pairs(&[("target", "ignored-output")]),
+        "{applied}"
+    );
+    assert!(paths(&applied, "retained_ignored").is_empty(), "{applied}");
+    assert!(!fixture.tree.join("target").exists());
 }
 
 /// The same loophole through the other call site: Git reports `target/release/` and
 /// `target/tmp/` on their own (a tracked file inside `target/`), and the parent counts only
-/// because `tmp/` holds both markers.
+/// because `tmp/` holds both markers. Neither is named as Cargo's.
 #[test]
 fn a_tmp_holding_both_markers_does_not_qualify_the_parent_of_a_profile_git_reports() {
     let fixture = Fixture::new("/target\n", &[MANIFEST, ("target/README.md", "kept\n")]);
     fixture.profile("target/tmp");
     write(&fixture.tree.join("target/tmp/output.log"), "scratch\n");
     fixture.fingerprint_only("target/release");
-    write(&fixture.tree.join("target/release/notes.md"), "kept\n");
+    write(&fixture.tree.join("target/release/notes.md"), "not kept\n");
 
     let applied = fixture.discard(&[]);
-    assert!(paths(&applied, "discarded").is_empty(), "{applied}");
     assert_eq!(
-        paths(&applied, "retained_ignored"),
-        ["target/release", "target/tmp"],
+        discarded(&applied),
+        pairs(&[
+            ("target/release", "ignored-output"),
+            ("target/tmp", "ignored-output")
+        ]),
         "{applied}"
     );
-    assert_eq!(fixture.read("target/release/notes.md"), "kept\n");
-    assert_eq!(fixture.read("target/tmp/output.log"), "scratch\n");
+    assert!(paths(&applied, "retained_ignored").is_empty(), "{applied}");
+    assert_eq!(fixture.read("target/README.md"), "kept\n");
 }
 
 /// Before this unit the classifier passed `tagged = true` only for a target whose tag was valid,
 /// so the `CACHEDIR.TAG` it treated as Cargo's root metadata was always Cargo's. An untagged
 /// target now gets `tagged = true` too, and a `CACHEDIR.TAG` with a bad signature is not a file
-/// Cargo writes.
+/// Cargo writes: the target does not go whole as `cargo-target`, and the file goes on its own.
 #[test]
 fn a_bad_signature_tag_in_an_untagged_target_is_not_cargo_metadata() {
     let fixture = Fixture::new("/target\n", &[MANIFEST]);
@@ -247,17 +267,15 @@ fn a_bad_signature_tag_in_an_untagged_target_is_not_cargo_metadata() {
     );
 
     let applied = fixture.discard(&[]);
-    assert_eq!(paths(&applied, "discarded"), ["target/debug"], "{applied}");
-    assert_eq!(kinds(&applied), ["cargo-profile"]);
     assert_eq!(
-        paths(&applied, "retained_ignored"),
-        ["target/CACHEDIR.TAG"],
+        discarded(&applied),
+        pairs(&[
+            ("target/CACHEDIR.TAG", "ignored-output"),
+            ("target/debug", "cargo-profile")
+        ]),
         "{applied}"
     );
-    assert_eq!(
-        fixture.read("target/CACHEDIR.TAG"),
-        "Signature: not the cache directory tag\nwritten by hand\n"
-    );
+    assert!(paths(&applied, "retained_ignored").is_empty(), "{applied}");
     assert!(!fixture.tree.join("target/debug").exists());
 }
 
@@ -283,26 +301,19 @@ fn an_untagged_target_below_the_root_counts_only_beside_its_own_manifest() {
 
     let applied = fixture.discard(&[]);
     assert_eq!(
-        paths(&applied, "discarded"),
-        ["crates/a/target"],
+        discarded(&applied),
+        pairs(&[
+            ("crates/a/target", "cargo-target"),
+            ("crates/b/target", "ignored-output")
+        ]),
         "{applied}"
     );
-    assert_eq!(kinds(&applied), ["cargo-target"]);
-    assert_eq!(
-        paths(&applied, "retained_ignored"),
-        ["crates/b/target"],
-        "{applied}"
-    );
-    assert!(
-        fixture
-            .tree
-            .join("crates/b/target/debug/deps/libone.rlib")
-            .exists()
-    );
+    assert!(paths(&applied, "retained_ignored").is_empty(), "{applied}");
+    assert!(fixture.tree.join("crates/b/Cargo.toml").is_file());
 }
 
 #[test]
-fn case_variants_of_the_target_name_are_retained() {
+fn case_variants_of_the_target_name_are_not_cargo_targets() {
     let fixture = Fixture::new("/Target\n/TARGET\n", &[MANIFEST]);
     for name in ["Target", "TARGET"] {
         fixture.profile(&format!("{name}/debug"));
@@ -310,12 +321,14 @@ fn case_variants_of_the_target_name_are_retained() {
     }
 
     let applied = fixture.discard(&[]);
-    assert!(paths(&applied, "discarded").is_empty(), "{applied}");
-    let mut retained = paths(&applied, "retained_ignored");
-    retained.sort();
-    assert_eq!(retained, ["TARGET", "Target"]);
-    assert_eq!(fixture.read("Target/tmp/output.log"), "scratch\n");
-    assert_eq!(fixture.read("TARGET/tmp/output.log"), "scratch\n");
+    let mut gone = discarded(&applied);
+    gone.sort();
+    assert_eq!(
+        gone,
+        pairs(&[("TARGET", "ignored-output"), ("Target", "ignored-output")]),
+        "{applied}"
+    );
+    assert!(paths(&applied, "retained_ignored").is_empty(), "{applied}");
 }
 
 #[test]
@@ -331,11 +344,12 @@ fn markers_that_are_regular_files_do_not_qualify_an_untagged_target() {
     write(&fixture.tree.join("target/tmp/output.log"), "scratch\n");
 
     let applied = fixture.discard(&[]);
-    assert!(paths(&applied, "discarded").is_empty(), "{applied}");
-    assert_eq!(paths(&applied, "retained_ignored"), ["target"]);
-    assert_eq!(fixture.read("target/debug/.fingerprint"), "a file\n");
-    assert_eq!(fixture.read("target/release/deps"), "a file\n");
-    assert_eq!(fixture.read("target/tmp/output.log"), "scratch\n");
+    assert_eq!(
+        discarded(&applied),
+        pairs(&[("target", "ignored-output")]),
+        "{applied}"
+    );
+    assert!(paths(&applied, "retained_ignored").is_empty(), "{applied}");
 }
 
 /// Once a real full profile qualifies the target, a sibling profile whose `deps` is a symlink
@@ -375,8 +389,9 @@ fn symlinks_inside_a_discarded_untagged_target_are_not_followed() {
     );
 }
 
-/// Git reports a nested repository inside an ignored `target/` as `!! target/`; its `.git` and
-/// its committed files must survive while the profile goes.
+/// Git reports a nested repository inside an ignored `target/` as `!! target/`. A `.git` directly
+/// in `target/` makes the target that repository's root: its `.git`, its committed files and the
+/// profile beside them are all the repository's working tree, and the whole target is retained.
 #[test]
 fn an_untagged_target_that_is_a_nested_repository_keeps_its_repository() {
     let fixture = Fixture::new("/target\n", &[MANIFEST]);
@@ -390,14 +405,11 @@ fn an_untagged_target_that_is_a_nested_repository_keeps_its_repository() {
     fixture.profile("target/debug");
 
     let applied = fixture.discard(&[]);
-    assert_eq!(paths(&applied, "discarded"), ["target/debug"], "{applied}");
-    assert_eq!(
-        paths(&applied, "retained_ignored"),
-        ["target/.git", "target/notes.md"],
-        "{applied}"
-    );
+    assert!(paths(&applied, "discarded").is_empty(), "{applied}");
+    assert_eq!(paths(&applied, "retained_ignored"), ["target"], "{applied}");
     assert_eq!(git(&nested, &["rev-parse", "HEAD"]), head);
     assert_eq!(fixture.read("target/notes.md"), "nested record\n");
+    assert!(fixture.tree.join("target/debug/deps/libone.rlib").exists());
 }
 
 /// A file force-added inside an untagged target's profile makes Git descend into `target/`; the
@@ -420,7 +432,8 @@ fn a_tracked_file_inside_an_untagged_target_profile_survives() {
 }
 
 /// The story's premise, run against real Cargo: a `target/` made before Cargo's first build has
-/// no `CACHEDIR.TAG`, and its profile is recognised while the record beside it stays.
+/// no `CACHEDIR.TAG`, and its profile is recognised while the record the keep file keeps beside
+/// it stays.
 #[test]
 fn a_target_real_cargo_built_after_mkdir_is_recognised() {
     let manifest =
@@ -430,6 +443,7 @@ fn a_target_real_cargo_built_after_mkdir_is_recognised() {
         &[
             ("Cargo.toml", manifest),
             ("src/lib.rs", "pub fn one() {}\n"),
+            (".worktreekeep", "/target/records/\n"),
         ],
     );
     write(&fixture.tree.join("target/records/notes.md"), "a record\n");
@@ -453,20 +467,19 @@ fn a_target_real_cargo_built_after_mkdir_is_recognised() {
     assert!(fixture.tree.join("target/debug/.fingerprint").is_dir());
 
     let applied = fixture.discard(&[]);
-    let discarded = paths(&applied, "discarded");
     assert!(
-        discarded.iter().any(|path| path == "target/debug"),
+        discarded(&applied).contains(&("target/debug".to_owned(), "cargo-profile".to_owned())),
         "{applied}"
     );
     assert!(
-        discarded
+        paths(&applied, "discarded")
             .iter()
-            .all(|path| path == "target/debug" || path == "target/tmp"),
+            .all(|path| !path.starts_with("target/records")),
         "{applied}"
     );
     assert_eq!(
         paths(&applied, "retained_ignored"),
-        ["target/records"],
+        ["target/records/notes.md"],
         "{applied}"
     );
     assert_eq!(fixture.read("target/records/notes.md"), "a record\n");

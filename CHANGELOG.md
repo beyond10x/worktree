@@ -1,5 +1,40 @@
 # Changelog
 
+## Unreleased
+
+- `discard-cache` (and `finish --discard-cache`, `sweep`) treats every ignored entry Git reports
+  (`status --ignored=matching`, file or directory) as disposable, unless the repository's keep
+  file keeps it or it is or holds a repository. An ignored entry no structural rule recognises
+  is discarded as the new kind `ignored-output` instead of retained. This reverses "anything
+  unrecognised is retained": a record written into an ignored directory (`target/backlog-input/`,
+  for instance) is deleted unless the keep file keeps it.
+- The keep file is `.worktreekeep` at the tree root. Its lines are Git exclude patterns matched
+  by Git's own exclude engine (`git ls-files --others --ignored --exclude-from`), so negation,
+  directory-only patterns and anchoring mean what they mean in `.gitignore`; a path is kept when
+  a pattern matches it or one of its ancestors. Git cannot re-include a path below an excluded
+  directory, so `!dir/file` after `dir/` keeps `dir/file` too; write `dir/*` to let a negation
+  take effect. An absent keep file keeps nothing. A symbolic link, a directory or an unreadable
+  file there refuses the discard as `keep-file-invalid` and deletes nothing. The keep file itself
+  is never deleted, even when Git ignores it. Kept files are reported one by one in
+  `retained_ignored`.
+- A repository is retained whole: an entry named `.git`, a directory holding one directly, or a
+  Git directory. A directory holding a kept path, a repository, an entry on another device or one
+  that cannot be read at any depth is never deleted whole, whatever kind it is: it falls to its
+  direct entries, each classified by the same rule. 0.17.1 retained a profile, `node_modules`,
+  virtual environment, tool cache or Flutter output directory holding a repository whole; each
+  now falls to its parts.
+- A Cargo target holding anything but Cargo's layout falls to its parts: profiles stay
+  `cargo-profile`, `tmp/` stays `cargo-target-tmp`, and its `CACHEDIR.TAG`, `.rustc_info.json`
+  and everything else are discarded as `ignored-output`.
+- A symbolic link is deleted itself and never followed, and a deletion is refused as
+  `cache-state-changed` when a directory above the entry is no longer a real directory. An
+  ignored path that is not UTF-8 refuses the discard as `cache-path-not-utf8` before anything is
+  deleted, since the report could not name it.
+- The keep file, read again and scoped to the entry, and the walk for repositories are repeated
+  immediately before each deletion.
+- `ignored-output` is a new `kind` value; the CLI JSON protocol stays 4 and no field changes.
+  `archive` never reads the keep file and never modifies the tree; `sweep` never removes a tree.
+
 ## 0.17.1 — 2026-10-12
 
 - `discard-cache` (and `finish --discard-cache`, `sweep`) never deletes a nested Git repository,

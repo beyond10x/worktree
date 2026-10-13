@@ -176,11 +176,11 @@ pub trait GitPort: Send + Sync {
             ),
         ))
     }
-    /// Classify a tree's ignored entries into recognised build cache and everything else and, with
-    /// `apply`, delete the cache. The default refuses.
+    /// Classify a tree's ignored entries into disposable ones and retained ones and, with
+    /// `apply`, delete the disposable ones. The default refuses.
     ///
-    /// Recognition follows [`b10x_worktree_domain::CacheKind`]; an ignored entry no rule
-    /// recognises is retained and reported, never deleted. An applying adapter refuses as
+    /// Every ignored entry is disposable unless the keep file keeps it or it is or holds a
+    /// repository ([`b10x_worktree_domain::CacheKind`]). An applying adapter refuses as
     /// `worktree-in-use` while a process other than the caller and its ancestors uses the tree.
     fn discard_cache(
         &self,
@@ -1051,8 +1051,8 @@ where
         })
     }
 
-    /// Finish a tree after optionally discarding its recognised build cache and archiving what
-    /// remains, so that nothing which is not cache is lost.
+    /// Finish a tree after optionally discarding its unkept ignored entries and archiving what
+    /// remains, so that nothing kept is lost.
     ///
     /// With `archive`, an archive is written when the tree still differs from HEAD, or HEAD adds
     /// commits no advertised ref holds, and no existing archive already holds exactly this state.
@@ -1094,8 +1094,8 @@ where
         })
     }
 
-    /// Classify an idle tree's ignored entries and, with `apply`, delete the recognised build
-    /// cache. Every other ignored entry is retained and reported.
+    /// Classify an idle tree's ignored entries and, with `apply`, delete each one the keep file
+    /// does not keep that neither is nor holds a repository. The rest are retained and reported.
     ///
     /// A dry-run reads only. Applying is refused for a live lease, a Git lock, or a tree that is
     /// neither active nor finished.
@@ -1143,7 +1143,7 @@ where
         })
     }
 
-    /// Discard the recognised build cache of every idle tree in the workspace and archive what an
+    /// Discard the unkept ignored entries of every idle tree in the workspace and archive what an
     /// expired or finished tree still holds, so that a reviewed GC can remove it without loss.
     ///
     /// A record is idle once neither the registry nor the tree's own Git state shows activity for
@@ -1196,7 +1196,7 @@ where
                     item.refusal = Some(Refusal::new(
                         "archive-too-large",
                         format!(
-                            "{retained} bytes of ignored files are not recognised cache; archive \
+                            "{retained} bytes of ignored files are kept; archive \
                              them deliberately with `worktree archive` or remove what is not needed"
                         ),
                     ));
@@ -3190,14 +3190,14 @@ fn retained_refusal(cache: &CacheDiscard) -> Refusal {
             0 => String::new(),
             rest => format!(" and {rest} more"),
         };
-        format!("ignored entries that are not recognised cache: {named}{more}")
+        format!("ignored entries that were kept: {named}{more}")
     };
     Refusal::new(
         "worktree-dirty",
         format!(
-            "the recognised build cache was discarded and the tree still differs from HEAD ({kept}); \
-             commit what belongs to the work, or add --archive to keep the rest in an archive and \
-             finish"
+            "the ignored entries .worktreekeep does not keep were discarded and the tree still \
+             differs from HEAD ({kept}); commit what belongs to the work, or add --archive to keep \
+             the rest in an archive and finish"
         ),
     )
 }
@@ -3207,7 +3207,7 @@ fn retained_refusal(cache: &CacheDiscard) -> Refusal {
 pub struct SweepOptions {
     /// Delete and write; without it the sweep only classifies.
     pub apply: bool,
-    /// Idle seconds before a tree's recognised build cache is discarded.
+    /// Idle seconds before a tree's unkept ignored entries are discarded.
     pub discard_after_seconds: i64,
     /// Largest retained ignored content an expired tree's archive may take on; larger is refused.
     pub max_archive_bytes: u64,
@@ -3226,7 +3226,7 @@ impl Default for SweepOptions {
 /// Steps [`WorktreeManager::finish_with`] takes before finishing.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct FinishOptions {
-    /// Delete the recognised build cache first.
+    /// Delete the ignored entries the keep file does not keep first.
     pub discard_cache: bool,
     /// Archive whatever the tree still holds that no advertised ref recovers.
     pub archive: bool,

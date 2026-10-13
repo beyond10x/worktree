@@ -1,13 +1,26 @@
-//! Build caches a tree may discard: ignored content its own tool recreates from tracked sources.
+//! What a tree may discard: every ignored entry Git reports, unless the repository keeps it.
 //!
-//! A directory's name never makes it cache. Each rule below names the structure that does, and an
-//! ignored entry no rule recognises is retained, because agents keep records in ignored
-//! directories too: on 2026-10-06 a prune of every ignored `target/` by name deleted review
-//! records that committed evidence cites under `target/`.
+//! Git's own exclude rules say which paths a repository calls disposable. An ignored entry is
+//! retained only when the tree's keep file ([`KEEP_FILE`]) keeps it, when it is or holds a
+//! repository, or when it sits on another device or cannot be read; a directory holding a kept
+//! path or a repository is never deleted whole and falls to its direct entries. Records an agent
+//! must keep therefore belong outside ignored directories or in the keep file: on 2026-10-06 a
+//! prune deleted review records that committed evidence cites under an ignored `target/`.
+//!
+//! A directory's name never makes it cache. The structural rules below name the build cache an
+//! entry was also recognised as ([`CacheKind`]); every other disposable entry is
+//! [`CacheKind::IgnoredOutput`].
 
 use crate::{ArchiveEvidence, Refusal, WorktreeId, WorktreeRecord};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+
+/// The repository's keep file (`worktree.cache.KeepFile`), at the tree root: Git exclude
+/// patterns naming ignored paths `discard-cache` keeps. A path is kept when a pattern matches it
+/// or one of its ancestors, as Git's own exclude engine decides. Absent, nothing is kept; a
+/// symbolic link, a directory or an unreadable file there refuses the discard as
+/// `keep-file-invalid`. The keep file itself is never discarded.
+pub const KEEP_FILE: &str = ".worktreekeep";
 
 /// The file that marks a cache directory, per the Cache Directory Tagging Specification.
 pub const CACHEDIR_TAG_FILE: &str = "CACHEDIR.TAG";
@@ -112,17 +125,20 @@ pub fn is_cache_tag(contents: &[u8]) -> bool {
     contents.starts_with(CACHEDIR_TAG_SIGNATURE)
 }
 
-/// Why an ignored directory was recognised as cache.
+/// Why an ignored entry was discarded.
+///
+/// Every ignored entry Git reports is disposable unless the keep file ([`KEEP_FILE`]) keeps it,
+/// it is a repository (an entry named `.git`, a directory holding one directly, or a Git
+/// directory), it sits on another device than the tree root, or it cannot be read. A directory
+/// holding any of those at any depth is never deleted whole: it falls to its direct entries,
+/// each classified by the same rule. The structural variants name the build cache an entry was
+/// recognised as; [`CacheKind::IgnoredOutput`] is every other disposable entry.
 ///
 /// A Cargo target is tagged by a valid `CACHEDIR.TAG`. One without a valid tag counts as tagged
 /// when it is named [`CARGO_UNTAGGED_TARGET`], a tracked [`CARGO_MANIFEST`] sits beside it, and a
 /// direct child is a profile holding both [`CARGO_PROFILE_MARKER`] and [`CARGO_PROFILE_DEPS`] as
-/// real directories. The Cargo kinds below then apply to it unchanged.
-///
-/// A nested repository is never cache, whatever kind of directory holds it: a recognised
-/// directory holding a `.git` (file, directory or symbolic link) at any depth is not deleted
-/// whole. A whole target holding one falls to its parts, `tmp/` to its direct entries, and every
-/// other kind is retained.
+/// real directories. The Cargo kinds below then apply to it unchanged. A target holding anything
+/// but Cargo's layout falls to its parts, each named by its own rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum CacheKind {
@@ -146,9 +162,13 @@ pub enum CacheKind {
     PythonVirtualenv,
     /// A tagged `.pytest_cache`, `.mypy_cache` or `.ruff_cache`.
     ToolCache,
+    /// An ignored file, symbolic link (deleted itself, never followed) or real directory that no
+    /// structural variant recognises, that the keep file does not keep, and that neither is nor
+    /// holds a repository or a kept path.
+    IgnoredOutput,
 }
 
-/// One ignored directory recognised as cache.
+/// One discarded ignored entry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiscardedCache {
     /// Path relative to the tree root.
@@ -159,12 +179,13 @@ pub struct DiscardedCache {
     pub allocated_bytes: u64,
 }
 
-/// What a Git adapter recognised among one tree's ignored entries.
+/// How a Git adapter classified one tree's ignored entries.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CacheClassification {
-    /// Recognised cache; deleted when the discard was applied.
+    /// Disposable entries; deleted when the discard was applied.
     pub discarded: Vec<DiscardedCache>,
-    /// Every other ignored entry, relative to the tree root. Never deleted.
+    /// Ignored entries the keep file keeps, repositories, and entries on another device or not
+    /// readable, relative to the tree root. Never deleted.
     pub retained_ignored: Vec<PathBuf>,
     /// Allocated bytes of the retained ignored entries, without following symbolic links.
     #[serde(default)]
@@ -184,9 +205,9 @@ pub struct CacheDiscard {
     pub observed_at: i64,
     /// False for a dry-run: entries were classified and nothing was deleted.
     pub applied: bool,
-    /// Recognised cache.
+    /// Disposable entries.
     pub discarded: Vec<DiscardedCache>,
-    /// Every other ignored entry; `worktree archive` keeps these.
+    /// Retained ignored entries; `worktree archive` keeps these.
     pub retained_ignored: Vec<PathBuf>,
     /// Allocated bytes of the retained ignored entries.
     #[serde(default)]
@@ -214,7 +235,7 @@ pub struct SweepItem {
 }
 
 impl CacheDiscard {
-    /// Total allocated bytes of the recognised cache.
+    /// Total allocated bytes of the discarded entries.
     #[must_use]
     pub fn discarded_bytes(&self) -> u64 {
         self.discarded
@@ -238,5 +259,18 @@ mod tests {
         ));
         assert!(!is_cache_tag(b""));
         assert!(!is_cache_tag(b"Signature: 0000"));
+    }
+
+    /// `ignored-output` is a new kind value on the unchanged JSON protocol.
+    #[test]
+    fn ignored_output_is_a_kebab_case_kind() {
+        assert_eq!(
+            serde_json::to_value(CacheKind::IgnoredOutput).unwrap(),
+            serde_json::json!("ignored-output")
+        );
+        assert_eq!(
+            serde_json::from_value::<CacheKind>(serde_json::json!("ignored-output")).unwrap(),
+            CacheKind::IgnoredOutput
+        );
     }
 }

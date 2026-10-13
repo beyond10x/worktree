@@ -30,9 +30,9 @@ worktree status
 worktree hook heartbeat --path <tree> --session <session-id>
 # Publish wanted changes.
 worktree hook session-end --path <tree> --session <session-id>
-# Review which ignored directories are recognised build cache; everything else is kept.
+# Review which ignored entries would be deleted; `.worktreekeep` and repositories are kept.
 worktree discard-cache <tree> --dry-run
-# Delete that cache, archive whatever no remote ref recovers, and finish.
+# Delete them, archive whatever no remote ref recovers, and finish.
 worktree finish --discard-cache --archive <tree>
 worktree gc --repo /path/to/repository --dry-run --id <reviewed-id>
 worktree gc --repo /path/to/repository --apply --id <reviewed-id>
@@ -55,27 +55,36 @@ are canonical, disjoint paths. Create plans resolve the requested base to an imm
 revalidate the repository, policy-derived destination, and exact Git worktree membership before
 changing state.
 
-`worktree discard-cache` recognises build cache by structure, never by a directory's name: a Cargo
-profile (it holds `.fingerprint/`) inside a target carrying a valid `CACHEDIR.TAG`, that target's
-`tmp/` test scratch (Cargo's `CARGO_TARGET_TMPDIR`) when the target holds a
-profile, `node_modules` at or below a tracked npm, Yarn, pnpm or Bun lockfile, a virtual environment (`pyvenv.cfg`) beside
-a tracked Python manifest, a Flutter app's `<P>/build/` or `<P>/.dart_tool/` (as `flutter-output`) when
-`<P>/pubspec.yaml` is a regular file beside it and neither HEAD nor the index tracks anything at or
-below it, and a tagged `.pytest_cache`, `.mypy_cache` or `.ruff_cache`. A `build/` with no
-`pubspec.yaml` beside it is kept. A nested repository is never cache, because it may hold commits
-no remote does: a recognised directory of any kind holding a `.git` (a file, a directory or a
-symbolic link) at any depth below it, or a bare or `--separate-git-dir` Git directory (`HEAD`,
-`objects/` and `refs/`) at or below it, is never deleted whole. A whole target holding one falls to
-its parts, each profile, nested target and `tmp/` under its own rule; a `tmp/` holding one deletes
-each direct entry that holds none and keeps each that holds one, such as a test's fixture
-repository; every other directory holding one is kept whole. The walk that looks for it follows no
-symbolic link and runs again immediately before each deletion, and a directory it cannot read is
-kept too (`archive` images such a repository). A directory that is a cargo target too is classified by the cargo rule alone. Cargo
-writes the tag only when it creates the target itself, so a `target/` made before the first build
-has none; such a directory counts as tagged when a tracked `Cargo.toml` sits beside it and a
-child other than `tmp/` holds both `.fingerprint/` and `deps/`. Every other
-ignored entry, including records written inside `target/`, is kept and named in the report. It
-follows no symbolic link, and it refuses while a session lease is live, Git locks the tree, or
+`worktree discard-cache` deletes every ignored entry Git reports, file or directory, unless the
+repository keeps it. A repository keeps paths in `.worktreekeep` at the tree root: Git exclude
+patterns, matched by Git's own exclude engine, so negation, directory-only patterns and anchoring
+mean what they mean in `.gitignore`, and a path is kept when a pattern matches it or one of its
+ancestors. Git cannot re-include a path below an excluded directory, so write `dir/*` rather than
+`dir/` when a `!` line should take effect. Without the file nothing is kept; a symbolic link, a
+directory or an unreadable file there refuses the discard as `keep-file-invalid`. Records written
+into an ignored directory such as `target/` are deleted unless `.worktreekeep` keeps them.
+
+A nested repository is never deleted either, because it may hold commits no remote does: an entry
+named `.git` (a file, a directory or a symbolic link), a directory holding one, or a bare or
+`--separate-git-dir` Git directory (`HEAD`, `objects/` and `refs/`) is kept whole, and so is an
+entry on another device or one that cannot be read. A directory holding a kept path or a
+repository at any depth is never deleted whole: it falls to its direct entries, each classified by
+the same rule. The walk that looks for them follows no symbolic link, and it and the keep file
+run again immediately before each deletion (`archive` images such a repository).
+
+Each deleted entry is named by the structure that recognises it, never by a directory's name: a
+Cargo profile (it holds `.fingerprint/`) inside a target carrying a valid `CACHEDIR.TAG`, that
+target's `tmp/` test scratch (Cargo's `CARGO_TARGET_TMPDIR`) when the target holds a profile,
+`node_modules` at or below a tracked npm, Yarn, pnpm or Bun lockfile, a virtual environment
+(`pyvenv.cfg`) beside a tracked Python manifest, a Flutter app's `<P>/build/` or `<P>/.dart_tool/`
+(as `flutter-output`) when `<P>/pubspec.yaml` is a regular file beside it and neither HEAD nor the
+index tracks anything at or below it, and a tagged `.pytest_cache`, `.mypy_cache` or
+`.ruff_cache`; everything else is `ignored-output`. A directory that is a cargo target too is
+classified by the cargo rule alone. Cargo writes the tag only when it creates the target itself,
+so a `target/` made before the first build has none; such a directory counts as tagged when a
+tracked `Cargo.toml` sits beside it and a child other than `tmp/` holds both `.fingerprint/` and
+`deps/`. A target holding anything but Cargo's layout falls to its parts. A symbolic link is
+deleted itself, never followed, and it refuses while a session lease is live, Git locks the tree, or
 another process has its working directory, executable or an open file inside the tree (observed
 through `/proc` on Linux; elsewhere the report says processes were not observed).
 

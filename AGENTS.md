@@ -108,32 +108,42 @@ independent policy: every decision must come from the public façade.
   or below which HEAD or the index tracks anything, and any entry that is not a file, directory or
   symlink are refused, never imaged.
 - The only command that deletes files a tree's owner wrote is `discard-cache` (and `finish
-  --discard-cache`), and it deletes only ignored, real directories recognised as build cache by
-  structure: a Cargo profile holding `.fingerprint/` inside a validly tagged target, that target's
-  own real `tmp/` (Cargo's `CARGO_TARGET_TMPDIR`) when the target holds a profile,
-  `node_modules` at or below a tracked lockfile, a virtual environment beside a tracked Python
-  manifest, a Flutter app's `<P>/build/` or `<P>/.dart_tool/` that the one classifier recognises
-  on disk (a regular `<P>/pubspec.yaml` beside it, nothing HEAD or the index tracks at or below
-  it, no cargo target at it), and a tagged `.pytest_cache`, `.mypy_cache` or `.ruff_cache`. Cargo
-  tags only a target it creates, so a real directory named `target` without a valid tag counts as
+  --discard-cache`, and `sweep` through it), and it deletes only ignored entries Git reports
+  (`status --ignored=matching`, file or directory): each is disposable unless the tree's keep file
+  keeps it. The keep file is `.worktreekeep` at the tree root, read from disk; its lines are Git
+  exclude patterns matched by Git's own exclude engine (`ls-files --others --ignored
+  --exclude-from`, argv only), so negation, directory-only patterns and anchoring mean what they
+  mean in `.gitignore`, and a path is kept when a pattern matches it or one of its ancestors.
+  Absent, it keeps nothing; a symbolic link, a directory or an unreadable file there refuses as
+  `keep-file-invalid` and deletes nothing; the keep file itself is never deleted. An entry is
+  retained when it is kept, is a repository (an entry named `.git`, file, directory or symbolic
+  link; a directory holding one directly; or a Git directory whatever its name, a bare repository
+  or a `--separate-git-dir`: `HEAD` a regular file, `objects/` and `refs/` real directories, none
+  through a symbolic link), sits on another device than the tree root, or cannot be read. A
+  directory holding any of those at any depth, found by one walk that follows no symbolic link,
+  is never deleted whole: each of its direct entries is classified by the same rule. Everything
+  else is discarded; a symbolic link is deleted itself and never followed, and no deletion leaves
+  the tree. The structural rules name what they recognise: a Cargo profile holding
+  `.fingerprint/` inside a validly tagged target, a whole target of nothing but Cargo's layout,
+  that target's own real `tmp/` (Cargo's `CARGO_TARGET_TMPDIR`) or its direct entries when the
+  target holds a profile, `node_modules` at or below a tracked lockfile, a virtual environment
+  beside a tracked Python manifest, a Flutter app's `<P>/build/` or `<P>/.dart_tool/` that the
+  one classifier recognises on disk (a regular `<P>/pubspec.yaml` beside it, nothing HEAD or the
+  index tracks at or below it, no cargo target at it), and a tagged `.pytest_cache`,
+  `.mypy_cache` or `.ruff_cache`; every other disposable entry is `ignored-output`. Cargo tags
+  only a target it creates, so a real directory named `target` without a valid tag counts as
   tagged when a tracked `Cargo.toml` sits beside it and a direct child other than `tmp/` holds
-  both `.fingerprint/` and `deps/` as real directories. A nested repository is never cache: a
-  recognised directory of any kind that holds a repository, found by one walk that follows no
-  symbolic link, is never deleted whole. A repository is an entry named `.git` (file, directory
-  or symbolic link) at any depth below it, or a Git directory whatever its name (a bare
-  repository or a `--separate-git-dir`: `HEAD` a regular file, `objects/` and `refs/` real
-  directories, none through a symbolic link) at it or at any depth below it; an entry whose type
-  or a directory whose names the walk cannot read counts as one. A whole target holding one
-  falls to its parts, each profile, nested target and `tmp/` under its own rule; a `tmp/`
-  holding one deletes each direct entry (file, symbolic link or directory) that is and holds
-  none as `cargo-target-tmp` and retains each other; every other directory holding one is
-  retained whole. The walk is repeated immediately before each deletion, and a directory that is
-  or holds a repository then is retained whole. Keeping is not recovering: a tree whose kept
+  both `.fingerprint/` and `deps/` as real directories. A target holding anything but Cargo's
+  layout falls to its parts, each named by its own rule. The keep file (read again, scoped to the
+  entry) and the walk are repeated immediately before each deletion, and an entry that then is or
+  holds a kept path or a repository is retained. An ignored path that is not UTF-8 refuses the
+  discard as `cache-path-not-utf8` before anything is deleted. Records an agent must keep belong
+  outside ignored directories or in the keep file. Keeping is not recovering: a tree whose kept
   state the archive cannot image (a nested `.git` with linked worktrees) or no walk can read
-  stays, and `finish --archive` or `gc` refuses naming the path. A name alone never qualifies; anything unrecognised is
-  retained and reported. It refuses for a live lease, a Git lock, or another
-  process using the tree. The one other deletion of such files is removal through a
-  `worktree.archive/3` archive, and only of the build layout it left out, re-observed as above.
+  stays, and `finish --archive` or `gc` refuses naming the path. It refuses for a live lease, a
+  Git lock, or another process using the tree. The one other deletion of such files is removal
+  through a `worktree.archive/3` archive, and only of the build layout it left out, re-observed
+  as above.
 - `sweep` composes only `discard-cache` and `archive`. It never changes lifecycle, never removes a
   tree and never applies GC; removal stays an exact-id, reviewed `gc --apply`.
 - Ordinary GC requires canonical containment below the configured worktree root. Only exact-id

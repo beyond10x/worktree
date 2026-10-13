@@ -44,7 +44,7 @@ enum Command {
     Archive(ArchiveArgs),
     /// Mark an idle worktree finished; it must be clean or exactly match its archive.
     Finish(FinishArgs),
-    /// Delete recognised build cache from an idle tree; every other ignored file is kept.
+    /// Delete an idle tree's ignored entries, except what `.worktreekeep` keeps and repositories.
     DiscardCache(DiscardCacheArgs),
     /// Discard build cache in idle trees and archive expired ones; never removes a tree.
     Sweep(SweepArgs),
@@ -123,7 +123,8 @@ struct FinishArgs {
     /// directory.
     #[arg(default_value = ".")]
     path: PathBuf,
-    /// First delete the recognised build cache, as `worktree discard-cache` does.
+    /// First delete the ignored entries `.worktreekeep` does not keep, as `worktree
+    /// discard-cache` does.
     #[arg(long)]
     discard_cache: bool,
     /// First archive whatever the tree holds that no advertised ref recovers.
@@ -659,7 +660,7 @@ fn sweep_lines(items: &[b10x_worktree_domain::SweepItem]) -> String {
         lines.push(parts.join("; "));
     }
     lines.push(format!(
-        "{} idle tree(s): {} MiB of recognised cache, {archived} archive(s) written, {left} left as \
+        "{} idle tree(s): {} MiB of ignored output, {archived} archive(s) written, {left} left as \
          they were. Nothing was removed; review `worktree gc --dry-run`.",
         items.len(),
         discarded / MIB
@@ -674,7 +675,7 @@ fn cache_lines(cache: &b10x_worktree_domain::CacheDiscard) -> String {
         "would discard"
     };
     let mut lines = vec![format!(
-        "{verb} {} recognised cache entr{} ({} MiB) in {}",
+        "{verb} {} ignored entr{} ({} MiB) in {}",
         cache.discarded.len(),
         if cache.discarded.len() == 1 {
             "y"
@@ -693,7 +694,10 @@ fn cache_lines(cache: &b10x_worktree_domain::CacheDiscard) -> String {
         ));
     }
     for path in &cache.retained_ignored {
-        lines.push(format!("  kept {} (not recognised cache)", path.display()));
+        lines.push(format!(
+            "  kept {} (kept by .worktreekeep, a repository, or not removable)",
+            path.display()
+        ));
     }
     if !cache.processes_observed {
         lines.push(
@@ -1451,7 +1455,7 @@ fn install_agent_guidance() -> Result<()> {
 
 fn agent_guidance_block() -> String {
     format!(
-        "{GUIDANCE_BEGIN}\n## Managed worktrees\n\nFor repository changes, load the worktree skill (the b10x plugin ships it as `worktree:managing-worktrees`, with `/worktree:cleanup` for cleanup; elsewhere `worktree skill` prints it to standard output and writes no file) and use the `worktree` CLI. Create isolated trees with `worktree create`, keep primary checkouts clean, publish commits, and end with `worktree finish --discard-cache --archive <tree>`: it deletes only recognised build cache, archives anything else no remote ref holds, and finishes. Keep records out of ignored build directories such as `target/`. Work that must not be published is archived with `worktree archive <tree>`, which gc accepts as recovery proof while the tree still matches it. Review cleanup with `worktree gc --dry-run`, then pass only exact reviewed ids to `worktree gc --apply --id <id>`. Use `worktree reconcile` for interrupted provisioning, adopted legacy paths, and already-missing records; external retirement additionally requires explicit `--allow-external-retirement`, and abandoning a missing record whose recorded commit you have established is gone for good additionally requires `--acknowledge-unrecoverable <recorded-commit>`. Never force-remove or manually delete a managed tree.\n{GUIDANCE_END}\n"
+        "{GUIDANCE_BEGIN}\n## Managed worktrees\n\nFor repository changes, load the worktree skill (the b10x plugin ships it as `worktree:managing-worktrees`, with `/worktree:cleanup` for cleanup; elsewhere `worktree skill` prints it to standard output and writes no file) and use the `worktree` CLI. Create isolated trees with `worktree create`, keep primary checkouts clean, publish commits, and end with `worktree finish --discard-cache --archive <tree>`: it deletes the ignored output `.worktreekeep` does not keep, archives anything else no remote ref holds, and finishes. Keep records out of ignored build directories such as `target/`. Work that must not be published is archived with `worktree archive <tree>`, which gc accepts as recovery proof while the tree still matches it. Review cleanup with `worktree gc --dry-run`, then pass only exact reviewed ids to `worktree gc --apply --id <id>`. Use `worktree reconcile` for interrupted provisioning, adopted legacy paths, and already-missing records; external retirement additionally requires explicit `--allow-external-retirement`, and abandoning a missing record whose recorded commit you have established is gone for good additionally requires `--acknowledge-unrecoverable <recorded-commit>`. Never force-remove or manually delete a managed tree.\n{GUIDANCE_END}\n"
     )
 }
 
@@ -1539,7 +1543,7 @@ Release only your own lease with `worktree hook session-end --path <tree> --sess
 
 Before a large build, inspect free space and `worktree inspect --repo <primary> --id <id>`. Keep compiler caches and dependencies separate from source and retained evidence. Prefer a repository-supported cache location and bounded build settings; do not force a shared target directory across incompatible build configurations.
 
-After verification, preserve the small logs, reports, or deliverables needed for review in their intended durable location, never only below an ignored build directory such as `target/`. Delete build output with `worktree discard-cache [<tree>]`; run it with `--dry-run` first to see the classification. It deletes only ignored directories it recognises as cache by their structure: Cargo profiles inside a tagged target (an untagged `target/` beside a tracked `Cargo.toml` whose profile holds `.fingerprint/` and `deps/` counts as tagged) and that target's `tmp/` test scratch, `node_modules` at or below a tracked lockfile, a virtual environment beside a tracked Python manifest, a Flutter app's `build/` and `.dart_tool/` beside a `pubspec.yaml` with nothing tracked in them, and tagged `.pytest_cache`, `.mypy_cache` and `.ruff_cache`. A nested Git repository is never cache: a directory holding a `.git` at any depth is never deleted whole (a target falls to its parts, `tmp/` to its entries, anything else is kept), so a test's fixture repository survives for `archive` to image. Every other ignored entry is kept and named. It refuses while a lease is live or another process uses the tree. Ignored files can contain valuable work: never blanket-delete them or use `git clean -fdx`. A worktree saves duplicate Git history; its build output still consumes disk until it is discarded.
+After verification, preserve the small logs, reports, or deliverables needed for review in their intended durable location, never only below an ignored build directory such as `target/`. Delete ignored output with `worktree discard-cache [<tree>]`; run it with `--dry-run` first to see the classification. Every ignored entry Git reports, file or directory, is disposable unless the repository's `.worktreekeep` keeps it: that file at the tree root holds Git exclude patterns, matched by Git's own exclude engine, and a path is kept when a pattern matches it or one of its ancestors (a symbolic link, directory or unreadable file there refuses as `keep-file-invalid` and deletes nothing). A repository is never deleted either: an entry named `.git`, a directory holding one, or a Git directory stays, and a directory holding a kept path or a repository at any depth falls to its direct entries, so a test's fixture repository survives for `archive` to image. An entry on another device or one that cannot be read stays too. A symbolic link is deleted itself, never followed. Each discarded entry is named by the rule that recognises it: Cargo profiles inside a tagged target (an untagged `target/` beside a tracked `Cargo.toml` whose profile holds `.fingerprint/` and `deps/` counts as tagged) and that target's `tmp/` test scratch, `node_modules` at or below a tracked lockfile, a virtual environment beside a tracked Python manifest, a Flutter app's `build/` and `.dart_tool/` beside a `pubspec.yaml` with nothing tracked in them, tagged `.pytest_cache`, `.mypy_cache` and `.ruff_cache`, and `ignored-output` for everything else. Records written into an ignored directory are deleted unless `.worktreekeep` keeps them. It refuses while a lease is live or another process uses the tree. Never blanket-delete ignored files or use `git clean -fdx`: those honour no keep file and no nested repository. A worktree saves duplicate Git history; its build output still consumes disk until it is discarded.
 
 ## Finish and clean up
 
@@ -1547,7 +1551,7 @@ One tree reference works in `finish`, `discard-cache`, `archive`, `gc --id` and 
 
 1. Commit and publish every wanted change. A local-only commit is deliberately not cleanup-safe. Work merged as rebased or cherry-picked copies also qualifies when an advertised ref carries every unique commit's exact patch; GC reports that proof as `patch-equivalent`.
    When work must not be published, run `worktree archive <tree>` instead. It never modifies the tree; it writes `commits.bundle` (every commit no advertised ref holds), `dirty.patch` (tracked, untracked and ignored changes over HEAD, except cargo build layout: untracked files under `debug/`, `release/`, `tmp/`, a profile holding `.fingerprint/`, `CACHEDIR.TAG` or `.rustc_info.json` of a target `discard-cache` recognises, and untracked files under a Flutter app's `build/` or `.dart_tool/` beside a `pubspec.yaml` with nothing tracked in them; other files under `target/` stay archived), one `nested-<n>.tar` byte image per nested Git repository in the tree's files (such as a test fixture in an ignored directory), and a `worktree.archive/1` (`/2` with images, `/3` when it left build layout out, recorded as `build_output`) `manifest.json` below the state directory's `worktree/archives/<repository>/<id>/`, and verifies them. GC then accepts that archive as `archive` proof while HEAD and every file still match it exactly; any later commit or edit is refused as `archive-stale` until `worktree archive --replace <tree>` writes a new one. `--replace` moves the old archive aside and never deletes it.
-2. Preserve required evidence. Release your own lease, then run `worktree finish --discard-cache --archive <tree>`. It deletes the recognised build cache, archives whatever the tree still holds that no advertised ref recovers, and finishes, so nothing that is not cache is lost. Without `--archive` it refuses a tree that still differs from HEAD and names what was kept. Every form refuses locked, unmanaged, live, or mid-operation Git worktrees; plain `worktree finish <tree>` also refuses a dirty tree unless its archive holds exactly the current state.
+2. Preserve required evidence. Release your own lease, then run `worktree finish --discard-cache --archive <tree>`. It deletes every ignored entry `.worktreekeep` does not keep (as `discard-cache` does), archives whatever the tree still holds that no advertised ref recovers, and finishes, so nothing kept is lost. Without `--archive` it refuses a tree that still differs from HEAD and names what was kept. Every form refuses locked, unmanaged, live, or mid-operation Git worktrees; plain `worktree finish <tree>` also refuses a dirty tree unless its archive holds exactly the current state.
 3. Run `worktree gc --repo <primary> --dry-run --id <id>` and inspect every result. Without exact ids, gc assesses only the records of the repository `--repo` resolves to (`--scope repo`, the default; a linked tree resolves to its primary). Add `--scope profile` to assess every record under the activated profile's `workspace_root`, including other repositories; that refreshes each repository's remote advertisements and takes correspondingly longer. `--id` assesses the named records whatever the scope.
 4. Run `worktree gc --repo <primary> --apply --id <reviewed-id>` with repeated `--id` values only for the exact results intended for removal. The command refreshes remote advertisements, fetches required objects, and revalidates immediately before non-forced removal. Check the result before reporting storage reclaimed.
 5. End with either verified cleanup or an explicit handoff: tree id and path, published branch/commit, related work-item references, retained evidence, remaining blockers, next owner and next action. Never leave a tree silently active or label work complete merely from its age or Git state.
@@ -1555,7 +1559,7 @@ One tree reference works in `finish`, `discard-cache`, `archive`, `gc --id` and 
 ## Audit and recovery
 
 - Run `worktree inspect --repo <path>` for actual Git state, separate ignored-file counts, storage, leases, and retention blockers. It defaults to that repository; add `--workspace` to expand to its profile and repeat `--id` to narrow the selection. Sizes are bounded observations, not promised reclaimable bytes. Add `--refresh` for fresh remote recovery evidence (which may fetch objects). Inspection never changes lifecycle or infers owner abandonment or story completion; review GC separately before removal.
-- Operators run `worktree sweep --all-profiles` daily from a timer. It discards the recognised build cache of every tree idle for a day or more without a live lease, and archives what an expired or finished tree still holds; it never changes lifecycle, removes a tree, or applies GC. A tree it archived shows as eligible in `worktree gc --dry-run`, run from its repository or with `--scope profile`. Add `--dry-run` to see what it would do.
+- Operators run `worktree sweep --all-profiles` daily from a timer. It discards the ignored entries `.worktreekeep` does not keep (as `discard-cache` does) of every tree idle for a day or more without a live lease, and archives what an expired or finished tree still holds; it never changes lifecycle, removes a tree, or applies GC. A tree it archived shows as eligible in `worktree gc --dry-run`, run from its repository or with `--scope profile`. Add `--dry-run` to see what it would do.
 - Run `worktree status` for durable lifecycle state. It accepts no filter and reports every record in every profile, so read `repository_root` on each one before acting.
 - Run `worktree repo list --repo <path>` to distinguish managed, unmanaged, primary, and linked checkouts.
 - Run `worktree reconcile --repo <path> --dry-run` to assess interrupted provisioning, adopted legacy paths, finished external trees, and missing records.
@@ -1727,6 +1731,19 @@ mod tests {
         assert!(markdown.contains("`/3` when it left build layout out"));
         assert!(interface.contains("$worktree"));
         assert!(interface.contains("Generated by `worktree skill`"));
+    }
+
+    /// The skill states the keep-file rule, not the retired "every other ignored entry is kept".
+    #[test]
+    fn generated_skill_states_that_unkept_ignored_entries_are_disposable() {
+        let markdown = skill_markdown();
+
+        assert!(markdown.contains("disposable unless the repository's `.worktreekeep` keeps it"));
+        assert!(markdown.contains("`keep-file-invalid`"));
+        assert!(markdown.contains("`ignored-output` for everything else"));
+        assert!(markdown.contains("deleted unless `.worktreekeep` keeps them"));
+        assert!(!markdown.contains("Every other ignored entry is kept"));
+        assert!(!markdown.contains("recognised build cache"));
     }
 
     #[test]
