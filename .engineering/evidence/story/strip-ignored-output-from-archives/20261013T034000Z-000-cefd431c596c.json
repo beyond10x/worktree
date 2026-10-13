@@ -1,0 +1,12 @@
+{
+  "at": "2026-10-13T03:40:00Z",
+  "actor": "human:timo",
+  "artifact": "story:strip-ignored-output-from-archives",
+  "kind": "story",
+  "revision": 3,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "fmt, clippy -D warnings, cargo test --workspace --locked --no-fail-fast (390 passed) on 98d8e11"
+  }
+}
