@@ -670,16 +670,15 @@ impl RegistryPort for SqliteRegistry {
             )
             .optional()
             .map_err(database_error)?;
-        if let Some((relocation_source, relocation_head)) = relocation {
-            if intent.operation != "retire-external"
+        if let Some((relocation_source, relocation_head)) = relocation
+            && (intent.operation != "retire-external"
                 || relocation_source != path
-                || relocation_head != intent.head
-            {
-                return Err(Refusal::new(
-                    "removal-relocation-mismatch",
-                    "pending relocation can only be superseded by retirement of its exact source and HEAD",
-                ));
-            }
+                || relocation_head != intent.head)
+        {
+            return Err(Refusal::new(
+                "removal-relocation-mismatch",
+                "pending relocation can only be superseded by retirement of its exact source and HEAD",
+            ));
         }
         transaction.commit().map_err(database_error)
     }
@@ -705,16 +704,15 @@ impl RegistryPort for SqliteRegistry {
             )
             .optional()
             .map_err(database_error)?;
-        if let Some((relocation_source, _, relocation_head)) = relocation.as_ref() {
-            if intent.operation != "retire-external"
+        if let Some((relocation_source, _, relocation_head)) = relocation.as_ref()
+            && (intent.operation != "retire-external"
                 || relocation_source != path_text(&intent.path)?
-                || relocation_head != &intent.head
-            {
-                return Err(Refusal::new(
-                    "removal-relocation-mismatch",
-                    "pending relocation can only be completed by retirement of its exact source and HEAD",
-                ));
-            }
+                || relocation_head != &intent.head)
+        {
+            return Err(Refusal::new(
+                "removal-relocation-mismatch",
+                "pending relocation can only be completed by retirement of its exact source and HEAD",
+            ));
         }
         changed(
             transaction.execute(

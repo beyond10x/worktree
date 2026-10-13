@@ -1229,14 +1229,13 @@ where
             }
         }
         let existing = self.existing_archive(record)?;
-        if let Some(dir) = &existing {
-            if self
+        if let Some(dir) = &existing
+            && self
                 .git
                 .verify_archived_state(record, dir, &snapshot.head)
                 .is_ok()
-            {
-                return Ok(None);
-            }
+        {
+            return Ok(None);
         }
         self.archive(path, existing.is_some()).map(Some)
     }
@@ -2086,13 +2085,13 @@ where
                 }
                 self.git.validate_move_worktree(from, to)?;
                 let snapshot = self.exact_worktree_snapshot(&record.repository_root, from)?;
-                if let Some(intent) = self.registry.relocation(record.id.as_str())? {
-                    if snapshot.head != intent.head {
-                        return Err(Refusal::new(
-                            "relocation-head-changed",
-                            "worktree HEAD changed after relocation was planned",
-                        ));
-                    }
+                if let Some(intent) = self.registry.relocation(record.id.as_str())?
+                    && snapshot.head != intent.head
+                {
+                    return Err(Refusal::new(
+                        "relocation-head-changed",
+                        "worktree HEAD changed after relocation was planned",
+                    ));
                 }
             }
             (None, Some(destination)) => {
@@ -2570,13 +2569,13 @@ where
     }
 
     fn require_matching_removal_intent(&self, record: &WorktreeRecord) -> Result<(), Refusal> {
-        if let Some(intent) = self.registry.removal(record.id.as_str())? {
-            if intent.path != record.path {
-                return Err(Refusal::new(
-                    "removal-intent-mismatch",
-                    "pending removal proof does not match the current worktree path",
-                ));
-            }
+        if let Some(intent) = self.registry.removal(record.id.as_str())?
+            && intent.path != record.path
+        {
+            return Err(Refusal::new(
+                "removal-intent-mismatch",
+                "pending removal proof does not match the current worktree path",
+            ));
         }
         Ok(())
     }
@@ -2680,13 +2679,13 @@ where
                 "worktree HEAD changed while remote recovery proof was collected",
             ));
         }
-        if let Some(intent) = self.registry.removal(record.id.as_str())? {
-            if intent.path != path || intent.operation != operation {
-                return Err(Refusal::new(
-                    "removal-intent-mismatch",
-                    "pending removal intent differs from the revalidated operation",
-                ));
-            }
+        if let Some(intent) = self.registry.removal(record.id.as_str())?
+            && (intent.path != path || intent.operation != operation)
+        {
+            return Err(Refusal::new(
+                "removal-intent-mismatch",
+                "pending removal intent differs from the revalidated operation",
+            ));
         }
         let intent = RemovalIntent {
             id: record.id.clone(),
@@ -3695,16 +3694,15 @@ mod tests {
                 .unwrap()
                 .get(intent.id.as_str())
                 .cloned();
-            if let Some(relocation) = relocation {
-                if intent.operation != "retire-external"
+            if let Some(relocation) = relocation
+                && (intent.operation != "retire-external"
                     || relocation.from != intent.path
-                    || relocation.head != intent.head
-                {
-                    return Err(Refusal::new(
-                        "removal-relocation-mismatch",
-                        "pending relocation can only be superseded by retirement of its exact source and HEAD",
-                    ));
-                }
+                    || relocation.head != intent.head)
+            {
+                return Err(Refusal::new(
+                    "removal-relocation-mismatch",
+                    "pending relocation can only be superseded by retirement of its exact source and HEAD",
+                ));
             }
             self.removals
                 .lock()
@@ -3724,16 +3722,14 @@ mod tests {
                 .unwrap()
                 .get(intent.id.as_str())
                 .cloned()
-            {
-                if intent.operation != "retire-external"
+                && (intent.operation != "retire-external"
                     || relocation.from != intent.path
-                    || relocation.head != intent.head
-                {
-                    return Err(Refusal::new(
-                        "removal-relocation-mismatch",
-                        "pending relocation can only be completed by retirement of its exact source and HEAD",
-                    ));
-                }
+                    || relocation.head != intent.head)
+            {
+                return Err(Refusal::new(
+                    "removal-relocation-mismatch",
+                    "pending relocation can only be completed by retirement of its exact source and HEAD",
+                ));
             }
             self.mark_removed(evidence)?;
             self.removals.lock().unwrap().remove(intent.id.as_str());
