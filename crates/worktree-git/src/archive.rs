@@ -2303,10 +2303,11 @@ fn require_streamed(
 }
 
 /// The text a `new file mode` section adds, collected line by line: its added lines, with the
-/// newline a `\ No newline at end of file` marker removes taken off. A binary section has none.
+/// newline a `\ No newline at end of file` marker removes taken off. A binary section, or one
+/// that adds anything but a regular file (a symbolic link, a gitlink), has none.
 #[derive(Debug, Default)]
 struct AddedText {
-    binary: bool,
+    unreadable: bool,
     in_hunk: bool,
     after_added: bool,
     bytes: Vec<u8>,
@@ -2315,14 +2316,18 @@ struct AddedText {
 impl AddedText {
     /// Observe one line of the section after its `diff --git` line, newline included.
     fn observe(&mut self, line: &[u8]) {
-        if self.binary {
+        if self.unreadable {
             return;
         }
-        if !self.in_hunk
-            && (line.starts_with(b"GIT binary patch") || line.starts_with(b"Binary files "))
-        {
-            self.binary = true;
-            return;
+        if !self.in_hunk {
+            let mode = line.strip_prefix(b"new file mode ").map(<[u8]>::trim_ascii);
+            if mode.is_some_and(|mode| !matches!(mode, b"100644" | b"100755"))
+                || line.starts_with(b"GIT binary patch")
+                || line.starts_with(b"Binary files ")
+            {
+                self.unreadable = true;
+                return;
+            }
         }
         if line.starts_with(b"@@") {
             self.in_hunk = true;
@@ -2343,14 +2348,28 @@ impl AddedText {
         self.after_added = false;
     }
 
-    /// The text added, or `None` for a binary section.
+    /// The text added, or `None` when it is not a regular text file.
     fn text(self) -> Option<Vec<u8>> {
-        (!self.binary).then_some(self.bytes)
+        (!self.unreadable).then_some(self.bytes)
     }
 }
 
-/// Per index of a section naming the root keep file, the text it adds (`None`: binary).
-type KeepTexts = BTreeMap<usize, Option<Vec<u8>>>;
+/// Whether a keep file's content is text: Git's own test, no NUL in its first 8000 bytes.
+fn keep_text(content: Vec<u8>) -> Option<Vec<u8>> {
+    (!content.iter().take(8000).any(|byte| *byte == 0)).then_some(content)
+}
+
+/// What the scan collects beside the sections for the exclude rules.
+#[derive(Debug, Default)]
+struct ScanNotes {
+    /// Per index of a section naming the root keep file, the text it adds (`None`: not a
+    /// regular text file).
+    keep_texts: BTreeMap<usize, Option<Vec<u8>>>,
+    /// Indexes of the sections whose decoded path is a `.gitignore`.
+    ignore_sections: Vec<usize>,
+    /// A section whose path did not decode names a `.gitignore` in its header.
+    undecodable_ignore: bool,
+}
 
 /// Stream an archive's `dirty.patch` into its `diff --git` sections, verifying the digest the
 /// manifest records. Nothing is written.
@@ -2362,22 +2381,40 @@ pub(crate) fn scan_patch(
     scan_sections(archive, manifest).map(|(sections, _)| sections)
 }
 
-/// [`scan_patch`], also collecting the text each section naming the root keep file adds.
+/// Whether `path`'s last component is a `.gitignore`.
+fn names_gitignore(path: &[u8]) -> bool {
+    path.rsplit(|byte| *byte == b'/').next() == Some(GITIGNORE.as_bytes())
+}
+
+/// [`scan_patch`], also collecting what the exclude rules need ([`ScanNotes`]).
 fn scan_sections(
     archive: &Path,
     manifest: &ArchiveManifest,
-) -> Result<(Vec<ScannedSection>, KeepTexts), Refusal> {
+) -> Result<(Vec<ScannedSection>, ScanNotes), Refusal> {
     let recorded = manifest
         .patch
         .as_ref()
         .ok_or_else(|| unusable(format!("{} records no patch", archive.display())))?;
     let patch = archive.join(ARCHIVE_PATCH_FILE);
     let mut sections: Vec<(ScannedSection, NewFileSize, Option<AddedText>)> = Vec::new();
+    let mut notes = ScanNotes::default();
     let mut in_header = false;
     let digest = walk_patch(&patch, |line, starts| {
         if starts {
             let header = line.strip_suffix(b"\n").unwrap_or(line);
             let decoded = diff_git_path(header);
+            match decoded.as_deref() {
+                Some(decoded_path) if names_gitignore(decoded_path) => {
+                    notes.ignore_sections.push(sections.len());
+                }
+                None if header
+                    .windows(GITIGNORE.len())
+                    .any(|window| window == GITIGNORE.as_bytes()) =>
+                {
+                    notes.undecodable_ignore = true;
+                }
+                _ => {}
+            }
             let keep = (decoded.as_deref() == Some(KEEP_FILE.as_bytes())).then(AddedText::default);
             sections.push((
                 ScannedSection {
@@ -2409,7 +2446,6 @@ fn scan_sections(
         Ok(())
     })?;
     require_streamed(&patch, recorded, &digest)?;
-    let mut keep_texts = KeepTexts::new();
     let sections = sections
         .into_iter()
         .enumerate()
@@ -2417,37 +2453,43 @@ fn scan_sections(
             section.content_bytes = size.bytes();
             section.signed_tag = size.signed_tag();
             if let Some(keep) = keep {
-                keep_texts.insert(index, keep.text());
+                notes.keep_texts.insert(index, keep.text());
             }
             section
         })
         .collect();
-    Ok((sections, keep_texts))
+    Ok((sections, notes))
 }
 
 /// Scan an archive's patch ([`scan_patch`]) with the paths of HEAD's files and directories, read
 /// from Git and never from the patch's own headers, and what Git's exclude engine says of the
 /// paths the domain asks about ([`observe_exclusion`]). The domain marks each section HEAD tracks
 /// ([`ScannedPatch::against_head`]) and decides from those observations what is build layout or
-/// ignored output.
+/// ignored output. Scratch lives in the system's temporary directory and is removed on every path
+/// out; nothing is written below the archive root.
 pub(crate) fn scan_patch_against_head(
     archive: &Path,
     manifest: &ArchiveManifest,
 ) -> Result<ScannedPatch, Refusal> {
-    let (sections, keep_texts) = scan_sections(archive, manifest)?;
+    let (sections, notes) = scan_sections(archive, manifest)?;
     let head = HeadTree::read(archive, manifest)?;
     let mut patch =
         ScannedPatch::against_head(sections, head.files.clone(), head.directories.clone());
-    patch.exclusion = observe_exclusion(archive, manifest, &patch, &head, &keep_texts)?;
+    patch.exclusion = observe_exclusion(archive, manifest, &patch, &head, &notes)?;
     Ok(patch)
 }
 
 /// The name of a per-directory exclude file.
 const GITIGNORE: &str = ".gitignore";
 
+/// A scratch object directory in the system's temporary directory, never below the archive root.
+fn temporary_scratch(repository: &Path) -> Result<Scratch, Refusal> {
+    Scratch::new(repository, &std::env::temp_dir())
+}
+
 /// HEAD's tree as `git ls-tree` lists it, read from the repository, or from the archive's own
-/// bundle through scratch objects when the repository no longer holds it; nothing is written to
-/// the repository.
+/// bundle through temporary scratch objects when the repository no longer holds it; nothing is
+/// written to the repository or below the archive root.
 struct HeadTree {
     /// The paths HEAD's tree holds as anything but a directory.
     files: PathSet,
@@ -2471,7 +2513,7 @@ impl HeadTree {
             if let Ok(listing) = ProcessGit::output_bytes(repository, arguments(&manifest.head)) {
                 (listing, None)
             } else {
-                let scratch = Scratch::new(repository, archive.parent().unwrap_or(archive))?;
+                let scratch = temporary_scratch(repository)?;
                 let tree = archived_head_tree(&scratch, repository, archive, manifest)?;
                 let listing = run(scratch.git(repository, None).args(arguments(&tree)), None)?;
                 (listing, Some(scratch))
@@ -2514,9 +2556,7 @@ impl HeadTree {
                 ProcessGit::validate_object_id(&object)?;
                 if path == KEEP_FILE.as_bytes() {
                     head.keep_blob = Some(object);
-                } else if path.rsplit(|byte| *byte == b'/').next() == Some(GITIGNORE.as_bytes())
-                    && exclude_query_path(&path)
-                {
+                } else if names_gitignore(&path) && exclude_query_path(&path) {
                     head.ignore_files.push((path.clone(), object));
                 }
             }
@@ -2525,61 +2565,166 @@ impl HeadTree {
         Ok(head)
     }
 
-    /// The content of each blob in `objects`, read in one `git cat-file --batch`.
+    /// The content of each blob in `objects`, read from the repository or HEAD's scratch objects.
     fn blobs(&self, repository: &Path, objects: &[&str]) -> Result<Vec<Vec<u8>>, Refusal> {
-        if objects.is_empty() {
-            return Ok(Vec::new());
-        }
-        let mut command = if let Some(scratch) = &self.scratch {
+        let command = if let Some(scratch) = &self.scratch {
             scratch.git(repository, None)
         } else {
             let mut command = Command::new("git");
             command.arg("-C").arg(repository);
             command
         };
-        command.args(["cat-file", "--batch"]);
-        let mut input = objects.join("\n").into_bytes();
-        input.push(b'\n');
-        let output = run(&mut command, Some(input))?;
-        let malformed = || unusable("git cat-file --batch wrote a malformed record".into());
-        let mut rest = output.as_slice();
-        let mut blobs = Vec::with_capacity(objects.len());
-        for object in objects {
-            let newline = rest
-                .iter()
-                .position(|byte| *byte == b'\n')
-                .ok_or_else(malformed)?;
-            let header = std::str::from_utf8(&rest[..newline]).map_err(|_| malformed())?;
-            rest = &rest[newline + 1..];
-            let fields = header.split(' ').collect::<Vec<_>>();
-            let [found, "blob", size] = fields.as_slice() else {
-                return Err(unusable(format!(
-                    "{object} is no blob HEAD holds: {header}"
-                )));
-            };
-            let size = size.parse::<usize>().map_err(|_| malformed())?;
-            if found != object || rest.len() <= size || rest[size] != b'\n' {
-                return Err(malformed());
-            }
-            blobs.push(rest[..size].to_vec());
-            rest = &rest[size + 1..];
-        }
-        Ok(blobs)
+        read_blobs(command, objects)
     }
 }
 
+/// The content of each blob in `objects`, read in one `git cat-file --batch` run by `command`.
+fn read_blobs(mut command: Command, objects: &[&str]) -> Result<Vec<Vec<u8>>, Refusal> {
+    if objects.is_empty() {
+        return Ok(Vec::new());
+    }
+    command.args(["cat-file", "--batch"]);
+    let mut input = objects.join("\n").into_bytes();
+    input.push(b'\n');
+    let output = run(&mut command, Some(input))?;
+    let malformed = || unusable("git cat-file --batch wrote a malformed record".into());
+    let mut rest = output.as_slice();
+    let mut blobs = Vec::with_capacity(objects.len());
+    for object in objects {
+        let newline = rest
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .ok_or_else(malformed)?;
+        let header = std::str::from_utf8(&rest[..newline]).map_err(|_| malformed())?;
+        rest = &rest[newline + 1..];
+        let fields = header.split(' ').collect::<Vec<_>>();
+        let [found, "blob", size] = fields.as_slice() else {
+            return Err(unusable(format!("{object} is no blob: {header}")));
+        };
+        let size = size.parse::<usize>().map_err(|_| malformed())?;
+        if found != object || rest.len() <= size || rest[size] != b'\n' {
+            return Err(malformed());
+        }
+        blobs.push(rest[..size].to_vec());
+        rest = &rest[size + 1..];
+    }
+    Ok(blobs)
+}
+
+/// The `.gitignore` files of one rule set: each path with its content.
+type IgnoreFiles = Vec<(Vec<u8>, Vec<u8>)>;
+
+/// The `.gitignore` files of the tree as archived: HEAD's, with the patch's `.gitignore` sections
+/// (additions, modifications, deletions) applied over HEAD in a scratch index. `None` when those
+/// sections do not apply: the tree's rules cannot be established.
+fn tree_ignore_files(
+    scratch: &Scratch,
+    archive: &Path,
+    manifest: &ArchiveManifest,
+    notes: &ScanNotes,
+    sections: usize,
+) -> Result<Option<IgnoreFiles>, Refusal> {
+    let repository = manifest.repository_root.as_path();
+    let recorded = manifest
+        .patch
+        .as_ref()
+        .ok_or_else(|| unusable(format!("{} records no patch", archive.display())))?;
+    let mut strip = vec![true; sections];
+    for index in &notes.ignore_sections {
+        strip[*index] = false;
+    }
+    let rules_patch = scratch.path("gitignore.patch");
+    rewrite_patch(
+        &archive.join(ARCHIVE_PATCH_FILE),
+        &rules_patch,
+        &strip,
+        recorded,
+    )?;
+    let head_tree = archived_head_tree(scratch, repository, archive, manifest)?;
+    let index = scratch.path("gitignore-index");
+    run(
+        scratch
+            .git(repository, Some(&index))
+            .args(["read-tree", &head_tree]),
+        None,
+    )?;
+    let applied = run(
+        scratch
+            .git(repository, Some(&index))
+            .args(["apply", "--cached", "--binary", "--whitespace=nowarn"])
+            .arg(&rules_patch),
+        None,
+    );
+    if applied.is_err() {
+        return Ok(None);
+    }
+    let listing = run(
+        scratch
+            .git(repository, Some(&index))
+            .args(["ls-files", "-s", "-z"]),
+        None,
+    )?;
+    let mut files = Vec::new();
+    for record in listing
+        .split(|byte| *byte == 0)
+        .filter(|record| !record.is_empty())
+    {
+        let malformed = || unusable("git ls-files -s wrote a malformed record".into());
+        let tab = record
+            .iter()
+            .position(|byte| *byte == b'\t')
+            .ok_or_else(malformed)?;
+        let (info, path) = (&record[..tab], &record[tab + 1..]);
+        let mut fields = info.split(|byte| *byte == b' ');
+        let (Some(mode), Some(object)) = (fields.next(), fields.next()) else {
+            return Err(malformed());
+        };
+        if matches!(mode, b"100644" | b"100755")
+            && names_gitignore(path)
+            && exclude_query_path(path)
+        {
+            let object = String::from_utf8(object.to_vec()).map_err(|_| malformed())?;
+            ProcessGit::validate_object_id(&object)?;
+            files.push((path.to_vec(), object));
+        }
+    }
+    let objects = files
+        .iter()
+        .map(|(_, object)| object.as_str())
+        .collect::<Vec<_>>();
+    let contents = read_blobs(scratch.git(repository, None), &objects)?;
+    Ok(Some(
+        files
+            .into_iter()
+            .zip(contents)
+            .map(|((path, _), content)| (path, content))
+            .collect(),
+    ))
+}
+
+/// The directory of a `.gitignore` path, empty for the tree root.
+fn ignore_directory(path: &[u8]) -> Vec<u8> {
+    path.iter()
+        .rposition(|byte| *byte == b'/')
+        .map_or_else(Vec::new, |at| path[..at].to_vec())
+}
+
 /// What Git's exclude engine says of the paths the domain asks about ([`exclude_queries`]),
-/// observed in scratch work trees beside the archive and never in a tree's or the primary
-/// checkout's working files: under HEAD's exclude rules, every `.gitignore` HEAD's tree holds
-/// (read from Git) and the repository's `info/exclude`; and under the keep file, from the source
-/// the domain names ([`keep_source`]). No `core.excludesFile` is read. The scratch is removed on
-/// every path out.
+/// observed in scratch work trees in the system's temporary directory and never in a tree's or
+/// the primary checkout's working files. A path is ignored only when both rule sets ignore it:
+/// HEAD's (every `.gitignore` HEAD's tree holds, read from Git) and the tree's as archived
+/// (HEAD's with the patch's `.gitignore` sections applied, [`tree_ignore_files`]); where the
+/// tree's rules cannot be established, nothing at or below the touched file's directory is
+/// stripped ([`ExcludeObservations::unknown_rules`]). The keep file comes from the source the
+/// domain names ([`keep_source`]); one that is not a regular text file keeps every path. No
+/// `info/exclude` and no `core.excludesFile` is read: either may have changed since the archive
+/// was written. The scratch is removed on every path out.
 fn observe_exclusion(
     archive: &Path,
     manifest: &ArchiveManifest,
     patch: &ScannedPatch,
     head: &HeadTree,
-    keep_texts: &KeepTexts,
+    notes: &ScanNotes,
 ) -> Result<ExcludeObservations, Refusal> {
     let mut observed = ExcludeObservations::default();
     let queries = exclude_queries(patch);
@@ -2588,68 +2733,62 @@ fn observe_exclusion(
     }
     let repository = manifest.repository_root.as_path();
     let keep = match keep_source(patch) {
-        KeepSource::Absent => None,
-        KeepSource::Head => {
-            if let Some(blob) = &head.keep_blob {
-                head.blobs(repository, &[blob.as_str()])?.pop()
-            } else {
-                observed.keep_unreadable = true;
-                None
-            }
-        }
-        KeepSource::Patch(index) => {
-            if let Some(Some(text)) = keep_texts.get(&index) {
-                Some(text.clone())
-            } else {
-                observed.keep_unreadable = true;
-                None
-            }
-        }
-        KeepSource::Unreadable => {
-            observed.keep_unreadable = true;
-            None
-        }
+        KeepSource::Absent => Some(Vec::new()),
+        KeepSource::Head => match &head.keep_blob {
+            Some(blob) => head
+                .blobs(repository, &[blob.as_str()])?
+                .pop()
+                .and_then(keep_text),
+            None => None,
+        },
+        KeepSource::Patch(index) => notes.keep_texts.get(&index).cloned().flatten(),
+        KeepSource::Unreadable => None,
     };
-    if observed.keep_unreadable {
+    let Some(keep) = keep else {
         // Every path counts as kept: nothing is stripped, so nothing more is asked.
+        observed.keep_unreadable = true;
+        return Ok(observed);
+    };
+    if notes.undecodable_ignore {
+        // A `.gitignore` the patch changes at a path that did not decode: no directory is known.
+        observed.unknown_rules.insert(Vec::new());
         return Ok(observed);
     }
-    let info_exclude =
-        ProcessGit::absolute_git_path(repository, "--git-common-dir")?.join("info/exclude");
-    let exclude = match std::fs::read(&info_exclude) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-        Err(error) => return Err(io_refusal("archive-unreadable", &info_exclude, &error)),
-    };
     let objects = head
         .ignore_files
         .iter()
         .map(|(_, object)| object.as_str())
         .collect::<Vec<_>>();
-    let ignore_files = head.blobs(repository, &objects)?;
-    let ignores = !ignore_files.is_empty() || !exclude.is_empty();
-    let keeps = keep.as_ref().is_some_and(|keep| !keep.is_empty());
-    if !ignores && !keeps {
-        return Ok(observed);
-    }
+    let head_rules: IgnoreFiles = head
+        .ignore_files
+        .iter()
+        .map(|(path, _)| path.clone())
+        .zip(head.blobs(repository, &objects)?)
+        .collect();
     let owned;
     let scratch = if let Some(scratch) = &head.scratch {
         scratch
     } else {
-        owned = Scratch::new(repository, archive.parent().unwrap_or(archive))?;
+        owned = temporary_scratch(repository)?;
         &owned
     };
-    if ignores {
-        let tree = scratch_directory(scratch, "exclude-tree")?;
-        for ((path, _), content) in head.ignore_files.iter().zip(&ignore_files) {
-            let file = tree.join(OsStr::from_bytes(path));
-            if let Some(parent) = file.parent() {
-                std::fs::create_dir_all(parent)
-                    .map_err(|error| io_refusal("archive-scratch-failed", parent, &error))?;
+    let tree_rules = if notes.ignore_sections.is_empty() {
+        None
+    } else {
+        let rules = tree_ignore_files(scratch, archive, manifest, notes, patch.sections.len())?;
+        if rules.is_none() {
+            for index in &notes.ignore_sections {
+                if let Some(path) = &patch.sections[*index].path {
+                    observed.unknown_rules.insert(ignore_directory(path));
+                }
             }
-            std::fs::write(&file, content)
-                .map_err(|error| io_refusal("archive-scratch-failed", &file, &error))?;
         }
+        Some(rules.unwrap_or_else(|| head_rules.clone()))
+    };
+    let tree_has_rules = tree_rules
+        .as_ref()
+        .map_or(!head_rules.is_empty(), |rules| !rules.is_empty());
+    if !head_rules.is_empty() && tree_has_rules {
         let mut input = Vec::new();
         for path in &queries.paths {
             input.extend_from_slice(path);
@@ -2659,14 +2798,22 @@ fn observe_exclusion(
             input.extend_from_slice(directory);
             input.extend_from_slice(b"/\0");
         }
-        for path in check_ignore(scratch, &tree, &exclude, input)? {
+        let under_head = ignored_under(scratch, "head-rules", &head_rules, input.clone())?;
+        let ignored = match &tree_rules {
+            None => under_head,
+            Some(rules) => {
+                let under_tree = ignored_under(scratch, "tree-rules", rules, input)?;
+                under_head.intersection(&under_tree).cloned().collect()
+            }
+        };
+        for path in ignored {
             match path.strip_suffix(b"/") {
                 Some(directory) => observed.ignored_directories.insert(directory.to_vec()),
                 None => observed.ignored.insert(path),
             };
         }
     }
-    if let Some(keep) = keep.filter(|_| keeps) {
+    if !keep.is_empty() {
         let tree = scratch_directory(scratch, "keep-tree")?;
         let mut input = Vec::new();
         for path in &queries.paths {
@@ -2680,6 +2827,29 @@ fn observe_exclusion(
     Ok(observed)
 }
 
+/// The `input` paths Git's exclude engine ignores under `rules`, the `.gitignore` files written
+/// into a fresh scratch work tree named `name` ([`check_ignore`]).
+fn ignored_under(
+    scratch: &Scratch,
+    name: &str,
+    rules: &IgnoreFiles,
+    input: Vec<u8>,
+) -> Result<BTreeSet<Vec<u8>>, Refusal> {
+    let tree = scratch_directory(scratch, name)?;
+    for (path, content) in rules {
+        let file = tree.join(OsStr::from_bytes(path));
+        if let Some(parent) = file.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| io_refusal("archive-scratch-failed", parent, &error))?;
+        }
+        std::fs::write(&file, content)
+            .map_err(|error| io_refusal("archive-scratch-failed", &file, &error))?;
+    }
+    Ok(check_ignore(scratch, &tree, b"", input)?
+        .into_iter()
+        .collect())
+}
+
 /// A new, empty directory below the scratch directory, as an absolute path.
 fn scratch_directory(scratch: &Scratch, name: &str) -> Result<PathBuf, Refusal> {
     let path = scratch.path(name);
@@ -2689,7 +2859,7 @@ fn scratch_directory(scratch: &Scratch, name: &str) -> Result<PathBuf, Refusal> 
 }
 
 /// The NUL-separated `input` paths Git's exclude engine ignores in `tree`, a scratch work tree,
-/// with `exclude` as the repository's `info/exclude` and nothing else beside the `.gitignore`
+/// with `exclude` as the scratch repository's `info/exclude` and nothing else beside the `.gitignore`
 /// files `tree` holds: `git check-ignore --no-index --stdin -z` in a scratch repository, with
 /// `core.excludesFile` pointing at an empty file and no user or system configuration. A path
 /// ending in `/` is asked as a directory. Every path is asked in this one process.

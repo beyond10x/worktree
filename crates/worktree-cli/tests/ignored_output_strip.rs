@@ -411,15 +411,17 @@ fn a_keep_file_the_patch_adds_keeps_and_stays() {
     );
 }
 
-/// The user's `core.excludesFile`, set or Git's default under `XDG_CONFIG_HOME`, is never read;
-/// the repository's `info/exclude` is.
+/// The user's `core.excludesFile`, set or Git's default under `XDG_CONFIG_HOME`, and the
+/// repository's `info/exclude` are never read: each may have changed since the archive was
+/// written. Only what HEAD's `.gitignore` ignores is stripped.
 #[test]
-fn a_path_only_the_users_excludes_file_ignores_stays() {
+fn a_path_only_the_users_excludes_file_or_info_exclude_ignores_stays() {
     let fixture = Fixture::new(&[(".gitignore", IGNORE)]);
     let archive = fixture.archived("global", &|tree| {
         write(&tree.join("drafts/plan.md"), "a plan\n");
         write(&tree.join("xdg/note.md"), "a note\n");
         write(&tree.join("local/cache.bin"), [0u8, 1, 2]);
+        write(&tree.join("target/out.txt"), "out\n");
     });
     write(&fixture.repository.join(".git/info/exclude"), "/local/\n");
     let excludes = fixture.root.path().join("global-excludes");
@@ -435,12 +437,15 @@ fn a_path_only_the_users_excludes_file_ignores_stays() {
         let item = fixture.assessment_with("global", user);
         assert_eq!(item["verdict"], "strippable", "{user:?}: {item}");
         assert_eq!(item["sections_stripped"], 1, "{user:?}: {item}");
-        assert_eq!(item["sections_kept"], 2, "{user:?}: {item}");
+        assert_eq!(item["sections_kept"], 3, "{user:?}: {item}");
     }
     let output = fixture.strip_with(&["--apply", "--id", "global"], Some(&global));
     assert!(output.status.success(), "{output:?}");
-    assert_eq!(patch_paths(&archive), ["drafts/plan.md", "xdg/note.md"]);
-    assert_eq!(targets(&archive), [("local".into(), "strip".into(), 1, 3)]);
+    assert_eq!(
+        patch_paths(&archive),
+        ["drafts/plan.md", "local/cache.bin", "xdg/note.md"]
+    );
+    assert_eq!(targets(&archive), [("target".into(), "strip".into(), 1, 4)]);
 }
 
 /// A bare repository below an ignored directory keeps every section; the ignored file beside it
@@ -586,6 +591,7 @@ fn ignored_output_is_recorded_per_outermost_directory_holding_no_kept_path() {
             ]),
             kept: paths(&["target/keep/z"]),
             keep_unreadable: false,
+            unknown_rules: BTreeSet::new(),
         },
         ..ScannedPatch::default()
     };
@@ -608,4 +614,14 @@ fn ignored_output_is_recorded_per_outermost_directory_holding_no_kept_path() {
     let mut unreadable = patch.clone();
     unreadable.exclusion.keep_unreadable = true;
     assert_eq!(plan_patch_strip(&unreadable).sections_stripped, 0);
+
+    // Where the tree's rules are unknown, nothing at or below that directory is stripped.
+    let mut unknown = patch.clone();
+    unknown.exclusion.unknown_rules = paths(&["target/a"]);
+    assert_eq!(
+        plan_patch_strip(&unknown).strip,
+        [false, false, false, true, false, false, false, true, false]
+    );
+    unknown.exclusion.unknown_rules = paths(&[""]);
+    assert_eq!(plan_patch_strip(&unknown).sections_stripped, 0);
 }

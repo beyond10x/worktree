@@ -88,17 +88,25 @@ independent policy: every decision must come from the public façade.
   that is both is classified by the cargo rule alone). A path with a `.git` component, or at or
   below a directory `D` for which the patch purely adds `D/HEAD` and at least one path under
   `D/objects/` (a Git directory, as the patch can show one), is never stripped. The outermost directory whose rule strips the path is recorded. Such a path is also
-  stripped as ignored output when Git's own exclude engine ignores it under HEAD's exclude rules:
-  every `.gitignore` HEAD's tree holds as a regular file (read from Git, never the patch) and the
-  repository's `info/exclude`, asked in one `git check-ignore --no-index --stdin -z` over a scratch
-  work tree beside the archive that holds only those files, with `core.excludesFile` pointed at an
-  empty file and no user or system configuration; no primary checkout's working files and no
-  `core.excludesFile` are read. A path the keep file keeps is never stripped, layout or ignored
-  output: `.worktreekeep` read from HEAD's tree, or from the patch when it purely adds it once
-  (that section stays), matched by the same engine; a keep file the patch changes otherwise, or
-  one that is not a regular file or text, keeps every path. Ignored output is recorded per
-  outermost ignored directory that HEAD does not hold and that holds no path whose section stays,
-  or per file. Both halves of
+  stripped as ignored output when Git's own exclude engine ignores it under both of two rule sets:
+  HEAD's, every `.gitignore` HEAD's tree holds as a regular file (read from Git); and the tree's
+  as archived, HEAD's `.gitignore` files with the patch's `.gitignore` additions, modifications and
+  deletions applied over HEAD in a scratch index. Where the patch's `.gitignore` sections do not
+  apply, or a `.gitignore` section's path does not decode, nothing at or below that file's
+  directory (the root, for an undecodable path) is stripped. Each rule set is asked in one
+  `git check-ignore --no-index --stdin -z` over a scratch work tree holding only its `.gitignore`
+  files, with `core.excludesFile` pointed at an empty file and no user or system configuration.
+  No primary checkout's working files, no `info/exclude` and no `core.excludesFile` are read:
+  either may have changed since the archive was written, and an unrecognised path stays. A path
+  the keep file keeps is never stripped, layout or ignored output: `.worktreekeep` read from HEAD's
+  tree, or from the patch when it purely adds it once (that section stays), matched by the same
+  engine; a keep file the patch changes otherwise, or one that is not a regular file (mode 100644
+  or 100755) holding text (no NUL in its first 8000 bytes), in HEAD or in the patch, keeps every
+  path. Ignored output is recorded per outermost directory both rule sets ignore that HEAD does
+  not hold and that holds no path whose section stays, or per file. The assessment's scratch
+  (HEAD's objects from the bundle, the scratch index, the rule work trees) lives in the system's
+  temporary directory and is removed on every path out, so a dry-run writes nothing below the
+  archive root. Both halves of
   a type change stay, an undecodable path keeps its section, and nested images are never touched. The new patch is written outside the archive, verified to apply
   over HEAD in a scratch index (never a tree's or the repository's own index), `worktree_tree` is
   recomputed from it, and only then are the patch replaced (or deleted when nothing remains) and

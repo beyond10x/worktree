@@ -42,9 +42,16 @@ types:
   #     HEAD's tree, read from Git and never from the patch, holds neither as a file or directory
   #     nor below a file. Build layout is cargo's (below a target the patch recognises,
   #     BuildOutputOrigin) or a Flutter app's (worktree.archive.FlutterOutputKind). Ignored output
-  #     is a path Git's exclude engine ignores under the exclude rules of HEAD's tree (every
-  #     `.gitignore` HEAD's tree holds, read from Git, and the repository's `info/exclude`) and
-  #     the keep file (worktree.cache.KeepFile) does not keep. A path with a `.git` component, or
+  #     is a path Git's exclude engine ignores under both HEAD's rules (every `.gitignore` HEAD's
+  #     tree holds as a regular file, read from Git) and the tree's rules as archived (HEAD's
+  #     `.gitignore` files with the patch's `.gitignore` additions, modifications and deletions
+  #     applied over HEAD in a scratch index). Where those changes do not apply, nothing at or
+  #     below the touched file's directory is stripped. Neither `info/exclude` nor any
+  #     `core.excludesFile` is read: either may have changed since the archive was written. A path
+  #     the keep file (worktree.cache.KeepFile) keeps is never stripped, layout or ignored output;
+  #     the keep file is read from HEAD's tree, or from the patch when it purely adds it (that
+  #     section stays), and one the patch changes otherwise, or that is not a regular file of
+  #     text, keeps every path. A path with a `.git` component, or
   #     at or below a directory D whose `D/HEAD` and some path under `D/objects/` the patch purely
   #     adds (a Git directory, as the patch can show one), is never build layout or ignored output
   #     and stays.
@@ -239,7 +246,10 @@ entities:
 
   # A report of one archive directory assessed by `prune-archives --strip-build-output`, not a
   # persisted lifecycle. Selection (`--repo`, `--scope repo|profile`, `--id`) and the skipped
-  # entries are exactly those of ArchivePruneAssessment. `--dry-run` (the default) writes nothing.
+  # entries are exactly those of ArchivePruneAssessment. `--dry-run` (the default) writes nothing
+  # below the archive root: the assessment's scratch (the rule work trees, a scratch index, HEAD's
+  # objects from the bundle) lives in the system's temporary directory and is removed on every
+  # path out.
   # `--apply` requires `--id`; per id it re-assesses, writes the new patch beside the old in a
   # scratch dot-directory of the repository's archive directory (never an archive entry; removed
   # on any refusal), verifies in a scratch index that it applies over HEAD (never a tree or the
@@ -247,7 +257,8 @@ entities:
   # deletes it when nothing remains, recording `patch: null`) and writes the format 3 manifest
   # last. Only sections that purely add an untracked file (`new file mode`, a C-unquoted path no
   # other section names, not held by HEAD's tree as a file or directory or below a file) whose
-  # path is build layout are stripped; both halves of a type change and every other section of a
+  # path is build layout or ignored output (worktree.archive.StripVerdict) and the keep file does
+  # not keep are stripped; both halves of a type change and every other section of a
   # tracked path stay, an undecodable path keeps its section, and nested repository images are
   # not touched. Stripping
   # never deletes an archive; removal stays `prune-archives --apply --id` under PruneVerdict.

@@ -30,8 +30,9 @@
 //! which the patch purely adds `HEAD` and some path under `objects/`.
 //!
 //! The strip also removes ignored output: a pure addition whose path Git's exclude engine ignores
-//! under HEAD's exclude rules ([`ExcludeObservations`], observed by the Git adapter for the paths
-//! [`exclude_queries`] names). A path the keep file keeps is never stripped ([`keep_source`]).
+//! under both HEAD's and the archived tree's `.gitignore` rules ([`ExcludeObservations`],
+//! observed by the Git adapter for the paths [`exclude_queries`] names). A path the keep file
+//! keeps is never stripped ([`keep_source`]).
 
 use crate::{
     ARCHIVE_PATCH_FILE, ArchiveContents, ArchiveEntryKind, ArchiveManifest, CACHEDIR_TAG_FILE,
@@ -418,20 +419,38 @@ pub struct ScannedPatch {
 }
 
 /// What Git's exclude engine says of a patch's pure additions ([`exclude_queries`]), observed by
-/// the Git adapter without reading any tree's working files: under HEAD's exclude rules (every
-/// `.gitignore` HEAD's tree holds, read from Git, and the repository's `info/exclude`; never a
-/// `core.excludesFile`), and under the keep file ([`KEEP_FILE`], from the source
-/// [`keep_source`] names).
+/// the Git adapter without reading any tree's working files. A path is ignored only when two rule
+/// sets both ignore it: HEAD's (every `.gitignore` HEAD's tree holds, read from Git) and the
+/// tree's as archived (HEAD's `.gitignore` files with the patch's `.gitignore` additions,
+/// modifications and deletions applied). No `info/exclude` and no `core.excludesFile` is read:
+/// either may have changed since the archive was written. Kept paths come from the keep file
+/// ([`KEEP_FILE`], from the source [`keep_source`] names).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ExcludeObservations {
-    /// Queried paths HEAD's exclude rules ignore, as a file or below an ignored directory.
+    /// Queried paths both rule sets ignore, as a file or below an ignored directory.
     pub ignored: BTreeSet<Vec<u8>>,
-    /// Queried directories HEAD's exclude rules ignore as directories.
+    /// Queried directories both rule sets ignore as directories.
     pub ignored_directories: BTreeSet<Vec<u8>>,
     /// Queried paths the keep file keeps: a pattern matches the path or one of its ancestors.
     pub kept: BTreeSet<Vec<u8>>,
-    /// The keep file could not be read ([`KeepSource::Unreadable`]): every path counts as kept.
+    /// The keep file could not be read ([`KeepSource::Unreadable`], or not a regular text file):
+    /// every path counts as kept.
     pub keep_unreadable: bool,
+    /// Directories of `.gitignore` files the patch touches whose rules in the tree could not be
+    /// established; empty is the tree root. Nothing at or below one is stripped.
+    pub unknown_rules: BTreeSet<Vec<u8>>,
+}
+
+impl ExcludeObservations {
+    /// Whether `path` lies at or below a directory whose rules are unknown
+    /// ([`Self::unknown_rules`]).
+    pub fn rules_unknown(&self, path: &[u8]) -> bool {
+        self.unknown_rules.iter().any(|directory| {
+            directory.is_empty()
+                || path == directory.as_slice()
+                || path_below(path, directory).is_some()
+        })
+    }
 }
 
 /// The paths a strip asks Git's exclude engine about ([`exclude_queries`]).
@@ -921,12 +940,13 @@ enum Stripped<'a> {
 /// Only a pure addition is stripped: a `new file mode` section whose path decoded, that no other
 /// section names, and that HEAD does not track ([`ScannedSection::tracked`]); and never one the
 /// keep file keeps ([`ExcludeObservations::kept`]; the root [`KEEP_FILE`] itself, and every
-/// path when the keep file is unreadable). It is build layout when its path lies below a
+/// path when the keep file is unreadable), and none at or below a directory whose rules are
+/// unknown ([`ExcludeObservations::unknown_rules`]). It is build layout when its path lies below a
 /// directory the patch's own pure additions recognise as a cargo target, by a Cargo-signed
 /// `CACHEDIR.TAG` or a profile's `.fingerprint/`, or strictly below a Flutter app's output
 /// directory ([`FlutterOutputKind`]) beside a `pubspec.yaml` HEAD holds or the patch purely adds
 /// and that is no cargo target the patch recognises; the outermost such directory is recorded.
-/// It is ignored output when HEAD's exclude rules ignore its path
+/// It is ignored output when both HEAD's and the tree's exclude rules ignore its path
 /// ([`ExcludeObservations::ignored`]); it is recorded under its outermost ancestor directory
 /// those rules ignore that HEAD does not hold and that holds no path whose section is kept, or
 /// as itself when there is none. A path with a `.git` component, or at or below a Git directory
@@ -950,6 +970,7 @@ pub fn plan_patch_strip(patch: &ScannedPatch) -> PatchStripPlan {
     let exclusion = &patch.exclusion;
     let kept = |file: &[u8]| {
         exclusion.keep_unreadable
+            || exclusion.rules_unknown(file)
             || file == KEEP_FILE.as_bytes()
             || !exclude_query_path(file)
             || exclusion.kept.contains(file)
