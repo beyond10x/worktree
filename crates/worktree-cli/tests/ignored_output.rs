@@ -543,3 +543,28 @@ fn an_ignored_keep_file_is_itself_kept() {
     assert!(fixture.tree.join(".worktreekeep").is_file());
     assert!(fixture.tree.join("scratch/notes.md").is_file());
 }
+
+/// Removal through a format 3 archive never deletes a kept path as build layout: a keep file
+/// that keeps left-out layout after the archive was written stops the removal, and the layout
+/// stays on disk.
+#[test]
+fn a_path_kept_after_the_archive_is_never_deleted_as_layout() {
+    let fixture = Fixture::tracking(&[]);
+    write(&fixture.tree.join("target/CACHEDIR.TAG"), TAG);
+    fixture.profile("target/debug");
+    let archived = fixture.ok(&["archive", fixture.tree_str()]);
+    assert_eq!(
+        archived["archive"]["manifest"]["format"], "worktree.archive/3",
+        "{archived}"
+    );
+    fixture.ok(&["finish", fixture.tree_str()]);
+    write(&fixture.tree.join(".worktreekeep"), "/target/debug/\n");
+
+    let repo = fixture.repository.to_str().unwrap();
+    let applied = fixture.ok(&["gc", "--repo", repo, "--apply", "--id", "ignored"]);
+    assert!(
+        applied["assessments"][0]["refusal"].is_object(),
+        "{applied}"
+    );
+    assert!(fixture.tree.join("target/debug/deps/libone.rlib").is_file());
+}

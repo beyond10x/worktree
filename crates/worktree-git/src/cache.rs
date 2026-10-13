@@ -2,17 +2,19 @@
 //!
 //! Every ignored entry Git reports (`status --ignored=matching`, file or directory) is
 //! disposable unless the tree's keep file ([`b10x_worktree_domain::KEEP_FILE`]) keeps it, it is a
-//! repository, it sits on another device than the tree root, or it cannot be read. Records an
-//! agent must keep are kept through the keep file, whose lines Git's own exclude engine matches
-//! (`ls-files --others --ignored --exclude-from`), so negation, directory-only
-//! patterns and anchoring mean what they mean in `.gitignore`. A directory holding a kept path or
-//! a repository at any depth is never deleted whole: it falls to its direct entries, each
-//! classified by the same rule. The structural rules in [`b10x_worktree_domain::CacheKind`] name
-//! what they recognise; everything else is `ignored-output`.
+//! repository, it is a mount point or sits on another device than the tree root, or it cannot be
+//! read. Records an agent must keep are kept through the keep file, whose lines Git's own exclude
+//! engine matches (`ls-files --others --ignored --exclude-from`), so negation, directory-only
+//! patterns and anchoring mean what they mean in `.gitignore`. A directory holding a kept path, a
+//! repository or a mount point at any depth is never deleted whole: it falls to its direct
+//! entries, each classified by the same rule. The structural rules in
+//! [`b10x_worktree_domain::CacheKind`] name what they recognise; everything else is
+//! `ignored-output`.
 //!
 //! The walk follows no symbolic link: a symbolic link is deleted itself. Every deletion is
-//! inside the tree, and the keep file and the walk for repositories are consulted again
-//! immediately before each one.
+//! inside the tree, and the keep file, the mount table and the walk for repositories are
+//! consulted again immediately before each one. `archive` reads the keep file through
+//! [`KeepSnapshot`]: a kept path is never build layout.
 
 use crate::ProcessGit;
 use b10x_worktree_domain::{
@@ -69,23 +71,188 @@ enum Observed {
     Directory,
 }
 
+/// What the tree's keep file (`worktree.cache.KeepFile`) keeps, read from disk once.
+///
+/// `discard-cache` refuses a keep file that is not a readable regular file. `archive` never
+/// refuses for it: an invalid keep file keeps everything, so nothing is left out as build layout.
+pub(crate) struct KeepSnapshot {
+    /// The keep file's bytes when it is a readable regular file; `None` when it is absent.
+    contents: Option<Vec<u8>>,
+    /// Why the keep file is invalid, when it is.
+    invalid: Option<Refusal>,
+    /// What it keeps, as Git lists it ([`kept_paths`]).
+    kept: BTreeSet<PathBuf>,
+}
+
+impl KeepSnapshot {
+    /// Read the keep file and what it keeps. Only a failing Git refuses.
+    pub(crate) fn read(worktree: &Path) -> Result<Self, Refusal> {
+        Ok(match keep_contents(worktree) {
+            Err(invalid) => Self {
+                contents: None,
+                invalid: Some(invalid),
+                kept: BTreeSet::new(),
+            },
+            Ok(None) => Self::none(),
+            Ok(Some(contents)) => Self {
+                contents: Some(contents),
+                invalid: None,
+                kept: kept_paths(worktree, None)?,
+            },
+        })
+    }
+
+    /// No keep file.
+    fn none() -> Self {
+        Self {
+            contents: None,
+            invalid: None,
+            kept: BTreeSet::new(),
+        }
+    }
+
+    /// Whether `relative` is kept: it or one of its ancestors is listed, it is the keep file
+    /// itself, or the keep file is invalid and so keeps everything.
+    pub(crate) fn keeps(&self, relative: &Path) -> bool {
+        self.invalid.is_some()
+            || relative == Path::new(KEEP_FILE)
+            || relative
+                .ancestors()
+                .filter(|ancestor| !ancestor.as_os_str().is_empty())
+                .any(|ancestor| self.kept.contains(ancestor))
+    }
+
+    /// Whether a kept path lies strictly below `relative`.
+    fn holds_kept(&self, relative: &Path) -> bool {
+        self.invalid.is_some()
+            || self
+                .kept
+                .range::<Path, _>((Bound::Excluded(relative), Bound::Unbounded))
+                .next()
+                .is_some_and(|path| path.starts_with(relative))
+    }
+
+    /// Whether the keep file on disk still is what this snapshot read: absent, invalid, or the
+    /// same bytes. What a path's being kept depends on is the patterns and the path alone, so an
+    /// unchanged keep file keeps exactly what it kept.
+    pub(crate) fn unchanged(&self, worktree: &Path) -> bool {
+        match keep_contents(worktree) {
+            Ok(contents) => self.invalid.is_none() && contents == self.contents,
+            Err(_) => self.invalid.is_some(),
+        }
+    }
+}
+
+/// Mount points below the tree, from `/proc/self/mountinfo`, as canonical absolute paths. Where
+/// they cannot be read only the device comparison guards.
+struct Mounts {
+    /// The tree root as the caller names it.
+    root: PathBuf,
+    /// The tree root resolved, as `mountinfo` names mount points.
+    canonical: PathBuf,
+    /// Every mount point, or `None` where `mountinfo` cannot be read.
+    points: Option<BTreeSet<PathBuf>>,
+}
+
+impl Mounts {
+    fn read(root: &Path) -> Self {
+        Self {
+            root: root.to_path_buf(),
+            canonical: std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf()),
+            points: mount_points(),
+        }
+    }
+
+    fn none() -> Self {
+        Self {
+            root: PathBuf::new(),
+            canonical: PathBuf::new(),
+            points: None,
+        }
+    }
+
+    /// `path` (below the root as the caller names it) as `mountinfo` names it.
+    fn resolved(&self, path: &Path) -> Option<PathBuf> {
+        path.strip_prefix(&self.root)
+            .ok()
+            .map(|relative| self.canonical.join(relative))
+    }
+
+    /// Whether `path` is itself a mount point.
+    fn at(&self, path: &Path) -> bool {
+        match (&self.points, self.resolved(path)) {
+            (Some(points), Some(path)) => points.contains(&path),
+            _ => false,
+        }
+    }
+
+    /// Whether a mount point lies at or below `path`.
+    fn at_or_below(&self, path: &Path) -> bool {
+        match (&self.points, self.resolved(path)) {
+            (Some(points), Some(path)) => points
+                .range::<Path, _>((Bound::Included(path.as_path()), Bound::Unbounded))
+                .next()
+                .is_some_and(|point| point.starts_with(&path)),
+            _ => false,
+        }
+    }
+}
+
+/// Every mount point `/proc/self/mountinfo` lists (its fifth field, octal escapes decoded), or
+/// `None` where it cannot be read.
+#[cfg(target_os = "linux")]
+fn mount_points() -> Option<BTreeSet<PathBuf>> {
+    use std::os::unix::ffi::OsStringExt as _;
+    let table = std::fs::read("/proc/self/mountinfo").ok()?;
+    let mut points = BTreeSet::new();
+    for line in table.split(|byte| *byte == b'\n') {
+        let Some(field) = line.split(|byte| *byte == b' ').nth(4) else {
+            continue;
+        };
+        let mut decoded = Vec::with_capacity(field.len());
+        let mut index = 0;
+        while index < field.len() {
+            let octal = field.get(index + 1..index + 4).filter(|digits| {
+                field[index] == b'\\' && digits.iter().all(|digit| (b'0'..=b'7').contains(digit))
+            });
+            if let Some(digits) = octal {
+                decoded.push(digits.iter().fold(0u8, |value, digit| {
+                    value.wrapping_mul(8).wrapping_add(digit - b'0')
+                }));
+                index += 4;
+            } else {
+                decoded.push(field[index]);
+                index += 1;
+            }
+        }
+        points.insert(PathBuf::from(OsString::from_vec(decoded)));
+    }
+    Some(points)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn mount_points() -> Option<BTreeSet<PathBuf>> {
+    None
+}
+
 /// What keeps an ignored entry from deletion beyond its structure, read once per discard.
 struct Guard {
-    /// What the keep file keeps, as Git lists it ([`kept_paths`]).
-    kept: BTreeSet<PathBuf>,
+    /// What the keep file keeps.
+    keep: KeepSnapshot,
     /// The tree root's device; `None` where devices are not compared.
     device: Option<u64>,
+    /// Mount points below the tree.
+    mounts: Mounts,
 }
 
 impl Guard {
-    /// Read the tree's keep file and root device. A keep file that is not a readable regular
-    /// file refuses as `keep-file-invalid`.
+    /// Read the tree's keep file, root device and mount points. A keep file that is not a
+    /// readable regular file refuses as `keep-file-invalid`.
     fn read(worktree: &Path) -> Result<Self, Refusal> {
-        let kept = if keep_file(worktree)? {
-            kept_paths(worktree, None)?
-        } else {
-            BTreeSet::new()
-        };
+        let keep = KeepSnapshot::read(worktree)?;
+        if let Some(invalid) = &keep.invalid {
+            return Err(invalid.clone());
+        }
         let root = std::fs::symlink_metadata(worktree).map_err(|error| {
             Refusal::new(
                 "cache-classification-failed",
@@ -93,35 +260,25 @@ impl Guard {
             )
         })?;
         Ok(Self {
-            kept,
+            keep,
             device: device(&root),
+            mounts: Mounts::read(worktree),
         })
     }
 
-    /// No keep file and no device comparison: what the archive's target discovery observes.
+    /// No keep file, no device comparison and no mount points: what the archive's target
+    /// discovery observes.
     fn structural() -> Self {
         Self {
-            kept: BTreeSet::new(),
+            keep: KeepSnapshot::none(),
             device: None,
+            mounts: Mounts::none(),
         }
     }
 
-    /// Whether the keep file keeps `relative`: it or one of its ancestors is listed. The keep file
-    /// itself is always kept.
+    /// Whether the keep file keeps `relative` ([`KeepSnapshot::keeps`]).
     fn kept(&self, relative: &Path) -> bool {
-        relative == Path::new(KEEP_FILE)
-            || relative
-                .ancestors()
-                .filter(|ancestor| !ancestor.as_os_str().is_empty())
-                .any(|ancestor| self.kept.contains(ancestor))
-    }
-
-    /// Whether the keep file keeps a path strictly below `relative`.
-    fn holds_kept(&self, relative: &Path) -> bool {
-        self.kept
-            .range::<Path, _>((Bound::Excluded(relative), Bound::Unbounded))
-            .next()
-            .is_some_and(|path| path.starts_with(relative))
+        self.keep.keeps(relative)
     }
 
     fn foreign_device(&self, metadata: &std::fs::Metadata) -> bool {
@@ -141,11 +298,15 @@ impl Guard {
             }
             Err(_) => return Observed::Retained,
         };
-        if self.foreign_device(&metadata) {
+        if self.foreign_device(&metadata) || self.mounts.at(path) {
             return Observed::Retained;
         }
         if !metadata.is_dir() {
-            return Observed::Unlinkable;
+            return if readable(path, &metadata) {
+                Observed::Unlinkable
+            } else {
+                Observed::Retained
+            };
         }
         if repository(path) || std::fs::read_dir(path).is_err() {
             Observed::Retained
@@ -154,14 +315,15 @@ impl Guard {
         }
     }
 
-    /// Whether the directory `relative` holds, at any depth, a kept path, a repository, an entry
-    /// on another device or one the walk cannot read. The walk follows no symbolic link.
+    /// Whether the directory `relative` holds, at any depth, a kept path, a repository, a mount
+    /// point, an entry on another device or one that cannot be read. The walk follows no
+    /// symbolic link.
     fn holds_protected(&self, worktree: &Path, relative: &Path) -> bool {
-        if self.holds_kept(relative) {
+        if self.keep.holds_kept(relative) {
             return true;
         }
         let directory = worktree.join(relative);
-        if git_directory(&directory) {
+        if git_directory(&directory) || self.mounts.at_or_below(&directory) {
             return true;
         }
         let mut pending = vec![directory];
@@ -180,7 +342,7 @@ impl Guard {
                 let Ok(metadata) = std::fs::symlink_metadata(&path) else {
                     return true;
                 };
-                if self.foreign_device(&metadata) {
+                if self.foreign_device(&metadata) || !readable(&path, &metadata) {
                     return true;
                 }
                 if metadata.is_dir() {
@@ -195,23 +357,42 @@ impl Guard {
     }
 
     /// The re-observation immediately before deleting `relative`: whether it is now kept (the
-    /// keep file read again, scoped to the path), a repository, on another device or unreadable,
-    /// or, as a directory, holds any of those. A keep file that became invalid keeps everything.
+    /// keep file read again, scoped to the path), a mount point or holds one (`mountinfo` read
+    /// again), a repository, on another device or unreadable, or, as a directory, holds any of
+    /// those. A keep file that became invalid keeps everything.
     fn protected_now(&self, worktree: &Path, relative: &Path) -> Result<bool, Refusal> {
         if self.kept(relative) {
             return Ok(true);
         }
-        match keep_file(worktree) {
+        match keep_contents(worktree) {
             Err(_) => return Ok(true),
-            Ok(true) if !kept_paths(worktree, Some(relative))?.is_empty() => return Ok(true),
+            Ok(Some(_)) if !kept_paths(worktree, Some(relative))?.is_empty() => return Ok(true),
             Ok(_) => {}
         }
-        Ok(match self.observe(&worktree.join(relative)) {
+        let path = worktree.join(relative);
+        if Mounts::read(worktree).at_or_below(&path) {
+            return Ok(true);
+        }
+        Ok(match self.observe(&path) {
             Observed::Retained => true,
             Observed::Missing | Observed::Unlinkable => false,
             Observed::Directory => self.holds_protected(worktree, relative),
         })
     }
+}
+
+/// Whether this process can read the entry: a regular file it cannot open is not, and every
+/// other kind is (a directory is read by the walk; a symbolic link is never followed). A file
+/// everyone may read is not opened.
+fn readable(path: &Path, metadata: &std::fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if metadata.permissions().mode() & 0o004 != 0 {
+            return true;
+        }
+    }
+    !metadata.is_file() || std::fs::File::open(path).is_ok()
 }
 
 #[cfg(unix)]
@@ -226,9 +407,9 @@ fn device(_metadata: &std::fs::Metadata) -> Option<u64> {
     None
 }
 
-/// Whether the tree has a keep file: absent is `false`; a regular file that can be read is
-/// `true`; anything else refuses as `keep-file-invalid`.
-fn keep_file(worktree: &Path) -> Result<bool, Refusal> {
+/// The keep file's bytes: `None` when it is absent; a symbolic link, a directory, any other
+/// non-regular file or one that cannot be read refuses as `keep-file-invalid`.
+fn keep_contents(worktree: &Path) -> Result<Option<Vec<u8>>, Refusal> {
     let path = worktree.join(KEEP_FILE);
     let invalid = |reason: &dyn std::fmt::Display| {
         Refusal::new(
@@ -241,45 +422,59 @@ fn keep_file(worktree: &Path) -> Result<bool, Refusal> {
         )
     };
     match std::fs::symlink_metadata(&path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(invalid(&format_args!("cannot be read: {error}"))),
         Ok(metadata) if metadata.is_symlink() => Err(invalid(&"is a symbolic link")),
         Ok(metadata) if metadata.is_dir() => Err(invalid(&"is a directory")),
         Ok(metadata) if !metadata.is_file() => Err(invalid(&"is not a regular file")),
         Ok(_) => std::fs::read(&path)
-            .map(|_| true)
+            .map(Some)
             .map_err(|error| invalid(&format_args!("cannot be read: {error}"))),
     }
 }
 
-/// What the keep file keeps, as Git's exclude engine lists it: every untracked file a pattern
-/// matches, directly or through a matched ancestor directory (and a nested repository Git does
-/// not descend into, as `<path>/`). `scope` limits the listing to one path. Without
-/// `--directory`, which also lists a parent whose every entry matches, so only what the patterns
-/// match is kept; an empty directory holds nothing to keep.
+/// What the keep file keeps, as Git's exclude engine lists it (`ls-files --others --ignored
+/// --exclude-from`): every untracked file a pattern matches, directly or through a matched
+/// ancestor directory (and a nested repository Git does not descend into, as `<path>/`), and
+/// every directory a pattern matches itself, empty or not. `scope` limits the listing to one path.
+///
+/// Directories come from the `--directory` listing, which also lists a parent whose every entry
+/// matches, together with those entries. Git does not descend into a directory a pattern matches,
+/// so a listed directory with nothing listed below it is one a pattern names, and one with
+/// something listed below it is such a parent, which is not kept.
 fn kept_paths(worktree: &Path, scope: Option<&Path>) -> Result<BTreeSet<PathBuf>, Refusal> {
-    let mut args: Vec<OsString> = [
-        "ls-files",
-        "-z",
-        "--others",
-        "--ignored",
+    let listing = |directories: bool| -> Result<BTreeSet<PathBuf>, Refusal> {
+        let mut args: Vec<OsString> = vec!["ls-files".into(), "-z".into(), "--others".into()];
+        args.push("--ignored".into());
+        if directories {
+            args.push("--directory".into());
+        }
         // Relative to `-C <tree>`, so a tree path that is not UTF-8 needs no argument of its own.
-        "--exclude-from=.worktreekeep",
-    ]
-    .into_iter()
-    .map(OsString::from)
-    .collect();
-    if let Some(scope) = scope {
-        args.push("--".into());
-        let mut literal = OsString::from(":(literal)");
-        literal.push(scope);
-        args.push(literal);
+        args.push("--exclude-from=.worktreekeep".into());
+        if let Some(scope) = scope {
+            args.push("--".into());
+            let mut literal = OsString::from(":(literal)");
+            literal.push(scope);
+            args.push(literal);
+        }
+        ProcessGit::output_bytes(worktree, args)?
+            .split(|byte| *byte == 0)
+            .filter(|field| !field.is_empty())
+            .map(|field| crate::path_from_git_bytes(field.strip_suffix(b"/").unwrap_or(field)))
+            .collect()
+    };
+    let mut kept = listing(false)?;
+    let listed = listing(true)?;
+    for directory in &listed {
+        let named = !listed
+            .range::<Path, _>((Bound::Excluded(directory.as_path()), Bound::Unbounded))
+            .next()
+            .is_some_and(|path| path.starts_with(directory));
+        if named {
+            kept.insert(directory.clone());
+        }
     }
-    ProcessGit::output_bytes(worktree, args)?
-        .split(|byte| *byte == 0)
-        .filter(|field| !field.is_empty())
-        .map(|field| crate::path_from_git_bytes(field.strip_suffix(b"/").unwrap_or(field)))
-        .collect()
+    Ok(kept)
 }
 
 /// Whether the real directory `path` is itself a repository: it holds a `.git` entry (file,
@@ -497,7 +692,7 @@ impl Walk<'_> {
     /// `top` marks an entry Git reported itself, the only place a Cargo target is recorded.
     fn entry(&mut self, relative: PathBuf, top: bool, plan: &mut Plan) -> Result<(), Refusal> {
         if self.guard.kept(&relative) {
-            plan.retained.push(relative);
+            self.retain_kept(relative, plan);
             return Ok(());
         }
         match self.guard.observe(&self.worktree.join(&relative)) {
@@ -507,6 +702,29 @@ impl Walk<'_> {
             Observed::Directory => self.directory(relative, top, plan)?,
         }
         Ok(())
+    }
+
+    /// Retain a kept entry, reported down to what it holds: a directory that is not a repository
+    /// is reported by its entries, so the report names each kept file; one that is empty, a
+    /// repository or unreadable is reported itself.
+    fn retain_kept(&self, relative: PathBuf, plan: &mut Plan) {
+        if !matches!(
+            self.guard.observe(&self.worktree.join(&relative)),
+            Observed::Directory
+        ) {
+            if std::fs::symlink_metadata(self.worktree.join(&relative)).is_ok() {
+                plan.retained.push(relative);
+            }
+            return;
+        }
+        match read_names(&self.worktree.join(&relative)) {
+            Ok(names) if !names.is_empty() => {
+                for name in names {
+                    self.retain_kept(relative.join(name), plan);
+                }
+            }
+            _ => plan.retained.push(relative),
+        }
     }
 
     /// Classify a real directory that is neither kept nor a repository, naming it by the first
@@ -611,7 +829,7 @@ impl Walk<'_> {
         plan: &mut Plan,
     ) -> Result<bool, Refusal> {
         if self.guard.kept(&relative) {
-            plan.retained.push(relative);
+            self.retain_kept(relative, plan);
             return Ok(false);
         }
         match self.guard.observe(&self.worktree.join(&relative)) {
@@ -711,13 +929,8 @@ impl Walk<'_> {
                         TargetShape::Partial(plan) => {
                             found_profile = true;
                             whole = false;
-                            if self.guard.kept(&child)
-                                || matches!(self.guard.observe(&path), Observed::Retained)
-                            {
-                                inner.retained.push(child);
-                            } else {
-                                inner.extend(plan);
-                            }
+                            // Each part was classified, kept ones included.
+                            inner.extend(plan);
                         }
                         TargetShape::NotCargo => {
                             whole = false;
@@ -1261,7 +1474,7 @@ mod tests {
         std::fs::write(root.path().join("output/evidence/run.json"), "{}\n").unwrap();
         std::fs::write(root.path().join("app.log"), "log\n").unwrap();
         let guard = Guard::read(root.path()).unwrap();
-        assert!(guard.kept.is_empty());
+        assert!(guard.keep.kept.is_empty());
         let plan = Plan {
             discarded: vec![
                 (PathBuf::from("app.log"), CacheKind::IgnoredOutput),
@@ -1324,8 +1537,8 @@ mod tests {
         std::fs::create_dir_all(root.path().join("mounted/inner")).unwrap();
         std::fs::write(root.path().join("mounted/inner/file"), "elsewhere\n").unwrap();
         let elsewhere = Guard {
-            kept: BTreeSet::new(),
             device: Some(u64::MAX),
+            ..Guard::structural()
         };
         assert!(matches!(
             elsewhere.observe(&root.path().join("mounted")),
@@ -1342,6 +1555,62 @@ mod tests {
             ..Guard::structural()
         };
         assert!(below.holds_protected(root.path(), Path::new("mounted")));
+    }
+
+    /// A mount point `mountinfo` lists at or below an entry keeps it, whatever its device: a
+    /// bind mount from the same filesystem shares the tree's device.
+    #[cfg(unix)]
+    #[test]
+    fn a_mount_point_at_or_below_an_entry_is_retained() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("scratch/mnt")).unwrap();
+        std::fs::create_dir_all(root.path().join("other")).unwrap();
+        let canonical = std::fs::canonicalize(root.path()).unwrap();
+        let guard = Guard {
+            device: device(&std::fs::symlink_metadata(root.path()).unwrap()),
+            mounts: Mounts {
+                root: root.path().to_path_buf(),
+                canonical: canonical.clone(),
+                points: Some(BTreeSet::from([canonical.join("scratch/mnt")])),
+            },
+            ..Guard::structural()
+        };
+        assert!(matches!(
+            guard.observe(&root.path().join("scratch/mnt")),
+            Observed::Retained
+        ));
+        assert!(guard.holds_protected(root.path(), Path::new("scratch")));
+        assert!(!guard.holds_protected(root.path(), Path::new("other")));
+        assert!(matches!(
+            guard.observe(&root.path().join("other")),
+            Observed::Directory
+        ));
+    }
+
+    /// The `mountinfo` of this process lists `/`, decoded, whenever it can be read.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mountinfo_lists_the_root() {
+        if let Some(points) = mount_points() {
+            assert!(points.contains(Path::new("/")), "{points:?}");
+        }
+    }
+
+    /// A directory a keep pattern names is kept even when it holds no file; a parent Git lists
+    /// only because everything in it matches is not.
+    #[test]
+    fn a_directory_a_keep_pattern_names_is_kept_and_its_parent_is_not() {
+        let root = tempfile::tempdir().unwrap();
+        git(root.path(), &["init", "-q"]);
+        std::fs::create_dir_all(root.path().join("only/mounts/data")).unwrap();
+        std::fs::write(root.path().join(KEEP_FILE), "only/mounts/\n").unwrap();
+
+        let kept = kept_paths(root.path(), None).unwrap();
+        assert_eq!(kept, BTreeSet::from([PathBuf::from("only/mounts")]));
+        let keep = KeepSnapshot::read(root.path()).unwrap();
+        assert!(keep.keeps(Path::new("only/mounts/data")));
+        assert!(!keep.keeps(Path::new("only")));
+        assert!(keep.holds_kept(Path::new("only")));
     }
 
     /// A deletion never leaves the tree: a planned path below a directory that became a symbolic
