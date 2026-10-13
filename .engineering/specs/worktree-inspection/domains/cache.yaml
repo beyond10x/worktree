@@ -1,8 +1,17 @@
 domain: worktree.cache
 
 types:
-  # Why an ignored directory was recognised as cache (crates/worktree-domain/src/cache.rs,
-  # CacheKind). A name alone never qualifies; each variant names a structure.
+  # Why an ignored entry is discarded (crates/worktree-domain/src/cache.rs, CacheKind). Git's own
+  # exclude rules decide what is ignored: every ignored entry Git reports is disposable unless the
+  # tree's keep file (worktree.cache.KeepFile) keeps it or it is or holds a repository. An ignored
+  # directory that holds a kept path or a repository at any depth is never deleted whole; it falls
+  # to its direct entries, each classified by the same rule. An ignored entry on another device
+  # than the tree root (a mount point) is retained whole. The structural variants below name the
+  # build cache an entry was also recognised as; IgnoredOutput is every other disposable entry,
+  # file or directory.
+  # IgnoredOutput: an ignored file, symbolic link (deleted itself, never followed) or real
+  # directory that no structural variant recognises, matches no keep pattern, holds no kept path
+  # and is not and holds no repository.
   # CargoTargetTmp: `tmp/` directly below a tagged Cargo target that holds at least one profile,
   # Cargo's CARGO_TARGET_TMPDIR, which test binaries fill with scratch; one holding a nested
   # repository is discarded entry by entry, as below.
@@ -27,11 +36,35 @@ types:
   # then is retained whole. `archive` images each retained repository; nothing else changes.
   - name: worktree.cache.CacheKind
     kind: enum
-    variants: [CargoProfile, CargoTarget, CargoTargetTmp, FlutterOutput, NodeModules, PythonVirtualenv, ToolCache]
+    variants: [CargoProfile, CargoTarget, CargoTargetTmp, FlutterOutput, NodeModules, PythonVirtualenv, ToolCache, IgnoredOutput]
 
 # A report of one cache discard, not a new persisted lifecycle. The worktree it names is the
 # existing registry record (crates/worktree-domain/src/lib.rs, WorktreeRecord).
 entities:
+  # The repository's list of ignored paths a tree keeps: `.worktreekeep` at the tree root, read
+  # from disk as a regular file (a symbolic link or a directory there is refused as
+  # `keep-file-invalid`; an absent file keeps nothing). Its lines are Git exclude patterns,
+  # matched by Git's own exclude engine against paths relative to the tree root, so negation,
+  # directory-only patterns and anchoring behave as in `.gitignore`. A path is kept when a
+  # pattern matches it or one of its ancestors. `discard-cache` retains every kept path, and an
+  # ignored directory holding one falls to its parts. `prune-archives --strip-build-output`
+  # reads the keep file from HEAD's tree, or from the patch when the patch purely adds it, and
+  # never strips a kept path.
+  - name: worktree.cache.KeepFile
+    identity:
+      name: path
+      type: String
+    fields:
+      # Non-blank lines that are not comments.
+      - name: patterns
+        type: Integer
+    invariants:
+      - patterns >= 0
+    lifecycle:
+      initial: Read
+      states: [Read]
+      terminal: [Read]
+
   - name: worktree.cache.CacheDiscard
     identity:
       name: worktree_id
@@ -42,12 +75,12 @@ entities:
       # false for `discard-cache --dry-run`: the entries were classified, nothing was deleted.
       - name: applied
         type: Boolean
-      # Ignored directories recognised as cache their own tool recreates from tracked sources:
-      # Cargo profile directories, node_modules below a tracked lockfile, a virtualenv beside a
-      # tracked Python manifest, and tagged tool caches.
+      # Ignored entries that are disposable (worktree.cache.CacheKind): neither kept by the keep
+      # file nor a repository nor holding either.
       - name: discarded_entries
         type: Integer
-      # Every other ignored entry. Never deleted; `worktree archive` keeps it.
+      # Ignored entries kept by the keep file, repositories, and entries on another device.
+      # Never deleted; `worktree archive` keeps them.
       - name: retained_ignored_entries
         type: Integer
       # Allocated bytes of those retained entries; a sweep refuses to archive more than its limit.

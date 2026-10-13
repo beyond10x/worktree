@@ -35,14 +35,19 @@ types:
   #   RepositoryGone: repository_root is gone, so the new patch cannot be verified over HEAD.
   #   PatchUnusable: dirty.patch no longer has its recorded digest, holds bytes before its first
   #     `diff --git` section, or the stripped patch does not apply over HEAD.
-  #   NothingToStrip: no patch, or no section purely adds an untracked file under build layout.
-  #   Strippable: at least one section purely adds an untracked file under build layout: a
-  #     `new file mode` section whose decoded path no other section names and HEAD's tree, read
-  #     from Git and never from the patch, holds neither as a file or directory nor below a file.
-  #     Build layout is cargo's (below a target the patch recognises, BuildOutputOrigin) or a
-  #     Flutter app's (worktree.archive.FlutterOutputKind). A path with a `.git` component, or at
-  #     or below a directory D whose `D/HEAD` and some path under `D/objects/` the patch purely
-  #     adds (a Git directory, as the patch can show one), is never build layout and stays.
+  #   NothingToStrip: no patch, or no section purely adds an untracked file that is build layout
+  #     or ignored output.
+  #   Strippable: at least one section purely adds an untracked file that is build layout or
+  #     ignored output: a `new file mode` section whose decoded path no other section names and
+  #     HEAD's tree, read from Git and never from the patch, holds neither as a file or directory
+  #     nor below a file. Build layout is cargo's (below a target the patch recognises,
+  #     BuildOutputOrigin) or a Flutter app's (worktree.archive.FlutterOutputKind). Ignored output
+  #     is a path Git's exclude engine ignores under the exclude rules of HEAD's tree (every
+  #     `.gitignore` HEAD's tree holds, read from Git, and the repository's `info/exclude`) and
+  #     the keep file (worktree.cache.KeepFile) does not keep. A path with a `.git` component, or
+  #     at or below a directory D whose `D/HEAD` and some path under `D/objects/` the patch purely
+  #     adds (a Git directory, as the patch can show one), is never build layout or ignored output
+  #     and stays.
   - name: worktree.archive.StripVerdict
     kind: enum
     variants: [Strippable, NothingToStrip, InvalidManifest, UnrecordedContent, TreeStillPresent, RepositoryGone, PatchUnusable]
@@ -58,7 +63,8 @@ types:
   #     begins with Cargo's `Signature: 8a477f597d28d172789f06886806bc55` line, or
   #     `T/<p>/.fingerprint/…`; `.rustc_info.json` or an unsigned tag alone never recognises T.
   #     A Flutter app's output directory (worktree.archive.FlutterOutputKind) found in the patch is
-  #     recorded with this origin.
+  #     recorded with this origin, and so is ignored output, per outermost ignored directory
+  #     holding no kept path (or per file, when no such ancestor directory exists).
   - name: worktree.archive.BuildOutputOrigin
     kind: enum
     variants: [Archive, Strip]
