@@ -560,8 +560,10 @@ fn discard_cache_deletes_flutter_output_beside_a_pubspec() {
     assert_eq!(fixture.gc("--dry-run", "discard")["eligible"], true);
 }
 
+/// A `build/` or `.dart_tool/` with no regular `pubspec.yaml` beside it is no Flutter output: it
+/// is discarded as `ignored-output`, and a symbolic link named `build` is unlinked, never followed.
 #[test]
-fn discard_cache_retains_a_build_directory_with_no_pubspec_beside() {
+fn discard_cache_names_a_build_directory_with_no_pubspec_beside_ignored_output() {
     let fixture = Fixture::new(&[]);
     let tree = fixture.tree("retain");
     write(&tree.join("other/build/out.bin"), [1u8; 9]);
@@ -578,11 +580,10 @@ fn discard_cache_retains_a_build_directory_with_no_pubspec_beside() {
     );
 
     let cache = fixture.discard(&tree, &[]);
-    assert_eq!(paths(&cache, "discarded"), Vec::<String>::new(), "{cache}");
-    let mut retained = paths(&cache, "retained_ignored");
-    retained.sort();
+    let mut discarded = paths(&cache, "discarded");
+    discarded.sort();
     assert_eq!(
-        retained,
+        discarded,
         [
             "linked/build",
             "other/.dart_tool",
@@ -591,23 +592,31 @@ fn discard_cache_retains_a_build_directory_with_no_pubspec_beside() {
         ],
         "{cache}"
     );
-    for kept in [
-        "other/build/out.bin",
-        "other/.dart_tool/version",
-        "tool/build/out.bin",
-        "linked/real/out.bin",
-    ] {
-        assert!(tree.join(kept).is_file(), "{kept}");
+    for entry in cache["discarded"].as_array().unwrap() {
+        assert_eq!(entry["kind"], "ignored-output", "{entry}");
     }
+    assert_eq!(
+        paths(&cache, "retained_ignored"),
+        Vec::<String>::new(),
+        "{cache}"
+    );
+    for gone in ["other/build", "other/.dart_tool", "tool/build"] {
+        assert!(!tree.join(gone).exists(), "{gone}");
+    }
+    assert!(std::fs::symlink_metadata(tree.join("linked/build")).is_err());
+    assert!(tree.join("linked/real/out.bin").is_file());
+    assert!(tree.join("tool/pubspec.yaml/readme").is_file());
+    // The untracked files beside them still differ from HEAD.
     let refusal = fixture.refused(&["finish", "--discard-cache", tree.to_str().unwrap()]);
     assert!(refusal["code"].is_string(), "{refusal}");
 }
 
 /// A Flutter app's output directory holding a `.git` at any depth, as a directory, a file or a
-/// symbolic link, may hold a repository whose commits no remote does: `discard-cache` retains it
-/// whole, and deletes an output directory holding none.
+/// symbolic link, may hold a repository whose commits no remote does: `discard-cache` never
+/// deletes it whole but splits it down to the repository, which it retains, and deletes an
+/// output directory holding none whole.
 #[test]
-fn discard_cache_retains_flutter_output_holding_a_git_entry_at_any_depth() {
+fn discard_cache_splits_flutter_output_holding_a_git_entry_at_any_depth() {
     let fixture = Fixture::new(&[
         ("app/pubspec.yaml", "name: app\n"),
         ("pkg/pubspec.yaml", "name: pkg\n"),
@@ -638,17 +647,42 @@ fn discard_cache_retains_flutter_output_holding_a_git_entry_at_any_depth() {
     discarded.sort();
     let expected = [
         ".dart_tool",
+        "app/.dart_tool/flutter_build",
+        "app/.dart_tool/package_config.json",
+        "app/build",
+        "build/app/outputs/flutter-apk",
+        "build/unit_test_assets",
+        "pkg/.dart_tool",
+        "pkg/build/app",
+        "pkg/build/unit_test_assets",
+        "plain/.dart_tool",
+        "plain/build",
+    ];
+    assert_eq!(discarded, expected, "{planned}");
+    let whole = [
+        ".dart_tool",
         "app/build",
         "pkg/.dart_tool",
         "plain/.dart_tool",
         "plain/build",
     ];
-    assert_eq!(discarded, expected, "{planned}");
+    for entry in planned["discarded"].as_array().unwrap() {
+        let kind = if whole.contains(&entry["path"].as_str().unwrap()) {
+            "flutter-output"
+        } else {
+            "ignored-output"
+        };
+        assert_eq!(entry["kind"], kind, "{entry}");
+    }
     let mut retained = paths(&planned, "retained_ignored");
     retained.sort();
     assert_eq!(
         retained,
-        ["app/.dart_tool", "build", "pkg/build"],
+        [
+            "app/.dart_tool/linked",
+            "build/app/outputs/notes",
+            "pkg/build/web"
+        ],
         "{planned}"
     );
 

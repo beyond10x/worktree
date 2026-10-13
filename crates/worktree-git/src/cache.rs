@@ -1,9 +1,20 @@
-//! Recognise, and on request delete, the build cache among a tree's ignored entries.
+//! Classify, and on request delete, a tree's ignored entries.
 //!
-//! The walk follows no symbolic link and deletes only real directories inside the tree that a
-//! rule in [`b10x_worktree_domain::CacheKind`] recognises, and the direct entries of Cargo's
-//! `tmp/` it splits around a nested repository. A directory holding a `.git` at any depth is
-//! never deleted whole. Every other ignored entry is reported as retained and left alone.
+//! Every ignored entry Git reports (`status --ignored=matching`, file or directory) is
+//! disposable unless the tree's keep file ([`b10x_worktree_domain::KEEP_FILE`]) keeps it, it is a
+//! repository, it is a mount point or sits on another device than the tree root, or it cannot be
+//! read. Records an agent must keep are kept through the keep file, whose lines Git's own exclude
+//! engine matches (`ls-files --others --ignored --exclude-from`), so negation, directory-only
+//! patterns and anchoring mean what they mean in `.gitignore`. A directory holding a kept path, a
+//! repository or a mount point at any depth is never deleted whole: it falls to its direct
+//! entries, each classified by the same rule. The structural rules in
+//! [`b10x_worktree_domain::CacheKind`] name what they recognise; everything else is
+//! `ignored-output`.
+//!
+//! The walk follows no symbolic link: a symbolic link is deleted itself. Every deletion is
+//! inside the tree, and the keep file, the mount table and the walk for repositories are
+//! consulted again immediately before each one. `archive` reads the keep file through
+//! [`KeepSnapshot`]: a kept path is never build layout.
 
 use crate::ProcessGit;
 use b10x_worktree_domain::{
@@ -11,11 +22,13 @@ use b10x_worktree_domain::{
     CARGO_PROFILE_MARKER, CARGO_TARGET_METADATA, CARGO_TARGET_TMP, CARGO_UNTAGGED_TARGET,
     CacheClassification, CacheKind, DiscardedCache, FlutterFacts, FlutterOutputKind,
     GIT_DIRECTORY_HEAD, GIT_DIRECTORY_OBJECTS, GIT_DIRECTORY_REFS, GIT_ENTRY, GitDirectoryFacts,
-    NODE_LOCKFILES, PYTHON_MANIFESTS, PYTHON_VIRTUALENV_MARKER, Refusal, TAGGED_TOOL_CACHES,
-    flutter_output_kind, is_cache_tag,
+    KEEP_FILE, NODE_LOCKFILES, PYTHON_MANIFESTS, PYTHON_VIRTUALENV_MARKER, Refusal,
+    TAGGED_TOOL_CACHES, flutter_output_kind, is_cache_tag,
 };
 use std::collections::BTreeSet;
+use std::ffi::{OsStr, OsString};
 use std::io::Read as _;
+use std::ops::Bound;
 use std::path::{Component, Path, PathBuf};
 
 /// Classified ignored entries, relative to the tree root.
@@ -27,28 +40,466 @@ struct Plan {
     targets: Vec<PathBuf>,
 }
 
+impl Plan {
+    fn extend(&mut self, other: Self) {
+        self.discarded.extend(other.discarded);
+        self.retained.extend(other.retained);
+        self.targets.extend(other.targets);
+    }
+}
+
 /// What a tagged Cargo target turned out to hold.
 enum TargetShape {
     /// Only profiles, nested targets of the same shape, Cargo metadata, empty directories and
-    /// Cargo's `tmp`.
+    /// Cargo's `tmp`, none of them kept or holding a repository.
     Whole,
-    /// Some cache and some other content.
+    /// A profile and anything else: each part classified on its own.
     Partial(Plan),
-    /// No profile at all: not a Cargo target, whatever its tag says. Holds the entries to
-    /// retain, empty when only Cargo metadata and empty directories remain.
-    NotCargo(Vec<PathBuf>),
+    /// No profile at all: not a Cargo target, whatever its tag says.
+    NotCargo,
+}
+
+/// What one entry is, observed on disk without following a symbolic link.
+enum Observed {
+    /// Gone since Git reported it.
+    Missing,
+    /// A repository, on another device, or unreadable: never deleted.
+    Retained,
+    /// A file, symbolic link or other non-directory: unlinked itself.
+    Unlinkable,
+    /// A real, readable directory that is not itself a repository.
+    Directory,
+}
+
+/// What the tree's keep file (`worktree.cache.KeepFile`) keeps, read from disk once.
+///
+/// `discard-cache` refuses a keep file that is not a readable regular file. `archive` never
+/// refuses for it: an invalid keep file keeps everything, so nothing is left out as build layout.
+pub(crate) struct KeepSnapshot {
+    /// The keep file's bytes when it is a readable regular file; `None` when it is absent.
+    contents: Option<Vec<u8>>,
+    /// Why the keep file is invalid, when it is.
+    invalid: Option<Refusal>,
+    /// What it keeps, as Git lists it ([`kept_paths`]).
+    kept: BTreeSet<PathBuf>,
+}
+
+impl KeepSnapshot {
+    /// Read the keep file and what it keeps. Only a failing Git refuses.
+    pub(crate) fn read(worktree: &Path) -> Result<Self, Refusal> {
+        Ok(match keep_contents(worktree) {
+            Err(invalid) => Self {
+                contents: None,
+                invalid: Some(invalid),
+                kept: BTreeSet::new(),
+            },
+            Ok(None) => Self::none(),
+            Ok(Some(contents)) => Self {
+                contents: Some(contents),
+                invalid: None,
+                kept: kept_paths(worktree, None)?,
+            },
+        })
+    }
+
+    /// No keep file.
+    fn none() -> Self {
+        Self {
+            contents: None,
+            invalid: None,
+            kept: BTreeSet::new(),
+        }
+    }
+
+    /// Whether `relative` is kept: it or one of its ancestors is listed, it is the keep file
+    /// itself, or the keep file is invalid and so keeps everything.
+    pub(crate) fn keeps(&self, relative: &Path) -> bool {
+        self.invalid.is_some()
+            || relative == Path::new(KEEP_FILE)
+            || relative
+                .ancestors()
+                .filter(|ancestor| !ancestor.as_os_str().is_empty())
+                .any(|ancestor| self.kept.contains(ancestor))
+    }
+
+    /// Whether a kept path lies strictly below `relative`.
+    fn holds_kept(&self, relative: &Path) -> bool {
+        self.invalid.is_some()
+            || self
+                .kept
+                .range::<Path, _>((Bound::Excluded(relative), Bound::Unbounded))
+                .next()
+                .is_some_and(|path| path.starts_with(relative))
+    }
+
+    /// Whether the keep file on disk still is what this snapshot read: absent, invalid, or the
+    /// same bytes. What a path's being kept depends on is the patterns and the path alone, so an
+    /// unchanged keep file keeps exactly what it kept.
+    pub(crate) fn unchanged(&self, worktree: &Path) -> bool {
+        match keep_contents(worktree) {
+            Ok(contents) => self.invalid.is_none() && contents == self.contents,
+            Err(_) => self.invalid.is_some(),
+        }
+    }
+}
+
+/// Mount points below the tree, from `/proc/self/mountinfo`, as canonical absolute paths. Where
+/// they cannot be read only the device comparison guards.
+struct Mounts {
+    /// The tree root as the caller names it.
+    root: PathBuf,
+    /// The tree root resolved, as `mountinfo` names mount points.
+    canonical: PathBuf,
+    /// Every mount point, or `None` where `mountinfo` cannot be read.
+    points: Option<BTreeSet<PathBuf>>,
+}
+
+impl Mounts {
+    fn read(root: &Path) -> Self {
+        Self {
+            root: root.to_path_buf(),
+            canonical: std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf()),
+            points: mount_points(),
+        }
+    }
+
+    fn none() -> Self {
+        Self {
+            root: PathBuf::new(),
+            canonical: PathBuf::new(),
+            points: None,
+        }
+    }
+
+    /// `path` (below the root as the caller names it) as `mountinfo` names it.
+    fn resolved(&self, path: &Path) -> Option<PathBuf> {
+        path.strip_prefix(&self.root)
+            .ok()
+            .map(|relative| self.canonical.join(relative))
+    }
+
+    /// Whether `path` is itself a mount point.
+    fn at(&self, path: &Path) -> bool {
+        match (&self.points, self.resolved(path)) {
+            (Some(points), Some(path)) => points.contains(&path),
+            _ => false,
+        }
+    }
+
+    /// Whether a mount point lies at or below `path`.
+    fn at_or_below(&self, path: &Path) -> bool {
+        match (&self.points, self.resolved(path)) {
+            (Some(points), Some(path)) => points
+                .range::<Path, _>((Bound::Included(path.as_path()), Bound::Unbounded))
+                .next()
+                .is_some_and(|point| point.starts_with(&path)),
+            _ => false,
+        }
+    }
+}
+
+/// Every mount point `/proc/self/mountinfo` lists (its fifth field, octal escapes decoded), or
+/// `None` where it cannot be read.
+#[cfg(target_os = "linux")]
+fn mount_points() -> Option<BTreeSet<PathBuf>> {
+    use std::os::unix::ffi::OsStringExt as _;
+    let table = std::fs::read("/proc/self/mountinfo").ok()?;
+    let mut points = BTreeSet::new();
+    for line in table.split(|byte| *byte == b'\n') {
+        let Some(field) = line.split(|byte| *byte == b' ').nth(4) else {
+            continue;
+        };
+        let mut decoded = Vec::with_capacity(field.len());
+        let mut index = 0;
+        while index < field.len() {
+            let octal = field.get(index + 1..index + 4).filter(|digits| {
+                field[index] == b'\\' && digits.iter().all(|digit| (b'0'..=b'7').contains(digit))
+            });
+            if let Some(digits) = octal {
+                decoded.push(digits.iter().fold(0u8, |value, digit| {
+                    value.wrapping_mul(8).wrapping_add(digit - b'0')
+                }));
+                index += 4;
+            } else {
+                decoded.push(field[index]);
+                index += 1;
+            }
+        }
+        points.insert(PathBuf::from(OsString::from_vec(decoded)));
+    }
+    Some(points)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn mount_points() -> Option<BTreeSet<PathBuf>> {
+    None
+}
+
+/// What keeps an ignored entry from deletion beyond its structure, read once per discard.
+struct Guard {
+    /// What the keep file keeps.
+    keep: KeepSnapshot,
+    /// The tree root's device; `None` where devices are not compared.
+    device: Option<u64>,
+    /// Mount points below the tree.
+    mounts: Mounts,
+}
+
+impl Guard {
+    /// Read the tree's keep file, root device and mount points. A keep file that is not a
+    /// readable regular file refuses as `keep-file-invalid`.
+    fn read(worktree: &Path) -> Result<Self, Refusal> {
+        let keep = KeepSnapshot::read(worktree)?;
+        if let Some(invalid) = &keep.invalid {
+            return Err(invalid.clone());
+        }
+        let root = std::fs::symlink_metadata(worktree).map_err(|error| {
+            Refusal::new(
+                "cache-classification-failed",
+                format!("{}: {error}", worktree.display()),
+            )
+        })?;
+        Ok(Self {
+            keep,
+            device: device(&root),
+            mounts: Mounts::read(worktree),
+        })
+    }
+
+    /// No keep file, no device comparison and no mount points: what the archive's target
+    /// discovery observes.
+    fn structural() -> Self {
+        Self {
+            keep: KeepSnapshot::none(),
+            device: None,
+            mounts: Mounts::none(),
+        }
+    }
+
+    /// Whether the keep file keeps `relative` ([`KeepSnapshot::keeps`]).
+    fn kept(&self, relative: &Path) -> bool {
+        self.keep.keeps(relative)
+    }
+
+    fn foreign_device(&self, metadata: &std::fs::Metadata) -> bool {
+        self.device
+            .is_some_and(|root| device(metadata).is_some_and(|entry| entry != root))
+    }
+
+    /// What the entry at `path` is ([`Observed`]).
+    fn observe(&self, path: &Path) -> Observed {
+        if path.file_name() == Some(OsStr::new(GIT_ENTRY)) {
+            return Observed::Retained;
+        }
+        let metadata = match std::fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Observed::Missing;
+            }
+            Err(_) => return Observed::Retained,
+        };
+        if self.foreign_device(&metadata) || self.mounts.at(path) {
+            return Observed::Retained;
+        }
+        if !metadata.is_dir() {
+            return if readable(path, &metadata) {
+                Observed::Unlinkable
+            } else {
+                Observed::Retained
+            };
+        }
+        if repository(path) || std::fs::read_dir(path).is_err() {
+            Observed::Retained
+        } else {
+            Observed::Directory
+        }
+    }
+
+    /// Whether the directory `relative` holds, at any depth, a kept path, a repository, a mount
+    /// point, an entry on another device or one that cannot be read. The walk follows no
+    /// symbolic link.
+    fn holds_protected(&self, worktree: &Path, relative: &Path) -> bool {
+        if self.keep.holds_kept(relative) {
+            return true;
+        }
+        let directory = worktree.join(relative);
+        if git_directory(&directory) || self.mounts.at_or_below(&directory) {
+            return true;
+        }
+        let mut pending = vec![directory];
+        while let Some(current) = pending.pop() {
+            let Ok(entries) = std::fs::read_dir(&current) else {
+                return true;
+            };
+            for entry in entries {
+                let Ok(entry) = entry else {
+                    return true;
+                };
+                if entry.file_name() == GIT_ENTRY {
+                    return true;
+                }
+                let path = entry.path();
+                let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+                    return true;
+                };
+                if self.foreign_device(&metadata) || !readable(&path, &metadata) {
+                    return true;
+                }
+                if metadata.is_dir() {
+                    if git_directory(&path) {
+                        return true;
+                    }
+                    pending.push(path);
+                }
+            }
+        }
+        false
+    }
+
+    /// The re-observation immediately before deleting `relative`: whether it is now kept (the
+    /// keep file read again, scoped to the path), a mount point or holds one (`mountinfo` read
+    /// again), a repository, on another device or unreadable, or, as a directory, holds any of
+    /// those. A keep file that became invalid keeps everything.
+    fn protected_now(&self, worktree: &Path, relative: &Path) -> Result<bool, Refusal> {
+        if self.kept(relative) {
+            return Ok(true);
+        }
+        match keep_contents(worktree) {
+            Err(_) => return Ok(true),
+            Ok(Some(_)) if !kept_paths(worktree, Some(relative))?.is_empty() => return Ok(true),
+            Ok(_) => {}
+        }
+        let path = worktree.join(relative);
+        if Mounts::read(worktree).at_or_below(&path) {
+            return Ok(true);
+        }
+        Ok(match self.observe(&path) {
+            Observed::Retained => true,
+            Observed::Missing | Observed::Unlinkable => false,
+            Observed::Directory => self.holds_protected(worktree, relative),
+        })
+    }
+}
+
+/// Whether this process can read the entry: a regular file it cannot open is not, and every
+/// other kind is (a directory is read by the walk; a symbolic link is never followed). A file
+/// everyone may read is not opened.
+fn readable(path: &Path, metadata: &std::fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if metadata.permissions().mode() & 0o004 != 0 {
+            return true;
+        }
+    }
+    !metadata.is_file() || std::fs::File::open(path).is_ok()
+}
+
+#[cfg(unix)]
+#[allow(clippy::unnecessary_wraps)]
+fn device(metadata: &std::fs::Metadata) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt as _;
+    Some(metadata.dev())
+}
+
+#[cfg(not(unix))]
+fn device(_metadata: &std::fs::Metadata) -> Option<u64> {
+    None
+}
+
+/// The keep file's bytes: `None` when it is absent; a symbolic link, a directory, any other
+/// non-regular file or one that cannot be read refuses as `keep-file-invalid`.
+fn keep_contents(worktree: &Path) -> Result<Option<Vec<u8>>, Refusal> {
+    let path = worktree.join(KEEP_FILE);
+    let invalid = |reason: &dyn std::fmt::Display| {
+        Refusal::new(
+            "keep-file-invalid",
+            format!(
+                "{} {reason}; it must be a regular file of Git exclude patterns, and nothing was \
+                 deleted",
+                path.display()
+            ),
+        )
+    };
+    match std::fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(invalid(&format_args!("cannot be read: {error}"))),
+        Ok(metadata) if metadata.is_symlink() => Err(invalid(&"is a symbolic link")),
+        Ok(metadata) if metadata.is_dir() => Err(invalid(&"is a directory")),
+        Ok(metadata) if !metadata.is_file() => Err(invalid(&"is not a regular file")),
+        Ok(_) => std::fs::read(&path)
+            .map(Some)
+            .map_err(|error| invalid(&format_args!("cannot be read: {error}"))),
+    }
+}
+
+/// What the keep file keeps, as Git's exclude engine lists it (`ls-files --others --ignored
+/// --exclude-from`): every untracked file a pattern matches, directly or through a matched
+/// ancestor directory (and a nested repository Git does not descend into, as `<path>/`), and
+/// every directory a pattern matches itself, empty or not. `scope` limits the listing to one path.
+///
+/// Directories come from the `--directory` listing, which also lists a parent whose every entry
+/// matches, together with those entries. Git does not descend into a directory a pattern matches,
+/// so a listed directory with nothing listed below it is one a pattern names, and one with
+/// something listed below it is such a parent, which is not kept.
+fn kept_paths(worktree: &Path, scope: Option<&Path>) -> Result<BTreeSet<PathBuf>, Refusal> {
+    let listing = |directories: bool| -> Result<BTreeSet<PathBuf>, Refusal> {
+        let mut args: Vec<OsString> = vec!["ls-files".into(), "-z".into(), "--others".into()];
+        args.push("--ignored".into());
+        if directories {
+            args.push("--directory".into());
+        }
+        // Relative to `-C <tree>`, so a tree path that is not UTF-8 needs no argument of its own.
+        args.push("--exclude-from=.worktreekeep".into());
+        if let Some(scope) = scope {
+            args.push("--".into());
+            let mut literal = OsString::from(":(literal)");
+            literal.push(scope);
+            args.push(literal);
+        }
+        ProcessGit::output_bytes(worktree, args)?
+            .split(|byte| *byte == 0)
+            .filter(|field| !field.is_empty())
+            .map(|field| crate::path_from_git_bytes(field.strip_suffix(b"/").unwrap_or(field)))
+            .collect()
+    };
+    let mut kept = listing(false)?;
+    let listed = listing(true)?;
+    for directory in &listed {
+        let named = !listed
+            .range::<Path, _>((Bound::Excluded(directory.as_path()), Bound::Unbounded))
+            .next()
+            .is_some_and(|path| path.starts_with(directory));
+        if named {
+            kept.insert(directory.clone());
+        }
+    }
+    Ok(kept)
+}
+
+/// Whether the real directory `path` is itself a repository: it holds a `.git` entry (file,
+/// directory or symbolic link) directly, or it is a Git directory ([`git_directory`]). Its
+/// files belong to that repository, so it is never deleted or split.
+fn repository(path: &Path) -> bool {
+    git_directory(path)
+        || match std::fs::symlink_metadata(path.join(GIT_ENTRY)) {
+            Ok(_) => true,
+            Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+        }
 }
 
 pub(crate) fn discard(worktree: &Path, apply: bool) -> Result<CacheClassification, Refusal> {
-    let plan = classify_tree(worktree)?;
-    finish_discard(worktree, plan, apply)
+    let guard = Guard::read(worktree)?;
+    let plan = classify_tree(worktree, &guard)?;
+    finish_discard(worktree, plan, &guard, apply)
 }
 
 /// The cargo targets `discard-cache` recognises among the tree's ignored entries, relative to the
 /// tree root, in path order: each holds at least one profile and is tagged or counts as tagged.
 /// Archives leave the build layout below them out ([`b10x_worktree_domain::is_build_layout`]).
+/// The keep file plays no part: archiving never deletes anything.
 pub(crate) fn cargo_targets(worktree: &Path) -> Result<Vec<PathBuf>, Refusal> {
-    let mut targets = classify_tree(worktree)?.targets;
+    let mut targets = classify_tree(worktree, &Guard::structural())?.targets;
     targets.sort();
     targets.dedup();
     Ok(targets)
@@ -92,7 +543,7 @@ pub(crate) fn signed_tag(directory: &Path) -> bool {
 }
 
 /// Classify every ignored entry of the tree.
-fn classify_tree(worktree: &Path) -> Result<Plan, Refusal> {
+fn classify_tree(worktree: &Path, guard: &Guard) -> Result<Plan, Refusal> {
     let status = ProcessGit::output_bytes(
         worktree,
         [
@@ -104,25 +555,44 @@ fn classify_tree(worktree: &Path) -> Result<Plan, Refusal> {
             "--ignored=matching",
         ],
     )?;
-    let tracked = tracked_paths(worktree)?;
-    let mut committed = None;
+    let mut walk = Walk {
+        worktree,
+        guard,
+        tracked: tracked_paths(worktree)?,
+        committed: None,
+    };
     let mut plan = Plan::default();
-    for (relative, directory) in ignored_entries(&status)? {
-        if directory {
-            classify(worktree, &relative, &tracked, &mut committed, &mut plan)?;
-        } else {
-            plan.retained.push(relative);
-        }
+    for (relative, _directory) in ignored_entries(&status)? {
+        walk.entry(relative, true, &mut plan)?;
     }
+    plan.discarded.sort_by(|left, right| left.0.cmp(&right.0));
+    plan.retained.sort();
+    plan.retained.dedup();
     Ok(plan)
 }
 
-/// Report the classified entries and, with `apply`, delete the recognised cache.
+/// Report the classified entries and, with `apply`, delete the disposable ones.
 fn finish_discard(
     worktree: &Path,
     plan: Plan,
+    guard: &Guard,
     apply: bool,
 ) -> Result<CacheClassification, Refusal> {
+    // A path that is not UTF-8 cannot be reported, so nothing is deleted that the report could
+    // not name.
+    if let Some((relative, _)) = plan
+        .discarded
+        .iter()
+        .find(|(relative, _)| relative.to_str().is_none())
+    {
+        return Err(Refusal::new(
+            "cache-path-not-utf8",
+            format!(
+                "{} is ignored and its path is not UTF-8; rename or delete it, then retry",
+                worktree.join(relative).display()
+            ),
+        ));
+    }
     let users = processes_using(worktree);
     if let Some(active) = users.as_ref().filter(|users| apply && !users.is_empty()) {
         return Err(in_use(worktree, active));
@@ -130,16 +600,16 @@ fn finish_discard(
     let mut discarded = Vec::with_capacity(plan.discarded.len());
     let mut retained = plan.retained;
     for (relative, kind) in plan.discarded {
-        let path = worktree.join(&relative);
-        // Re-observed immediately before deletion, whatever the kind: a `.git` that appeared
-        // at or below the entry since it was classified keeps it whole.
-        if is_or_holds_git_entry(&path) {
+        // Re-observed immediately before deletion, whatever the kind: a kept path or a
+        // repository that appeared at or below the entry since it was classified keeps it.
+        if guard.protected_now(worktree, &relative)? {
             retained.push(relative);
             continue;
         }
+        let path = worktree.join(&relative);
         let allocated_bytes = allocated_bytes(&path);
         if apply {
-            remove(&path, kind)?;
+            remove(worktree, &relative, kind)?;
         }
         discarded.push(DiscardedCache {
             path: relative,
@@ -147,6 +617,8 @@ fn finish_discard(
             allocated_bytes,
         });
     }
+    retained.sort();
+    retained.dedup();
     Ok(CacheClassification {
         discarded,
         retained_bytes: retained
@@ -204,183 +676,329 @@ pub(crate) fn tracked_paths(worktree: &Path) -> Result<BTreeSet<PathBuf>, Refusa
         .collect()
 }
 
-/// Classify one ignored directory. `committed` holds, once a candidate needs it, every path HEAD
-/// or the index tracks ([`head_or_index_paths`]).
-fn classify(
-    worktree: &Path,
-    relative: &Path,
-    tracked: &BTreeSet<PathBuf>,
-    committed: &mut Option<BTreeSet<Vec<u8>>>,
-    plan: &mut Plan,
-) -> Result<(), Refusal> {
-    let path = worktree.join(relative);
-    if !real_directory(&path) {
-        plan.retained.push(relative.to_path_buf());
-        return Ok(());
-    }
-    let name = relative.file_name().and_then(|name| name.to_str());
-    let parent = relative.parent().unwrap_or(Path::new(""));
-    let kind = if name == Some("node_modules") && lockfile_at_or_above(parent, tracked) {
-        Some(CacheKind::NodeModules)
-    } else if regular_file(&path.join(PYTHON_VIRTUALENV_MARKER))
-        && python_manifest_beside(parent, tracked)
-    {
-        Some(CacheKind::PythonVirtualenv)
-    } else if name.is_some_and(|name| TAGGED_TOOL_CACHES.contains(&name)) && cache_tagged(&path) {
-        Some(CacheKind::ToolCache)
-    } else if cargo_profile(&path) && cargo_target_root(worktree, parent, tracked) {
-        plan.targets.push(parent.to_path_buf());
-        Some(CacheKind::CargoProfile)
-    } else {
-        None
-    };
-    if let Some(kind) = kind {
-        plan.discard_unless_repository(worktree, relative.to_path_buf(), kind);
-        return Ok(());
-    }
-    if cargo_target_root(worktree, relative, tracked) {
-        match cargo_target(worktree, relative, true)? {
-            // Whole only when nothing in it was retained, so by construction it holds no `.git`.
-            TargetShape::Whole => {
-                plan.targets.push(relative.to_path_buf());
-                plan.discarded
-                    .push((relative.to_path_buf(), CacheKind::CargoTarget));
-            }
-            TargetShape::Partial(inner) => {
-                plan.targets.push(relative.to_path_buf());
-                plan.discarded.extend(inner.discarded);
-                plan.retained.extend(inner.retained);
-            }
-            TargetShape::NotCargo(_) if flutter_output(worktree, relative, tracked, committed)? => {
-                plan.discard_unless_repository(
-                    worktree,
-                    relative.to_path_buf(),
-                    CacheKind::FlutterOutput,
-                );
-            }
-            TargetShape::NotCargo(children) if children.is_empty() => {
-                plan.retained.push(relative.to_path_buf());
-            }
-            TargetShape::NotCargo(children) => plan.retained.extend(children),
-        }
-        return Ok(());
-    }
-    if flutter_output(worktree, relative, tracked, committed)? {
-        plan.discard_unless_repository(worktree, relative.to_path_buf(), CacheKind::FlutterOutput);
-        return Ok(());
-    }
-    plan.retained.push(relative.to_path_buf());
-    Ok(())
+/// One classification of a tree's ignored entries.
+struct Walk<'a> {
+    worktree: &'a Path,
+    guard: &'a Guard,
+    /// The index's paths.
+    tracked: BTreeSet<PathBuf>,
+    /// HEAD's and the index's paths, read once a candidate needs them ([`head_or_index_paths`]).
+    committed: Option<BTreeSet<Vec<u8>>>,
 }
 
-impl Plan {
-    /// Plan the recognised directory `relative` for deletion as `kind`, or retain it whole when
-    /// it holds a repository at any depth below it ([`holds_git_entry`]): a nested repository is
-    /// never cache, whatever kind of directory holds it.
-    fn discard_unless_repository(&mut self, worktree: &Path, relative: PathBuf, kind: CacheKind) {
-        if holds_git_entry(&worktree.join(&relative)) {
-            self.retained.push(relative);
-        } else {
-            self.discarded.push((relative, kind));
+impl Walk<'_> {
+    /// Classify one ignored entry: kept, a repository, on another device or unreadable is
+    /// retained; a file or symbolic link is `ignored-output`; a directory goes to [`Self::directory`].
+    /// `top` marks an entry Git reported itself, the only place a Cargo target is recorded.
+    fn entry(&mut self, relative: PathBuf, top: bool, plan: &mut Plan) -> Result<(), Refusal> {
+        if self.guard.kept(&relative) {
+            self.retain_kept(relative, plan);
+            return Ok(());
+        }
+        match self.guard.observe(&self.worktree.join(&relative)) {
+            Observed::Missing => {}
+            Observed::Retained => plan.retained.push(relative),
+            Observed::Unlinkable => plan.discarded.push((relative, CacheKind::IgnoredOutput)),
+            Observed::Directory => self.directory(relative, top, plan)?,
+        }
+        Ok(())
+    }
+
+    /// Retain a kept entry, reported down to what it holds: a directory that is not a repository
+    /// is reported by its entries, so the report names each kept file; one that is empty, a
+    /// repository or unreadable is reported itself.
+    fn retain_kept(&self, relative: PathBuf, plan: &mut Plan) {
+        if !matches!(
+            self.guard.observe(&self.worktree.join(&relative)),
+            Observed::Directory
+        ) {
+            if std::fs::symlink_metadata(self.worktree.join(&relative)).is_ok() {
+                plan.retained.push(relative);
+            }
+            return;
+        }
+        match read_names(&self.worktree.join(&relative)) {
+            Ok(names) if !names.is_empty() => {
+                for name in names {
+                    self.retain_kept(relative.join(name), plan);
+                }
+            }
+            _ => plan.retained.push(relative),
         }
     }
 
-    /// Plan Cargo's `tmp/` (`scratch`) beside a profile, keeping both lists in path order: whole
-    /// as `cargo-target-tmp` when it holds no `.git`; otherwise each direct entry holding none
-    /// as `cargo-target-tmp` and each holding one retained. A `tmp/` whose names cannot be read
-    /// is retained whole.
-    fn scratch(&mut self, worktree: &Path, scratch: PathBuf) {
-        let directory = worktree.join(&scratch);
-        if !holds_git_entry(&directory) {
-            self.discard_sorted(scratch, CacheKind::CargoTargetTmp);
-            return;
+    /// Classify a real directory that is neither kept nor a repository, naming it by the first
+    /// structural rule that recognises it, else `ignored-output`.
+    fn directory(&mut self, relative: PathBuf, top: bool, plan: &mut Plan) -> Result<(), Refusal> {
+        let path = self.worktree.join(&relative);
+        let name = relative.file_name().and_then(|name| name.to_str());
+        let parent = relative.parent().unwrap_or(Path::new(""));
+        let kind = if name == Some("node_modules") && lockfile_at_or_above(parent, &self.tracked) {
+            Some(CacheKind::NodeModules)
+        } else if regular_file(&path.join(PYTHON_VIRTUALENV_MARKER))
+            && python_manifest_beside(parent, &self.tracked)
+        {
+            Some(CacheKind::PythonVirtualenv)
+        } else if name.is_some_and(|name| TAGGED_TOOL_CACHES.contains(&name)) && cache_tagged(&path)
+        {
+            Some(CacheKind::ToolCache)
+        } else if cargo_profile(&path) && cargo_target_root(self.worktree, parent, &self.tracked) {
+            if top {
+                plan.targets.push(parent.to_path_buf());
+            }
+            Some(CacheKind::CargoProfile)
+        } else {
+            None
+        };
+        if let Some(kind) = kind {
+            self.discard_or_parts(relative, kind, plan)?;
+            return Ok(());
         }
-        let Ok(mut names) = read_names(&directory) else {
-            self.retain_sorted(scratch);
-            return;
+        if cargo_target_root(self.worktree, &relative, &self.tracked) {
+            match self.cargo_target(&relative, true)? {
+                // Whole only when no part was kept, a repository or holds one.
+                TargetShape::Whole => {
+                    if top {
+                        plan.targets.push(relative.clone());
+                    }
+                    plan.discarded.push((relative, CacheKind::CargoTarget));
+                }
+                TargetShape::Partial(inner) => {
+                    if top {
+                        plan.targets.push(relative);
+                    }
+                    plan.extend(inner);
+                }
+                TargetShape::NotCargo => {
+                    let kind = if self.flutter_output(&relative)? {
+                        CacheKind::FlutterOutput
+                    } else {
+                        CacheKind::IgnoredOutput
+                    };
+                    self.discard_or_parts(relative, kind, plan)?;
+                }
+            }
+            return Ok(());
+        }
+        let kind = if self.flutter_output(&relative)? {
+            CacheKind::FlutterOutput
+        } else {
+            CacheKind::IgnoredOutput
+        };
+        self.discard_or_parts(relative, kind, plan)
+    }
+
+    /// Plan the directory `relative` for deletion as `kind`, or, when it holds a kept path or a
+    /// repository at any depth ([`Guard::holds_protected`]), classify each direct entry instead.
+    fn discard_or_parts(
+        &mut self,
+        relative: PathBuf,
+        kind: CacheKind,
+        plan: &mut Plan,
+    ) -> Result<(), Refusal> {
+        if self.guard.holds_protected(self.worktree, &relative) {
+            self.parts(relative, plan)
+        } else {
+            plan.discarded.push((relative, kind));
+            Ok(())
+        }
+    }
+
+    /// Classify each direct entry of the directory `relative` by the general rule. One whose
+    /// names cannot be read is retained whole.
+    fn parts(&mut self, relative: PathBuf, plan: &mut Plan) -> Result<(), Refusal> {
+        let Ok(mut names) = read_names(&self.worktree.join(&relative)) else {
+            plan.retained.push(relative);
+            return Ok(());
         };
         names.sort();
         for name in names {
-            let entry = scratch.join(name);
-            if is_or_holds_git_entry(&worktree.join(&entry)) {
-                self.retain_sorted(entry);
-            } else {
-                self.discard_sorted(entry, CacheKind::CargoTargetTmp);
+            self.entry(relative.join(name), false, plan)?;
+        }
+        Ok(())
+    }
+
+    /// Plan one Cargo part (`kind`) of a target, or one direct entry of its `tmp/`: retained when
+    /// kept or a repository, whole when it holds nothing protected, otherwise split. A file or
+    /// symbolic link is unlinked, as `cargo-target-tmp` in `tmp/` and `ignored-output`
+    /// elsewhere. Returns whether it went whole as `kind`.
+    fn cargo_part(
+        &mut self,
+        relative: PathBuf,
+        kind: CacheKind,
+        plan: &mut Plan,
+    ) -> Result<bool, Refusal> {
+        if self.guard.kept(&relative) {
+            self.retain_kept(relative, plan);
+            return Ok(false);
+        }
+        match self.guard.observe(&self.worktree.join(&relative)) {
+            Observed::Missing => Ok(false),
+            Observed::Retained => {
+                plan.retained.push(relative);
+                Ok(false)
+            }
+            Observed::Unlinkable if kind == CacheKind::CargoTargetTmp => {
+                plan.discarded.push((relative, kind));
+                Ok(false)
+            }
+            Observed::Unlinkable => {
+                plan.discarded.push((relative, CacheKind::IgnoredOutput));
+                Ok(false)
+            }
+            Observed::Directory if self.guard.holds_protected(self.worktree, &relative) => {
+                self.parts(relative, plan)?;
+                Ok(false)
+            }
+            Observed::Directory => {
+                plan.discarded.push((relative, kind));
+                Ok(true)
             }
         }
     }
 
-    fn discard_sorted(&mut self, relative: PathBuf, kind: CacheKind) {
-        let at = self.discarded.partition_point(|(path, _)| *path < relative);
-        self.discarded.insert(at, (relative, kind));
-    }
-
-    fn retain_sorted(&mut self, relative: PathBuf) {
-        let at = self.retained.partition_point(|path| *path < relative);
-        self.retained.insert(at, relative);
-    }
-}
-
-/// Whether the ignored directory `relative` is a Flutter app's output by the one build-output
-/// classifier ([`flutter_output_kind`]), observed on disk. HEAD's and the index's paths are read
-/// into `committed` only for a directory whose name could make it one; `tracked` holds the
-/// index's paths.
-fn flutter_output(
-    worktree: &Path,
-    relative: &Path,
-    tracked: &BTreeSet<PathBuf>,
-    committed: &mut Option<BTreeSet<Vec<u8>>>,
-) -> Result<bool, Refusal> {
-    let Some(directory) = relative.to_str().map(str::as_bytes) else {
-        return Ok(false);
-    };
-    let named = relative
-        .file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| FlutterOutputKind::named(name.as_bytes()).is_some());
-    if !named {
-        return Ok(false);
-    }
-    let committed = match committed {
-        Some(paths) => paths,
-        None => committed.insert(head_or_index_paths(worktree, "HEAD")?),
-    };
-    Ok(flutter_output_kind(directory, |directory, manifest| {
-        flutter_facts(worktree, directory, manifest, committed, tracked)
-    })
-    .is_some())
-}
-
-/// Whether `directory` holds a repository: an entry named `.git` (a file, a directory or a
-/// symbolic link) at any depth below it, or a Git directory ([`git_directory`]: a bare
-/// repository, or one placed with `--separate-git-dir`) at it or at any depth below it. A
-/// repository there may hold commits no remote does, so `discard-cache` never deletes the
-/// directory whole, whatever kind of cache it is. The walk follows no symbolic link. An entry
-/// whose type or a directory whose names cannot be read counts as one, so it is retained too.
-fn holds_git_entry(directory: &Path) -> bool {
-    let mut pending = vec![directory.to_path_buf()];
-    while let Some(current) = pending.pop() {
-        if git_directory(&current) {
-            return true;
+    /// Plan Cargo's `tmp/` (`scratch`) beside a profile: whole as `cargo-target-tmp` when it
+    /// holds nothing protected; otherwise each direct entry by the general rule, a disposable
+    /// one named `cargo-target-tmp`. Returns whether it went whole.
+    fn scratch(&mut self, scratch: PathBuf, plan: &mut Plan) -> Result<bool, Refusal> {
+        let path = self.worktree.join(&scratch);
+        if self.guard.kept(&scratch) || !matches!(self.guard.observe(&path), Observed::Directory) {
+            return self.cargo_part(scratch, CacheKind::CargoTargetTmp, plan);
         }
-        let Ok(entries) = std::fs::read_dir(&current) else {
-            return true;
+        if !self.guard.holds_protected(self.worktree, &scratch) {
+            plan.discarded.push((scratch, CacheKind::CargoTargetTmp));
+            return Ok(true);
+        }
+        let Ok(mut names) = read_names(&path) else {
+            plan.retained.push(scratch);
+            return Ok(false);
         };
-        for entry in entries {
-            let Ok(entry) = entry else {
-                return true;
-            };
-            if entry.file_name() == GIT_ENTRY {
-                return true;
+        names.sort();
+        for name in names {
+            self.cargo_part(scratch.join(name), CacheKind::CargoTargetTmp, plan)?;
+        }
+        Ok(false)
+    }
+
+    /// Classify the children of a tagged target, or of a target-triple directory below one.
+    fn cargo_target(&mut self, relative: &Path, tagged: bool) -> Result<TargetShape, Refusal> {
+        let directory = self.worktree.join(relative);
+        let mut children = read_names(&directory)?;
+        children.sort();
+        let mut inner = Plan::default();
+        let mut found_profile = false;
+        let mut whole = true;
+        // Cargo's metadata files and empty directories: they go with a whole target, and on
+        // their own beside anything else.
+        let mut loose = Vec::new();
+        // Cargo's `tmp` below a tagged target is cache, but only beside a profile, which is known
+        // once every child was read.
+        let mut scratch = None;
+        for name in children {
+            let child = relative.join(&name);
+            let path = self.worktree.join(&child);
+            // A repository's `.git` is never a target's part, whatever it holds.
+            if name == GIT_ENTRY {
+                inner.retained.push(child);
+                whole = false;
+                continue;
             }
-            match entry.file_type() {
-                Ok(kind) if kind.is_dir() => pending.push(entry.path()),
-                Ok(_) => {}
-                Err(_) => return true,
+            if real_directory(&path) {
+                if tagged && name == CARGO_TARGET_TMP {
+                    scratch = Some(child);
+                    continue;
+                }
+                if cargo_profile(&path) {
+                    found_profile = true;
+                    whole &= self.cargo_part(child, CacheKind::CargoProfile, &mut inner)?;
+                    continue;
+                }
+                // A repository's root, an unreadable directory or one on another device.
+                if !matches!(self.guard.observe(&path), Observed::Directory) {
+                    whole = false;
+                    self.entry(child, false, &mut inner)?;
+                    continue;
+                }
+                let nested_tag = cache_tagged(&path);
+                if nested_tag || holds_profile(&path)? {
+                    match self.cargo_target(&child, nested_tag)? {
+                        TargetShape::Whole => {
+                            found_profile = true;
+                            whole &= self.cargo_part(child, CacheKind::CargoTarget, &mut inner)?;
+                        }
+                        TargetShape::Partial(plan) => {
+                            found_profile = true;
+                            whole = false;
+                            // Each part was classified, kept ones included.
+                            inner.extend(plan);
+                        }
+                        TargetShape::NotCargo => {
+                            whole = false;
+                            self.entry(child, false, &mut inner)?;
+                        }
+                    }
+                    continue;
+                }
+                if read_names(&path)?.is_empty() && !self.guard.kept(&child) {
+                    loose.push(child);
+                    continue;
+                }
+            } else if tagged
+                && regular_file(&path)
+                && cargo_metadata(&directory, &name)
+                && !self.guard.kept(&child)
+            {
+                loose.push(child);
+                continue;
+            }
+            whole = false;
+            self.entry(child, false, &mut inner)?;
+        }
+        if let Some(scratch) = scratch {
+            if found_profile {
+                whole &= self.scratch(scratch, &mut inner)?;
+            } else {
+                whole = false;
             }
         }
+        Ok(if !found_profile {
+            TargetShape::NotCargo
+        } else if whole && inner.retained.is_empty() {
+            TargetShape::Whole
+        } else {
+            for child in loose {
+                self.entry(child, false, &mut inner)?;
+            }
+            TargetShape::Partial(inner)
+        })
     }
-    false
+
+    /// Whether the directory `relative` is a Flutter app's output by the one build-output
+    /// classifier ([`flutter_output_kind`]), observed on disk. HEAD's and the index's paths are
+    /// read only for a directory whose name could make it one.
+    fn flutter_output(&mut self, relative: &Path) -> Result<bool, Refusal> {
+        let Some(directory) = relative.to_str().map(str::as_bytes) else {
+            return Ok(false);
+        };
+        let named = relative
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| FlutterOutputKind::named(name.as_bytes()).is_some());
+        if !named {
+            return Ok(false);
+        }
+        let committed = match &mut self.committed {
+            Some(paths) => paths,
+            None => self
+                .committed
+                .insert(head_or_index_paths(self.worktree, "HEAD")?),
+        };
+        let (worktree, tracked) = (self.worktree, &self.tracked);
+        Ok(flutter_output_kind(directory, |directory, manifest| {
+            flutter_facts(worktree, directory, manifest, committed, tracked)
+        })
+        .is_some())
+    }
 }
 
 /// Whether `directory` is itself a Git directory, whatever its name: `HEAD` a regular file, and
@@ -395,21 +1013,6 @@ pub(crate) fn git_directory(directory: &Path) -> bool {
         refs_directory: real_directory(&directory.join(GIT_DIRECTORY_REFS)),
     }
     .recognises()
-}
-
-/// Whether the entry at `path` is named `.git` or, as a real directory, is or holds a repository
-/// ([`holds_git_entry`]). A file or symbolic link of another name holds none; an entry whose type
-/// cannot be read counts as holding one, and a missing one as holding none (its deletion then
-/// refuses as changed state).
-fn is_or_holds_git_entry(path: &Path) -> bool {
-    if path.file_name() == Some(std::ffi::OsStr::new(GIT_ENTRY)) {
-        return true;
-    }
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.is_dir() => holds_git_entry(path),
-        Ok(_) => false,
-        Err(error) => error.kind() != std::io::ErrorKind::NotFound,
-    }
 }
 
 /// Every path HEAD's tree (`head`) or the tree's index tracks, as raw bytes: such a file is
@@ -498,73 +1101,6 @@ fn cargo_metadata(directory: &Path, name: &std::ffi::OsStr) -> bool {
     name.to_str().is_some_and(|name| {
         CARGO_TARGET_METADATA.contains(&name)
             && (name != CACHEDIR_TAG_FILE || cache_tagged(directory))
-    })
-}
-
-/// Classify the children of a tagged target, or of a target-triple directory below one.
-fn cargo_target(worktree: &Path, relative: &Path, tagged: bool) -> Result<TargetShape, Refusal> {
-    let directory = worktree.join(relative);
-    let mut children = read_names(&directory)?;
-    children.sort();
-    let mut inner = Plan::default();
-    let mut found_profile = false;
-    // Cargo's `tmp` below a tagged target is cache, but only beside a profile, which is known
-    // once every child was read.
-    let mut scratch = None;
-    for name in children {
-        let child = relative.join(&name);
-        let path = worktree.join(&child);
-        // A repository's `.git` is never a target's part, whatever it holds.
-        if name == GIT_ENTRY {
-            inner.retained.push(child);
-            continue;
-        }
-        if real_directory(&path) {
-            if tagged && name == CARGO_TARGET_TMP {
-                scratch = Some(child);
-                continue;
-            }
-            if cargo_profile(&path) {
-                found_profile = true;
-                inner.discard_unless_repository(worktree, child, CacheKind::CargoProfile);
-                continue;
-            }
-            let nested_tag = cache_tagged(&path);
-            if nested_tag || holds_profile(&path)? {
-                match cargo_target(worktree, &child, nested_tag)? {
-                    TargetShape::Whole => {
-                        found_profile = true;
-                        inner.discarded.push((child, CacheKind::CargoTarget));
-                    }
-                    TargetShape::Partial(plan) => {
-                        found_profile = true;
-                        inner.discarded.extend(plan.discarded);
-                        inner.retained.extend(plan.retained);
-                    }
-                    TargetShape::NotCargo(_) => inner.retained.push(child),
-                }
-                continue;
-            }
-            if !read_names(&path)?.is_empty() {
-                inner.retained.push(child);
-            }
-        } else if !(tagged && regular_file(&path) && cargo_metadata(&directory, &name)) {
-            inner.retained.push(child);
-        }
-    }
-    if let Some(scratch) = scratch {
-        if found_profile {
-            inner.scratch(worktree, scratch);
-        } else if !read_names(&worktree.join(&scratch))?.is_empty() {
-            inner.retain_sorted(scratch);
-        }
-    }
-    Ok(if !found_profile {
-        TargetShape::NotCargo(inner.retained)
-    } else if inner.retained.is_empty() {
-        TargetShape::Whole
-    } else {
-        TargetShape::Partial(inner)
     })
 }
 
@@ -677,34 +1213,38 @@ pub(crate) fn last_activity(worktree: &Path) -> Option<i64> {
         .max()
 }
 
-/// Delete one planned entry. Only a direct entry of Cargo's `tmp/` (`cargo-target-tmp`) may be a
-/// file or symbolic link, which is unlinked, never followed; every other entry must still be a
-/// real directory.
-fn remove(path: &Path, kind: CacheKind) -> Result<(), Refusal> {
-    let unlinkable = kind == CacheKind::CargoTargetTmp
-        && std::fs::symlink_metadata(path)
-            .is_ok_and(|metadata| metadata.is_file() || metadata.is_symlink());
-    if unlinkable {
-        return std::fs::remove_file(path).map_err(|error| {
-            Refusal::new(
-                "cache-delete-failed",
-                format!("{}: {error}", path.display()),
-            )
-        });
+/// Delete one planned entry, `relative` below `worktree`, only while every directory between the
+/// tree root and it is still a real directory, so a deletion never leaves the tree. A file or
+/// symbolic link of the kinds that may be one (`ignored-output`, a direct entry of Cargo's
+/// `tmp/`) is unlinked, never followed; a directory is deleted with everything below it, without
+/// following a symbolic link; every other kind must still be a real directory.
+fn remove(worktree: &Path, relative: &Path, kind: CacheKind) -> Result<(), Refusal> {
+    let path = worktree.join(relative);
+    let changed =
+        |what: &str| Refusal::new("cache-state-changed", format!("{} {what}", path.display()));
+    let inside = relative
+        .ancestors()
+        .skip(1)
+        .filter(|ancestor| !ancestor.as_os_str().is_empty())
+        .all(|ancestor| real_directory(&worktree.join(ancestor)));
+    if !inside {
+        return Err(changed("is no longer below real directories of the tree"));
     }
-    if !real_directory(path) {
-        return Err(Refusal::new(
-            "cache-state-changed",
-            format!("{} is no longer a directory", path.display()),
-        ));
-    }
-    crate::make_directories_owner_writable(path)?;
-    std::fs::remove_dir_all(path).map_err(|error| {
+    let failed = |error: std::io::Error| {
         Refusal::new(
             "cache-delete-failed",
             format!("{}: {error}", path.display()),
         )
-    })
+    };
+    let metadata = std::fs::symlink_metadata(&path).map_err(|_| changed("no longer exists"))?;
+    if !metadata.is_dir() {
+        if matches!(kind, CacheKind::IgnoredOutput | CacheKind::CargoTargetTmp) {
+            return std::fs::remove_file(&path).map_err(failed);
+        }
+        return Err(changed("is no longer a directory"));
+    }
+    crate::make_directories_owner_writable(&path)?;
+    std::fs::remove_dir_all(&path).map_err(failed)
 }
 
 fn in_use(worktree: &Path, users: &[(u32, String)]) -> Refusal {
@@ -790,7 +1330,7 @@ fn own_ancestry() -> BTreeSet<u32> {
 mod tests {
     use super::*;
 
-    const KINDS: [CacheKind; 7] = [
+    const KINDS: [CacheKind; 8] = [
         CacheKind::CargoProfile,
         CacheKind::CargoTarget,
         CacheKind::CargoTargetTmp,
@@ -798,7 +1338,24 @@ mod tests {
         CacheKind::NodeModules,
         CacheKind::PythonVirtualenv,
         CacheKind::ToolCache,
+        CacheKind::IgnoredOutput,
     ];
+
+    fn git(path: &Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 
     /// A `.git` that appears below a planned directory after classification, as a file, a
     /// directory or a symbolic link, keeps the directory whole at deletion, whatever its kind.
@@ -808,6 +1365,7 @@ mod tests {
         for (index, kind) in KINDS.into_iter().enumerate() {
             for shape in ["file", "directory", "symlink"] {
                 let root = tempfile::tempdir().unwrap();
+                let guard = Guard::read(root.path()).unwrap();
                 let relative = PathBuf::from(format!("cache-{index}"));
                 let nested = root.path().join(&relative).join("deep/fixture");
                 std::fs::create_dir_all(&nested).unwrap();
@@ -823,7 +1381,7 @@ mod tests {
                     ..Plan::default()
                 };
 
-                let result = finish_discard(root.path(), plan, true).unwrap();
+                let result = finish_discard(root.path(), plan, &guard, true).unwrap();
                 assert!(result.discarded.is_empty(), "{kind:?} with a {shape} .git");
                 assert_eq!(result.retained_ignored, [relative]);
                 assert!(
@@ -841,6 +1399,7 @@ mod tests {
     #[test]
     fn a_git_directory_is_recognised_by_head_objects_and_refs() {
         let root = tempfile::tempdir().unwrap();
+        let guard = Guard::structural();
         let make = |name: &str, head: bool, objects: bool, refs: bool| {
             let directory = root.path().join(name);
             std::fs::create_dir_all(&directory).unwrap();
@@ -864,25 +1423,29 @@ mod tests {
         std::fs::create_dir(head_directory.join("HEAD")).unwrap();
 
         assert!(git_directory(&bare));
-        assert!(is_or_holds_git_entry(&bare));
+        assert!(matches!(guard.observe(&bare), Observed::Retained));
         for not_one in [&only_head, &no_refs, &linked_objects, &head_directory] {
             assert!(!git_directory(not_one), "{}", not_one.display());
         }
-        assert!(!is_or_holds_git_entry(&only_head));
-        assert!(!is_or_holds_git_entry(&linked_objects));
+        assert!(matches!(guard.observe(&only_head), Observed::Directory));
+        assert!(matches!(
+            guard.observe(&linked_objects),
+            Observed::Directory
+        ));
 
         // One at any depth below a directory counts, as a `.git` does.
         let scratch = root.path().join("scratch");
         std::fs::create_dir_all(scratch.join("deep")).unwrap();
-        assert!(!holds_git_entry(&scratch));
+        assert!(!guard.holds_protected(root.path(), Path::new("scratch")));
         std::fs::rename(&bare, scratch.join("deep/remote.git")).unwrap();
-        assert!(holds_git_entry(&scratch));
+        assert!(guard.holds_protected(root.path(), Path::new("scratch")));
     }
 
     /// A direct entry of Cargo's `tmp/` may be a file; it is deleted as `cargo-target-tmp`.
     #[test]
     fn a_file_in_target_tmp_is_discarded_as_target_tmp() {
         let root = tempfile::tempdir().unwrap();
+        let guard = Guard::read(root.path()).unwrap();
         let relative = PathBuf::from("target/tmp/output.log");
         std::fs::create_dir_all(root.path().join("target/tmp")).unwrap();
         std::fs::write(root.path().join(&relative), "scratch\n").unwrap();
@@ -891,10 +1454,183 @@ mod tests {
             ..Plan::default()
         };
 
-        let result = finish_discard(root.path(), plan, true).unwrap();
+        let result = finish_discard(root.path(), plan, &guard, true).unwrap();
         assert_eq!(result.discarded.len(), 1);
         assert_eq!(result.discarded[0].path, relative);
         assert_eq!(result.retained_ignored, [] as [PathBuf; 0]);
         assert!(!root.path().join(&relative).exists());
+    }
+
+    /// The keep file is read again immediately before each deletion: a pattern written after
+    /// classification keeps the entry it matches, and one that keeps a path below a planned
+    /// directory keeps the directory.
+    #[test]
+    fn a_path_kept_after_classification_is_retained_at_deletion() {
+        let root = tempfile::tempdir().unwrap();
+        git(root.path(), &["init", "-q"]);
+        std::fs::create_dir_all(root.path().join("records")).unwrap();
+        std::fs::write(root.path().join("records/notes.md"), "a record\n").unwrap();
+        std::fs::create_dir_all(root.path().join("output/evidence")).unwrap();
+        std::fs::write(root.path().join("output/evidence/run.json"), "{}\n").unwrap();
+        std::fs::write(root.path().join("app.log"), "log\n").unwrap();
+        let guard = Guard::read(root.path()).unwrap();
+        assert!(guard.keep.kept.is_empty());
+        let plan = Plan {
+            discarded: vec![
+                (PathBuf::from("app.log"), CacheKind::IgnoredOutput),
+                (PathBuf::from("output"), CacheKind::IgnoredOutput),
+                (PathBuf::from("records"), CacheKind::IgnoredOutput),
+            ],
+            ..Plan::default()
+        };
+        std::fs::write(root.path().join(KEEP_FILE), "records/\noutput/evidence/\n").unwrap();
+
+        let result = finish_discard(root.path(), plan, &guard, true).unwrap();
+        assert_eq!(
+            result
+                .discarded
+                .iter()
+                .map(|entry| entry.path.clone())
+                .collect::<Vec<_>>(),
+            [PathBuf::from("app.log")]
+        );
+        assert_eq!(
+            result.retained_ignored,
+            [PathBuf::from("output"), PathBuf::from("records")]
+        );
+        assert!(root.path().join("records/notes.md").is_file());
+        assert!(root.path().join("output/evidence/run.json").is_file());
+        assert!(!root.path().join("app.log").exists());
+    }
+
+    /// A keep file that turns into a symbolic link after classification keeps everything.
+    #[cfg(unix)]
+    #[test]
+    fn a_keep_file_that_turns_invalid_keeps_everything() {
+        let root = tempfile::tempdir().unwrap();
+        git(root.path(), &["init", "-q"]);
+        std::fs::write(root.path().join(KEEP_FILE), "records/\n").unwrap();
+        std::fs::create_dir_all(root.path().join("records")).unwrap();
+        std::fs::write(root.path().join("records/notes.md"), "a record\n").unwrap();
+        std::fs::write(root.path().join("app.log"), "log\n").unwrap();
+        let guard = Guard::read(root.path()).unwrap();
+        assert!(guard.kept(Path::new("records/notes.md")));
+        let plan = Plan {
+            discarded: vec![(PathBuf::from("app.log"), CacheKind::IgnoredOutput)],
+            ..Plan::default()
+        };
+        std::fs::remove_file(root.path().join(KEEP_FILE)).unwrap();
+        std::os::unix::fs::symlink("elsewhere", root.path().join(KEEP_FILE)).unwrap();
+
+        let result = finish_discard(root.path(), plan, &guard, true).unwrap();
+        assert_eq!(result.discarded, []);
+        assert_eq!(result.retained_ignored, [PathBuf::from("app.log")]);
+        assert!(root.path().join("app.log").is_file());
+    }
+
+    /// An entry on another device than the tree root (a mount point) is retained, and a
+    /// directory holding one is never deleted whole.
+    #[cfg(unix)]
+    #[test]
+    fn an_entry_on_another_device_is_retained() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("mounted/inner")).unwrap();
+        std::fs::write(root.path().join("mounted/inner/file"), "elsewhere\n").unwrap();
+        let elsewhere = Guard {
+            device: Some(u64::MAX),
+            ..Guard::structural()
+        };
+        assert!(matches!(
+            elsewhere.observe(&root.path().join("mounted")),
+            Observed::Retained
+        ));
+        let root_device = Guard {
+            device: device(&std::fs::symlink_metadata(root.path()).unwrap()),
+            ..Guard::structural()
+        };
+        assert!(!root_device.holds_protected(root.path(), Path::new("mounted")));
+        let below = Guard {
+            device: device(&std::fs::symlink_metadata(root.path()).unwrap())
+                .map(|device| device ^ 1),
+            ..Guard::structural()
+        };
+        assert!(below.holds_protected(root.path(), Path::new("mounted")));
+    }
+
+    /// A mount point `mountinfo` lists at or below an entry keeps it, whatever its device: a
+    /// bind mount from the same filesystem shares the tree's device.
+    #[cfg(unix)]
+    #[test]
+    fn a_mount_point_at_or_below_an_entry_is_retained() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("scratch/mnt")).unwrap();
+        std::fs::create_dir_all(root.path().join("other")).unwrap();
+        let canonical = std::fs::canonicalize(root.path()).unwrap();
+        let guard = Guard {
+            device: device(&std::fs::symlink_metadata(root.path()).unwrap()),
+            mounts: Mounts {
+                root: root.path().to_path_buf(),
+                canonical: canonical.clone(),
+                points: Some(BTreeSet::from([canonical.join("scratch/mnt")])),
+            },
+            ..Guard::structural()
+        };
+        assert!(matches!(
+            guard.observe(&root.path().join("scratch/mnt")),
+            Observed::Retained
+        ));
+        assert!(guard.holds_protected(root.path(), Path::new("scratch")));
+        assert!(!guard.holds_protected(root.path(), Path::new("other")));
+        assert!(matches!(
+            guard.observe(&root.path().join("other")),
+            Observed::Directory
+        ));
+    }
+
+    /// The `mountinfo` of this process lists `/`, decoded, whenever it can be read.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mountinfo_lists_the_root() {
+        if let Some(points) = mount_points() {
+            assert!(points.contains(Path::new("/")), "{points:?}");
+        }
+    }
+
+    /// A directory a keep pattern names is kept even when it holds no file; a parent Git lists
+    /// only because everything in it matches is not.
+    #[test]
+    fn a_directory_a_keep_pattern_names_is_kept_and_its_parent_is_not() {
+        let root = tempfile::tempdir().unwrap();
+        git(root.path(), &["init", "-q"]);
+        std::fs::create_dir_all(root.path().join("only/mounts/data")).unwrap();
+        std::fs::write(root.path().join(KEEP_FILE), "only/mounts/\n").unwrap();
+
+        let kept = kept_paths(root.path(), None).unwrap();
+        assert_eq!(kept, BTreeSet::from([PathBuf::from("only/mounts")]));
+        let keep = KeepSnapshot::read(root.path()).unwrap();
+        assert!(keep.keeps(Path::new("only/mounts/data")));
+        assert!(!keep.keeps(Path::new("only")));
+        assert!(keep.holds_kept(Path::new("only")));
+    }
+
+    /// A deletion never leaves the tree: a planned path below a directory that became a symbolic
+    /// link is refused, and what the link points at is untouched.
+    #[cfg(unix)]
+    #[test]
+    fn a_deletion_through_a_symlinked_parent_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let tree = root.path().join("tree");
+        let outside = root.path().join("outside");
+        std::fs::create_dir_all(&tree).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("file"), "outside\n").unwrap();
+        std::os::unix::fs::symlink(&outside, tree.join("link")).unwrap();
+
+        let refusal = remove(&tree, Path::new("link/file"), CacheKind::IgnoredOutput).unwrap_err();
+        assert_eq!(refusal.code, "cache-state-changed", "{refusal}");
+        assert_eq!(
+            std::fs::read_to_string(outside.join("file")).unwrap(),
+            "outside\n"
+        );
     }
 }

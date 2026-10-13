@@ -51,6 +51,11 @@ impl Fixture {
         git(&repository, &["init", "-b", "main"]);
         write(&repository.join("source"), "original\n");
         write(&repository.join(".gitignore"), "/target\n");
+        // The records a sweep must not delete: every other ignored entry is disposable.
+        write(
+            &repository.join(".worktreekeep"),
+            "/target/review/\n/target/data/\n",
+        );
         git(&repository, &["add", "."]);
         git(&repository, &["commit", "-m", "fixture"]);
         let remote = root.path().join("remote.git");
@@ -184,8 +189,28 @@ fn an_idle_expired_tree_loses_only_cache_and_gains_an_archive_gc_accepts() {
 
     let swept = fixture.sweep(&[]);
     let done = item(&swept, "idle");
+    let discarded: Vec<(&str, &str)> = done["cache"]["discarded"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| {
+            (
+                entry["path"].as_str().unwrap(),
+                entry["kind"].as_str().unwrap(),
+            )
+        })
+        .collect();
     assert_eq!(
-        done["cache"]["discarded"][0]["path"], "target/debug",
+        discarded,
+        [
+            ("target/CACHEDIR.TAG", "ignored-output"),
+            ("target/debug", "cargo-profile")
+        ],
+        "{done}"
+    );
+    assert_eq!(
+        done["cache"]["retained_ignored"],
+        serde_json::json!(["target/review/notes.md"]),
         "{done}"
     );
     assert!(done.get("refusal").is_none(), "{done}");

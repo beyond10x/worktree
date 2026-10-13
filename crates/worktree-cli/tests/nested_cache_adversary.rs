@@ -431,7 +431,22 @@ fn finish_collects_a_tree_whose_triple_profile_holds_a_repository() {
     let commit = fixture.nested_repository("target/x86_64-unknown-linux-gnu/debug/build/out/fx");
 
     let applied = fixture.ok(&["discard-cache", fixture.tree_str()])["cache"].clone();
-    assert_eq!(paths(&applied, "discarded"), ["target/debug"], "{applied}");
+    // The triple's profile holds the repository, so it falls to its parts.
+    assert_eq!(
+        paths(&applied, "discarded"),
+        [
+            "target/CACHEDIR.TAG",
+            "target/debug",
+            "target/x86_64-unknown-linux-gnu/debug/.fingerprint",
+            "target/x86_64-unknown-linux-gnu/debug/deps"
+        ],
+        "{applied}"
+    );
+    assert_eq!(
+        paths(&applied, "retained_ignored"),
+        ["target/x86_64-unknown-linux-gnu/debug/build/out/fx"],
+        "{applied}"
+    );
     assert!(holds_commit(
         &fixture
             .tree
@@ -469,8 +484,8 @@ fn a_nested_target_inside_target_tmp_keeps_its_fixture_repository() {
 }
 
 /// `tmp/` entries that are symbolic links (to a repository outside, and one named `.git`) and a
-/// file named `.git` directly in `tmp/`: links are unlinked, never followed, and every `.git`
-/// stays.
+/// file named `.git` directly in `tmp/`: that file makes `tmp/` itself a repository's root, so
+/// `tmp/` is retained whole; no link is followed and every `.git` stays.
 #[test]
 fn links_and_git_files_in_target_tmp_never_reach_a_repository() {
     let fixture = Fixture::new();
@@ -496,7 +511,13 @@ fn links_and_git_files_in_target_tmp_never_reach_a_repository() {
         std::fs::symlink_metadata(scratch.join("linked/.git")).is_ok(),
         "{applied}"
     );
-    assert!(std::fs::symlink_metadata(scratch.join("outside")).is_err());
+    assert_eq!(paths(&applied, "retained_ignored"), ["target/tmp"]);
+    assert!(
+        std::fs::symlink_metadata(scratch.join("outside"))
+            .unwrap()
+            .is_symlink()
+    );
+    assert!(!fixture.tree.join("target/debug").exists());
 }
 
 /// A `.git` directly in an untagged target's root (`git init target`): the target falls to its
@@ -578,20 +599,31 @@ fn restore(fixture: &Fixture, archive: &Path) -> PathBuf {
     restored
 }
 
-/// A bare repository inside a profile `discard-cache` keeps whole. The archive must hold it too:
-/// before, it left the repository's files out as cargo build layout, no image and no blocker,
-/// and `gc --apply` then removed the tree and the only copy of its commit. Outcome: the tree is
-/// collected, `dirty.patch` holds every file of the repository as an ordinary untracked file,
-/// the profile's own layout stays left out, and applying the patch restores the commit.
+/// A bare repository inside a profile, archived with the profile's layout still on disk. The
+/// archive must hold it: before, it left the repository's files out as cargo build layout, no
+/// image and no blocker, and `gc --apply` then removed the tree and the only copy of its commit.
+/// Outcome: the tree is collected, `dirty.patch` holds every file of the repository as an
+/// ordinary untracked file, the profile's own layout stays left out, and applying the patch
+/// restores the commit.
+///
+/// `discard-cache` no longer keeps such a profile whole (it falls to its parts, and a kept path
+/// is never layout), so the archive is written without a discard, as `archive` alone does.
 #[test]
-fn a_bare_repository_in_a_kept_profile_survives_finish_and_gc() {
+fn a_bare_repository_in_a_profile_survives_archive_finish_and_gc() {
     let fixture = Fixture::new();
     fixture.tagged_target_with_profile();
     fixture.profile("target/release");
     let relative = "target/release/build/one/out/remote.git";
     let commit = bare_repository_with_pushed_commit(&fixture, relative);
 
-    let finished = fixture.finish_and_collect();
+    let archived = fixture.ok(&["archive", fixture.tree_str()]);
+    fixture.ok(&["finish", fixture.tree_str()]);
+    let repo = fixture.repository.to_str().unwrap();
+    let review = fixture.ok(&["gc", "--repo", repo, "--dry-run", "--id", "cache"]);
+    assert_eq!(review["assessments"][0]["eligible"], true, "{review}");
+    fixture.ok(&["gc", "--repo", repo, "--apply", "--id", "cache"]);
+    assert!(!fixture.tree.exists());
+    let finished = &archived;
     let archive = PathBuf::from(finished["archive"]["path"].as_str().unwrap());
     let manifest = &finished["archive"]["manifest"];
     assert_eq!(manifest["format"], "worktree.archive/3", "{finished}");

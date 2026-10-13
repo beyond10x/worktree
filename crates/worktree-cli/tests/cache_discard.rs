@@ -1,5 +1,5 @@
-//! Recognised build cache is discarded; every other ignored entry survives, and finish loses
-//! nothing that is not cache.
+//! Ignored entries are discarded, named by the structural rule that recognises them; what the
+//! keep file keeps and every repository survive, and finish loses nothing that is kept.
 
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -222,21 +222,19 @@ impl Fixture {
         head
     }
 
-    /// Every file [`Self::untagged_target`] wrote is still on disk.
-    fn assert_untagged_target_intact(&self, relative: &str) {
-        let directory = self.tree.join(relative);
-        for file in [
-            "debug/.fingerprint/one/dep-lib",
-            "debug/deps/libone.rlib",
-            "tmp/output.log",
-            "tmp/case/one/state.json",
-            "tmp/fixture/.git/HEAD",
-            "tmp/fixture/file",
-            ".rustc_info.json",
-        ] {
+    /// What [`Self::untagged_target`] left at `relative` once it was discarded as an unrecognised
+    /// directory: only the fixture repository, with its commit `head`.
+    fn assert_only_the_fixture_survives(&self, relative: &str, head: &str) {
+        let fixture = format!("{relative}/tmp/fixture");
+        assert!(self.holds_commit(&fixture, head), "{fixture} lost {head}");
+        assert_eq!(
+            std::fs::read_to_string(self.tree.join(&fixture).join("file")).unwrap(),
+            "nested\n"
+        );
+        for gone in ["debug", "tmp/output.log", "tmp/case", ".rustc_info.json"] {
             assert!(
-                directory.join(file).exists(),
-                "{relative}/{file} was deleted"
+                !self.tree.join(relative).join(gone).exists(),
+                "{relative}/{gone} survived"
             );
         }
     }
@@ -280,9 +278,27 @@ fn kinds(cache: &Value) -> Vec<String> {
         .collect()
 }
 
+/// `(path, kind)` of every discarded entry.
+fn discarded(cache: &Value) -> Vec<(String, String)> {
+    paths(cache, "discarded")
+        .into_iter()
+        .zip(kinds(cache))
+        .collect()
+}
+
+fn pairs(expected: &[(&str, &str)]) -> Vec<(String, String)> {
+    expected
+        .iter()
+        .map(|(path, kind)| ((*path).to_owned(), (*kind).to_owned()))
+        .collect()
+}
+
+/// The keep file that keeps the record [`Fixture`]s write into `target/backlog-input/`.
+const KEEP_BACKLOG: (&str, &str) = (".worktreekeep", "target/backlog-input/\n");
+
 #[test]
-fn records_inside_a_cargo_target_survive_and_only_profiles_are_discarded() {
-    let fixture = Fixture::new();
+fn a_kept_record_inside_a_cargo_target_survives_and_the_rest_of_the_target_goes() {
+    let fixture = Fixture::tracking(&[KEEP_BACKLOG]);
     write(&fixture.tree.join("target/CACHEDIR.TAG"), TAG);
     write(&fixture.tree.join("target/.rustc_info.json"), "{}");
     fixture.profile("target/debug");
@@ -291,21 +307,25 @@ fn records_inside_a_cargo_target_survive_and_only_profiles_are_discarded() {
         &fixture.tree.join("target/backlog-input/notes.md"),
         "a record a commit cites\n",
     );
+    let expected = pairs(&[
+        ("target/.rustc_info.json", "ignored-output"),
+        ("target/CACHEDIR.TAG", "ignored-output"),
+        ("target/debug", "cargo-profile"),
+        ("target/x86_64-unknown-linux-gnu", "cargo-target"),
+    ]);
 
     let planned = fixture.discard(&["--dry-run"]);
     assert_eq!(planned["applied"], false);
-    assert_eq!(
-        paths(&planned, "discarded"),
-        ["target/debug", "target/x86_64-unknown-linux-gnu"]
-    );
+    assert_eq!(discarded(&planned), expected, "{planned}");
     assert_eq!(
         paths(&planned, "retained_ignored"),
-        ["target/backlog-input"]
+        ["target/backlog-input/notes.md"]
     );
     assert!(fixture.tree.join("target/debug/deps/libone.rlib").exists());
 
     let applied = fixture.discard(&[]);
     assert_eq!(applied["applied"], true);
+    assert_eq!(discarded(&applied), expected, "{applied}");
     assert!(!fixture.tree.join("target/debug").exists());
     assert!(
         !fixture
@@ -317,7 +337,7 @@ fn records_inside_a_cargo_target_survive_and_only_profiles_are_discarded() {
         std::fs::read_to_string(fixture.tree.join("target/backlog-input/notes.md")).unwrap(),
         "a record a commit cites\n"
     );
-    assert!(fixture.tree.join("target/CACHEDIR.TAG").exists());
+    assert!(!fixture.tree.join("target/CACHEDIR.TAG").exists());
 
     let refusal = fixture.refused(&["finish", "--discard-cache", fixture.tree_str()]);
     assert_eq!(refusal["code"], "worktree-dirty");
@@ -381,8 +401,8 @@ fn a_target_whose_tmp_holds_only_scratch_goes_whole_and_the_tree_is_collected() 
 }
 
 #[test]
-fn beside_a_record_the_target_tmp_is_discarded_on_its_own() {
-    let fixture = Fixture::new();
+fn beside_a_kept_record_the_target_tmp_is_discarded_on_its_own() {
+    let fixture = Fixture::tracking(&[KEEP_BACKLOG]);
     write(&fixture.tree.join("target/CACHEDIR.TAG"), TAG);
     fixture.profile("target/debug");
     fixture.plain_scratch("target/tmp");
@@ -390,20 +410,23 @@ fn beside_a_record_the_target_tmp_is_discarded_on_its_own() {
         &fixture.tree.join("target/backlog-input/notes.md"),
         "a record a commit cites\n",
     );
+    let expected = pairs(&[
+        ("target/CACHEDIR.TAG", "ignored-output"),
+        ("target/debug", "cargo-profile"),
+        ("target/tmp", "cargo-target-tmp"),
+    ]);
 
     let planned = fixture.discard(&["--dry-run"]);
-    assert_eq!(paths(&planned, "discarded"), ["target/debug", "target/tmp"]);
-    assert_eq!(kinds(&planned), ["cargo-profile", "cargo-target-tmp"]);
+    assert_eq!(discarded(&planned), expected, "{planned}");
     assert_eq!(
         paths(&planned, "retained_ignored"),
-        ["target/backlog-input"]
+        ["target/backlog-input/notes.md"]
     );
     assert!(fixture.tree.join("target/tmp/output.log").exists());
 
     let applied = fixture.discard(&[]);
     assert_eq!(applied["applied"], true);
-    assert_eq!(paths(&applied, "discarded"), ["target/debug", "target/tmp"]);
-    assert_eq!(kinds(&applied), ["cargo-profile", "cargo-target-tmp"]);
+    assert_eq!(discarded(&applied), expected, "{applied}");
     assert!(!fixture.tree.join("target/tmp").exists());
     assert!(!fixture.tree.join("target/debug").exists());
     assert_eq!(
@@ -413,9 +436,29 @@ fn beside_a_record_the_target_tmp_is_discarded_on_its_own() {
 }
 
 /// Discarded scratch of [`Fixture::test_scratch`] in `target/tmp`, beside the profile
-/// `target/debug`: every direct entry of `tmp/` but the fixture repository.
-const SCRATCH_PARTS: [&str; 3] = ["target/debug", "target/tmp/case", "target/tmp/output.log"];
-const SCRATCH_KINDS: [&str; 3] = ["cargo-profile", "cargo-target-tmp", "cargo-target-tmp"];
+/// `target/debug` and the target's `CACHEDIR.TAG`: every direct entry of `tmp/` but the fixture
+/// repository. The target holds a repository, so its own metadata goes on its own.
+const SCRATCH_PARTS: [&str; 4] = [
+    "target/CACHEDIR.TAG",
+    "target/debug",
+    "target/tmp/case",
+    "target/tmp/output.log",
+];
+const SCRATCH_KINDS: [&str; 4] = [
+    "ignored-output",
+    "cargo-profile",
+    "cargo-target-tmp",
+    "cargo-target-tmp",
+];
+
+/// [`SCRATCH_PARTS`] of an untagged target ([`Fixture::untagged_target`]), which holds
+/// `.rustc_info.json` instead of a tag.
+const UNTAGGED_SCRATCH_PARTS: [&str; 4] = [
+    "target/.rustc_info.json",
+    "target/debug",
+    "target/tmp/case",
+    "target/tmp/output.log",
+];
 
 /// Integration tests write fixture repositories into `CARGO_TARGET_TMPDIR`; one may hold commits
 /// no remote does, so `tmp/` falls to its direct entries and the repository is kept.
@@ -485,8 +528,10 @@ fn finish_discard_cache_archive_images_a_fixture_repository_and_the_tree_is_coll
     assert!(directory.join(image).is_file(), "{archive}");
 }
 
+/// A profile holding a repository is never deleted whole: it falls to its direct entries, and
+/// each directory above the repository falls in turn.
 #[test]
-fn a_profile_holding_a_nested_repository_is_retained_whole() {
+fn a_profile_holding_a_nested_repository_falls_to_its_parts() {
     let fixture = Fixture::new();
     write(&fixture.tree.join("target/CACHEDIR.TAG"), TAG);
     fixture.profile("target/debug");
@@ -494,21 +539,36 @@ fn a_profile_holding_a_nested_repository_is_retained_whole() {
     let commit = fixture.nested_repository("target/release/build/one/out/fixture");
 
     let applied = fixture.discard(&[]);
-    assert_eq!(paths(&applied, "discarded"), ["target/debug"], "{applied}");
-    assert_eq!(kinds(&applied), ["cargo-profile"]);
-    assert_eq!(paths(&applied, "retained_ignored"), ["target/release"]);
-    assert!(!fixture.tree.join("target/debug").exists());
-    assert!(
-        fixture
-            .tree
-            .join("target/release/deps/libone.rlib")
-            .exists()
+    assert_eq!(
+        discarded(&applied),
+        pairs(&[
+            ("target/CACHEDIR.TAG", "ignored-output"),
+            ("target/debug", "cargo-profile"),
+            ("target/release/.fingerprint", "ignored-output"),
+            ("target/release/deps", "ignored-output"),
+        ]),
+        "{applied}"
     );
+    assert_eq!(
+        paths(&applied, "retained_ignored"),
+        ["target/release/build/one/out/fixture"]
+    );
+    assert!(!fixture.tree.join("target/debug").exists());
+    assert!(!fixture.tree.join("target/release/deps").exists());
     assert!(fixture.holds_commit("target/release/build/one/out/fixture", &commit));
+    assert_eq!(
+        std::fs::read_to_string(
+            fixture
+                .tree
+                .join("target/release/build/one/out/fixture/file")
+        )
+        .unwrap(),
+        "nested\n"
+    );
 }
 
 #[test]
-fn node_modules_holding_a_nested_repository_is_retained_whole() {
+fn node_modules_holding_a_nested_repository_falls_to_its_parts() {
     let fixture = Fixture::new();
     write(&fixture.tree.join("web/node_modules/a/index.js"), "a");
     let commit = fixture.nested_repository("web/node_modules/from-git");
@@ -519,19 +579,26 @@ fn node_modules_holding_a_nested_repository_is_retained_whole() {
 
     let applied = fixture.discard(&[]);
     assert_eq!(
-        paths(&applied, "discarded"),
-        ["web/packages/ui/node_modules"],
+        discarded(&applied),
+        pairs(&[
+            ("web/node_modules/a", "ignored-output"),
+            ("web/packages/ui/node_modules", "node-modules"),
+        ]),
         "{applied}"
     );
-    assert_eq!(kinds(&applied), ["node-modules"]);
-    assert_eq!(paths(&applied, "retained_ignored"), ["web/node_modules"]);
-    assert!(fixture.tree.join("web/node_modules/a/index.js").exists());
+    assert_eq!(
+        paths(&applied, "retained_ignored"),
+        ["web/node_modules/from-git"]
+    );
+    assert!(!fixture.tree.join("web/node_modules/a").exists());
     assert!(fixture.holds_commit("web/node_modules/from-git", &commit));
     assert!(!fixture.tree.join("web/packages/ui/node_modules").exists());
 }
 
+/// A `tmp/` is Cargo's scratch only directly below a tagged target that holds a profile; any
+/// other is discarded as `ignored-output` with the directory it is in.
 #[test]
-fn a_tmp_outside_a_tagged_target_holding_a_profile_is_retained() {
+fn a_tmp_outside_a_tagged_target_holding_a_profile_is_not_cargo_scratch() {
     let fixture = Fixture::new();
     // Untagged: a profile and a tmp, but no CACHEDIR.TAG.
     fixture.profile("build/debug");
@@ -541,15 +608,20 @@ fn a_tmp_outside_a_tagged_target_holding_a_profile_is_retained() {
     write(&fixture.tree.join("target/tmp/output.log"), "scratch\n");
 
     let applied = fixture.discard(&[]);
-    assert!(paths(&applied, "discarded").is_empty(), "{applied}");
-    assert_eq!(paths(&applied, "retained_ignored"), ["build", "target/tmp"]);
-    assert!(fixture.tree.join("build/tmp/output.log").exists());
-    assert!(fixture.tree.join("build/debug/deps/libone.rlib").exists());
-    assert!(fixture.tree.join("target/tmp/output.log").exists());
+    assert_eq!(
+        discarded(&applied),
+        pairs(&[("build", "ignored-output"), ("target", "ignored-output")]),
+        "{applied}"
+    );
+    assert!(paths(&applied, "retained_ignored").is_empty(), "{applied}");
+    assert!(!fixture.tree.join("build").exists());
+    assert!(!fixture.tree.join("target").exists());
 }
 
+/// A symlinked `tmp/` is unlinked and never followed; a `tmp/` below a target-triple directory
+/// is not Cargo's scratch. Neither is `cargo-target-tmp`.
 #[test]
-fn a_symlinked_tmp_or_one_below_a_target_triple_is_retained() {
+fn a_symlinked_tmp_or_one_below_a_target_triple_is_not_cargo_scratch() {
     let fixture = Fixture::new();
     write(&fixture.tree.join("target/CACHEDIR.TAG"), TAG);
     fixture.profile("target/debug");
@@ -566,27 +638,26 @@ fn a_symlinked_tmp_or_one_below_a_target_triple_is_retained() {
 
     let applied = fixture.discard(&[]);
     assert_eq!(
-        paths(&applied, "discarded"),
-        ["target/debug", "target/x86_64-unknown-linux-gnu/release"]
+        discarded(&applied),
+        pairs(&[
+            ("target/CACHEDIR.TAG", "ignored-output"),
+            ("target/debug", "cargo-profile"),
+            ("target/tmp", "ignored-output"),
+            ("target/x86_64-unknown-linux-gnu/release", "cargo-profile"),
+            ("target/x86_64-unknown-linux-gnu/tmp", "ignored-output"),
+        ]),
+        "{applied}"
     );
-    assert_eq!(kinds(&applied), ["cargo-profile", "cargo-profile"]);
-    assert_eq!(
-        paths(&applied, "retained_ignored"),
-        ["target/tmp", "target/x86_64-unknown-linux-gnu/tmp"]
-    );
+    assert!(paths(&applied, "retained_ignored").is_empty(), "{applied}");
     assert_eq!(
         std::fs::read_to_string(elsewhere.join("notes.md")).unwrap(),
         "kept\n"
     );
+    assert!(std::fs::symlink_metadata(fixture.tree.join("target/tmp")).is_err());
     assert!(
-        std::fs::symlink_metadata(fixture.tree.join("target/tmp"))
-            .unwrap()
-            .is_symlink()
-    );
-    assert!(
-        fixture
+        !fixture
             .tree
-            .join("target/x86_64-unknown-linux-gnu/tmp/output.log")
+            .join("target/x86_64-unknown-linux-gnu/tmp")
             .exists()
     );
 }
@@ -602,7 +673,7 @@ fn an_untagged_target_holding_a_fixture_repository_falls_to_its_parts_and_the_tr
     let finished = fixture.ok(&["finish", "--discard-cache", "--archive", fixture.tree_str()]);
     assert_eq!(
         paths(&finished["cache"], "discarded"),
-        SCRATCH_PARTS,
+        UNTAGGED_SCRATCH_PARTS,
         "{finished}"
     );
     assert_eq!(kinds(&finished["cache"]), SCRATCH_KINDS);
@@ -625,23 +696,31 @@ fn an_untagged_target_holding_a_fixture_repository_falls_to_its_parts_and_the_tr
 }
 
 #[test]
-fn beside_a_record_an_untagged_target_discards_its_profile_and_scratch_but_not_a_fixture_repository()
+fn beside_a_kept_record_an_untagged_target_discards_its_profile_and_scratch_but_not_a_fixture_repository()
  {
-    let fixture = Fixture::tracking(&[MANIFEST]);
+    let fixture = Fixture::tracking(&[MANIFEST, (".worktreekeep", "target/records/\n")]);
     let commit = fixture.untagged_target("target");
     write(
         &fixture.tree.join("target/records/notes.md"),
         "a record a commit cites\n",
     );
-    let retained = ["target/records", "target/tmp/fixture"];
+    let retained = ["target/records/notes.md", "target/tmp/fixture"];
 
     let planned = fixture.discard(&["--dry-run"]);
-    assert_eq!(paths(&planned, "discarded"), SCRATCH_PARTS, "{planned}");
+    assert_eq!(
+        paths(&planned, "discarded"),
+        UNTAGGED_SCRATCH_PARTS,
+        "{planned}"
+    );
     assert_eq!(kinds(&planned), SCRATCH_KINDS);
     assert_eq!(paths(&planned, "retained_ignored"), retained);
 
     let applied = fixture.discard(&[]);
-    assert_eq!(paths(&applied, "discarded"), SCRATCH_PARTS, "{applied}");
+    assert_eq!(
+        paths(&applied, "discarded"),
+        UNTAGGED_SCRATCH_PARTS,
+        "{applied}"
+    );
     assert_eq!(kinds(&applied), SCRATCH_KINDS);
     assert_eq!(paths(&applied, "retained_ignored"), retained);
     assert!(!fixture.tree.join("target/debug").exists());
@@ -654,72 +733,85 @@ fn beside_a_record_an_untagged_target_discards_its_profile_and_scratch_but_not_a
     );
 }
 
-#[test]
-fn an_untagged_cargo_layout_under_another_name_is_retained() {
-    let fixture = Fixture::tracking(&[MANIFEST]);
-    fixture.untagged_target("build");
-
-    let applied = fixture.discard(&[]);
-    assert!(paths(&applied, "discarded").is_empty(), "{applied}");
-    assert_eq!(paths(&applied, "retained_ignored"), ["build"]);
-    fixture.assert_untagged_target_intact("build");
+/// What an unrecognised directory holding [`Fixture::untagged_target`]'s layout at `relative`
+/// discards: every part but the fixture repository, none of it named as Cargo's.
+fn unrecognised_parts(relative: &str) -> Vec<(String, String)> {
+    [".rustc_info.json", "debug", "tmp/case", "tmp/output.log"]
+        .iter()
+        .map(|part| (format!("{relative}/{part}"), "ignored-output".to_owned()))
+        .collect()
 }
 
 #[test]
-fn an_untagged_target_beside_no_tracked_manifest_is_retained() {
+fn an_untagged_cargo_layout_under_another_name_is_not_cargo_cache() {
+    let fixture = Fixture::tracking(&[MANIFEST]);
+    let head = fixture.untagged_target("build");
+
+    let applied = fixture.discard(&[]);
+    assert_eq!(
+        discarded(&applied),
+        unrecognised_parts("build"),
+        "{applied}"
+    );
+    assert_eq!(paths(&applied, "retained_ignored"), ["build/tmp/fixture"]);
+    fixture.assert_only_the_fixture_survives("build", &head);
+}
+
+#[test]
+fn an_untagged_target_beside_no_tracked_manifest_is_not_cargo_cache() {
     // A manifest tracked elsewhere, and one beside the target that Git does not track.
     let fixture = Fixture::tracking(&[("tools/Cargo.toml", MANIFEST.1)]);
     write(&fixture.tree.join("Cargo.toml"), MANIFEST.1);
-    fixture.untagged_target("target");
+    let head = fixture.untagged_target("target");
 
     let applied = fixture.discard(&[]);
-    assert!(paths(&applied, "discarded").is_empty(), "{applied}");
-    assert_eq!(paths(&applied, "retained_ignored"), ["target"]);
-    fixture.assert_untagged_target_intact("target");
+    assert_eq!(
+        discarded(&applied),
+        unrecognised_parts("target"),
+        "{applied}"
+    );
+    assert_eq!(paths(&applied, "retained_ignored"), ["target/tmp/fixture"]);
+    fixture.assert_only_the_fixture_survives("target", &head);
+    assert!(fixture.tree.join("Cargo.toml").is_file());
 }
 
 #[test]
-fn an_untagged_target_whose_profile_lacks_deps_is_retained() {
+fn an_untagged_target_whose_profile_lacks_deps_is_not_cargo_cache() {
     let fixture = Fixture::tracking(&[MANIFEST]);
     write(
         &fixture.tree.join("target/debug/.fingerprint/one/dep-lib"),
         "fingerprint",
     );
-    fixture.test_scratch("target/tmp");
+    let head = fixture.test_scratch("target/tmp");
     write(&fixture.tree.join("target/.rustc_info.json"), "{}");
 
     let applied = fixture.discard(&[]);
-    assert!(paths(&applied, "discarded").is_empty(), "{applied}");
-    assert_eq!(paths(&applied, "retained_ignored"), ["target"]);
-    assert!(
-        fixture
-            .tree
-            .join("target/debug/.fingerprint/one/dep-lib")
-            .exists()
+    assert_eq!(
+        discarded(&applied),
+        unrecognised_parts("target"),
+        "{applied}"
     );
-    assert!(fixture.tree.join("target/tmp/fixture/.git/HEAD").exists());
-    assert!(fixture.tree.join("target/.rustc_info.json").exists());
+    assert_eq!(paths(&applied, "retained_ignored"), ["target/tmp/fixture"]);
+    fixture.assert_only_the_fixture_survives("target", &head);
 }
 
 #[test]
-fn a_symlinked_untagged_target_is_retained() {
+fn a_symlinked_untagged_target_is_unlinked_and_never_followed() {
     let fixture = Fixture::tracking(&[MANIFEST]);
-    fixture.untagged_target("build");
+    let head = fixture.untagged_target("build");
     std::os::unix::fs::symlink("build", fixture.tree.join("target")).unwrap();
 
     let applied = fixture.discard(&[]);
-    assert!(paths(&applied, "discarded").is_empty(), "{applied}");
-    assert_eq!(paths(&applied, "retained_ignored"), ["build", "target"]);
-    assert!(
-        std::fs::symlink_metadata(fixture.tree.join("target"))
-            .unwrap()
-            .is_symlink()
-    );
-    fixture.assert_untagged_target_intact("build");
+    let mut expected = unrecognised_parts("build");
+    expected.push(("target".to_owned(), "ignored-output".to_owned()));
+    assert_eq!(discarded(&applied), expected, "{applied}");
+    assert_eq!(paths(&applied, "retained_ignored"), ["build/tmp/fixture"]);
+    assert!(std::fs::symlink_metadata(fixture.tree.join("target")).is_err());
+    fixture.assert_only_the_fixture_survives("build", &head);
 }
 
 #[test]
-fn an_untagged_target_whose_profile_or_markers_are_symlinks_is_retained() {
+fn an_untagged_target_whose_profile_or_markers_are_symlinks_is_not_followed() {
     let fixture = Fixture::tracking(&[MANIFEST]);
     let outside = fixture.root.path().join("outside");
     write(
@@ -744,11 +836,21 @@ fn an_untagged_target_whose_profile_or_markers_are_symlinks_is_retained() {
         "fingerprint",
     );
     std::os::unix::fs::symlink(outside.join("deps"), target.join("bench/deps")).unwrap();
-    fixture.test_scratch("target/tmp");
+    let head = fixture.test_scratch("target/tmp");
 
     let applied = fixture.discard(&[]);
-    assert!(paths(&applied, "discarded").is_empty(), "{applied}");
-    assert_eq!(paths(&applied, "retained_ignored"), ["target"]);
+    assert_eq!(
+        discarded(&applied),
+        pairs(&[
+            ("target/bench", "ignored-output"),
+            ("target/debug", "ignored-output"),
+            ("target/release", "ignored-output"),
+            ("target/tmp/case", "ignored-output"),
+            ("target/tmp/output.log", "ignored-output"),
+        ]),
+        "{applied}"
+    );
+    assert_eq!(paths(&applied, "retained_ignored"), ["target/tmp/fixture"]);
     for file in [
         "profile/.fingerprint/one/dep-lib",
         "profile/deps/libone.rlib",
@@ -757,9 +859,7 @@ fn an_untagged_target_whose_profile_or_markers_are_symlinks_is_retained() {
     ] {
         assert!(outside.join(file).exists(), "outside/{file} was deleted");
     }
-    assert!(target.join("bench/.fingerprint/one/dep-lib").exists());
-    assert!(target.join("release/deps/libone.rlib").exists());
-    assert!(target.join("tmp/fixture/.git/HEAD").exists());
+    assert!(fixture.holds_commit("target/tmp/fixture", &head));
 }
 
 #[test]
@@ -780,14 +880,22 @@ fn a_profile_git_reports_itself_is_discarded_below_an_untagged_target() {
 }
 
 #[test]
-fn a_profile_git_reports_itself_is_retained_beside_no_tracked_manifest() {
+fn a_profile_git_reports_itself_is_ignored_output_beside_no_tracked_manifest() {
     let fixture = Fixture::tracking(&[("target/README.md", "kept\n")]);
     fixture.profile("target/debug");
 
     let applied = fixture.discard(&[]);
-    assert!(paths(&applied, "discarded").is_empty(), "{applied}");
-    assert_eq!(paths(&applied, "retained_ignored"), ["target/debug"]);
-    assert!(fixture.tree.join("target/debug/deps/libone.rlib").exists());
+    assert_eq!(
+        discarded(&applied),
+        pairs(&[("target/debug", "ignored-output")]),
+        "{applied}"
+    );
+    assert!(paths(&applied, "retained_ignored").is_empty(), "{applied}");
+    assert!(!fixture.tree.join("target/debug").exists());
+    assert_eq!(
+        std::fs::read_to_string(fixture.tree.join("target/README.md")).unwrap(),
+        "kept\n"
+    );
 }
 
 #[test]
@@ -809,25 +917,25 @@ fn dependencies_and_environments_are_cache_only_beside_tracked_sources() {
 
     let applied = fixture.discard(&[]);
     assert_eq!(
-        paths(&applied, "discarded"),
-        [
-            ".pytest_cache",
-            "tools/.venv",
-            "web/node_modules",
-            "web/packages/ui/node_modules"
-        ]
+        discarded(&applied),
+        pairs(&[
+            (".pytest_cache", "tool-cache"),
+            (".venv", "ignored-output"),
+            ("loose/node_modules", "ignored-output"),
+            ("tools/.venv", "python-virtualenv"),
+            ("web/node_modules", "node-modules"),
+            ("web/packages/ui/node_modules", "node-modules"),
+        ]),
+        "{applied}"
     );
-    assert_eq!(
-        paths(&applied, "retained_ignored"),
-        [".venv", "loose/node_modules"]
-    );
-    assert!(fixture.tree.join("loose/node_modules/c/index.js").exists());
-    assert!(fixture.tree.join(".venv/pyvenv.cfg").exists());
+    assert!(paths(&applied, "retained_ignored").is_empty(), "{applied}");
+    assert!(!fixture.tree.join("loose/node_modules").exists());
+    assert!(!fixture.tree.join(".venv").exists());
     assert!(!fixture.tree.join("web/node_modules").exists());
 }
 
 #[test]
-fn a_profile_reached_through_a_symlink_is_neither_followed_nor_deleted() {
+fn a_profile_reached_through_a_symlink_is_unlinked_and_never_followed() {
     let fixture = Fixture::new();
     let outside = fixture.root.path().join("outside");
     write(&outside.join(".fingerprint/one/dep-lib"), "fingerprint");
@@ -836,14 +944,18 @@ fn a_profile_reached_through_a_symlink_is_neither_followed_nor_deleted() {
     std::os::unix::fs::symlink(&outside, fixture.tree.join("target/release")).unwrap();
 
     let applied = fixture.discard(&[]);
-    assert_eq!(paths(&applied, "discarded"), ["target/debug"]);
-    assert_eq!(paths(&applied, "retained_ignored"), ["target/release"]);
-    assert!(outside.join(".fingerprint/one/dep-lib").exists());
-    assert!(
-        std::fs::symlink_metadata(fixture.tree.join("target/release"))
-            .unwrap()
-            .is_symlink()
+    assert_eq!(
+        discarded(&applied),
+        pairs(&[
+            ("target/CACHEDIR.TAG", "ignored-output"),
+            ("target/debug", "cargo-profile"),
+            ("target/release", "ignored-output"),
+        ]),
+        "{applied}"
     );
+    assert!(paths(&applied, "retained_ignored").is_empty(), "{applied}");
+    assert!(outside.join(".fingerprint/one/dep-lib").exists());
+    assert!(std::fs::symlink_metadata(fixture.tree.join("target/release")).is_err());
 }
 
 #[test]

@@ -270,11 +270,18 @@ fn adversary_archive_images_a_nested_repository_inside_flutter_output() {
 
 /// A cargo target named `build` (Cargo-signed, holding a profile) beside a `pubspec.yaml`.
 /// Cargo's rule leaves out only its layout: `build/notes.md` is no layout, `discard-cache` keeps
-/// it, and 0.16.0's `archive` kept it in `dirty.patch`. The story says cargo behaviour is
-/// unchanged and that one classifier decides for both commands.
+/// it (here through the keep file, since an unkept ignored file is disposable), and 0.16.0's
+/// `archive` kept it in `dirty.patch`. The story says cargo behaviour is unchanged and that one
+/// classifier decides for both commands.
 #[test]
 fn adversary_archive_keeps_what_discard_cache_keeps_in_a_cargo_target_named_build() {
-    let fixture = Fixture::new(true, &[("Cargo.toml", "[package]\nname = \"one\"\n")]);
+    let fixture = Fixture::new(
+        true,
+        &[
+            ("Cargo.toml", "[package]\nname = \"one\"\n"),
+            (".worktreekeep", "/build/notes.md\n"),
+        ],
+    );
     let tree = fixture.tree("cargo");
     write(&tree.join("build/CACHEDIR.TAG"), TAG);
     write(&tree.join("build/debug/.fingerprint/one-1/lib-one"), "f\n");
@@ -354,18 +361,23 @@ fn adversary_an_index_only_file_below_build_stays_archived_through_removal() {
 }
 
 /// HEAD tracks a file below `build/` that the index no longer does (`git rm --cached`): something
-/// is still tracked there, so `discard-cache` keeps the directory.
+/// is still tracked there, so the directory is no Flutter output. Ignored and unkept, it is
+/// discarded as `ignored-output`, and HEAD still holds the tracked file.
 #[test]
-fn adversary_discard_cache_keeps_a_build_directory_only_head_tracks_below() {
+fn adversary_discard_cache_never_names_a_build_directory_head_tracks_below_flutter_output() {
     let fixture = Fixture::new(true, &[("build/build.yaml", "targets: {}\n")]);
     let tree = fixture.tree("head");
     git(&tree, &["rm", "--cached", "--quiet", "build/build.yaml"]);
     write(&tree.join("build/out.bin"), [5u8; 9]);
 
     let cache = fixture.discard(&tree, &[]);
-    assert_eq!(paths(&cache, "discarded"), Vec::<String>::new(), "{cache}");
-    assert!(tree.join("build/build.yaml").is_file());
-    assert!(tree.join("build/out.bin").is_file());
+    assert_eq!(paths(&cache, "discarded"), ["build"], "{cache}");
+    assert_eq!(cache["discarded"][0]["kind"], "ignored-output", "{cache}");
+    assert!(!tree.join("build").exists());
+    assert_eq!(
+        git(&tree, &["show", "HEAD:build/build.yaml"]),
+        "targets: {}"
+    );
 }
 
 /// A `pubspec.yaml` that is a symbolic link is no regular file: neither `archive` nor
@@ -379,7 +391,8 @@ fn adversary_a_symlinked_pubspec_recognises_nothing() {
     write(&tree.join("build/out.bin"), [4u8; 9]);
 
     let cache = fixture.discard(&tree, &["--dry-run"]);
-    assert_eq!(paths(&cache, "discarded"), Vec::<String>::new(), "{cache}");
+    assert_eq!(paths(&cache, "discarded"), ["build"], "{cache}");
+    assert_eq!(cache["discarded"][0]["kind"], "ignored-output", "{cache}");
     let archive = fixture.archive("linked");
     assert!(
         archive["manifest"].get("build_output").is_none(),
