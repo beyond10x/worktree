@@ -11,7 +11,7 @@ members = [
 [workspace.package]
 version = "0.18.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.89"
 license = "Apache-2.0"
 repository = "https://github.com/beyond10x/worktree"
 authors = ["Beyond10x contributors"]
@@ -24,14 +24,14 @@ b10x-worktree = { path = "crates/worktree" }
 b10x-worktree-git = { path = "crates/worktree-git" }
 b10x-worktree-state = { path = "crates/worktree-state" }
 clap = { version = "4", features = ["derive"] }
-rusqlite = { version = "0.37", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sha2 = "0.10"
+sha2 = "0.11"
 tar = { version = "0.4", default-features = false }
 tempfile = "3"
 thiserror = "2"
-toml = "0.9"
+toml = "1.1"
 uuid = { version = "1", features = ["v4"] }
 
 [workspace.lints.rust]
