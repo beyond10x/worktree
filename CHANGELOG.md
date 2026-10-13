@@ -45,6 +45,27 @@
   left-out file only while it is not kept and the keep file's bytes are those it was split with.
 - `ignored-output` is a new `kind` value; the CLI JSON protocol stays 4 and no field changes.
   `archive` never modifies the tree; `sweep` never removes a tree.
+- `prune-archives --strip-build-output` also strips ignored output from existing archives: a
+  section that purely adds an untracked file the keep file does not keep, whose path Git's
+  exclude engine ignores under both HEAD's `.gitignore` files (read from Git) and the tree's as
+  archived (HEAD's with the patch's `.gitignore` additions, modifications and deletions applied).
+  A path the tree's own `.gitignore` change un-ignored stays; where those changes cannot be
+  applied, nothing at or below the touched file's directory is stripped. A non-layout file below
+  an ignored `target/`, `node_modules/` or `build/` is stripped now; 0.17.1 kept it.
+- Neither `info/exclude` nor any `core.excludesFile` is read: either may have changed since the
+  archive was written, so a path only they ignore stays. Each rule set is asked in one
+  `git check-ignore --no-index --stdin -z` over a scratch work tree in the system's temporary
+  directory, removed on every path out; a dry-run writes nothing below the archive root.
+- The strip never strips a path the keep file keeps, layout or ignored output. The keep file is
+  read from HEAD's tree, or from the patch when it purely adds `.worktreekeep` (that section
+  stays). A patch that changes a tracked keep file, or a keep file in HEAD or the patch that is
+  not a regular file (a symbolic link, a gitlink) or holds a NUL byte, keeps every path.
+  Repository content (a `.git` component, or a Git directory the patch shows) stays whatever the
+  rules say.
+- Stripped ignored output is recorded as a `build_output` target of origin `strip`, per outermost
+  directory both rule sets ignore that HEAD does not hold and that holds no path whose section
+  stays, or per file. The archive format stays `worktree.archive/3` and the CLI JSON protocol
+  stays 4.
 
 ## 0.17.1 — 2026-10-12
 
