@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.18.0 — 2026-10-13
 
 - `discard-cache` (and `finish --discard-cache`, `sweep`) treats every ignored entry Git reports
   (`status --ignored=matching`, file or directory) as disposable, unless the repository's keep
