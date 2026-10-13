@@ -60,14 +60,19 @@ independent policy: every decision must come from the public façade.
   directory observed on disk (`HEAD` a regular file, `objects/` and `refs/` real directories, none
   reached through a symbolic link; the one predicate `discard-cache` uses), stays in `dirty.patch`
   and the fingerprint; one I/O-free rule in the domain decides it for `archive`, verification,
-  removal and the strip. Such an archive is `worktree.archive/3` and records per directory the
+  removal and the strip. A path the tree's keep file (`.worktreekeep`, read from disk) keeps is
+  never build layout either, wherever it lies: it stays in `dirty.patch` and the fingerprint. A
+  keep file that is a symbolic link, a directory or unreadable keeps every path there, so
+  `archive` leaves nothing out; it does not refuse. Such an archive is `worktree.archive/3` and
+  records per directory the
   files and bytes left out; one that left nothing out is written exactly as format 1 or 2. Its
   fingerprint excludes that layout, and verification leaves layout out only below the directories
   the manifest records, so layout below a directory it did not record stays in the fingerprint and
   refuses as `archive-stale`. Removal through it deletes each left-out file only after
   re-observing it, immediately before deletion, as a file or symlink of build layout below the
-  same recorded directory, recognised now, and still neither with a `.git` component nor at or
-  below a Git directory; anything else refuses, and such a path is never deleted as layout.
+  same recorded directory, recognised now, still neither with a `.git` component nor at or below
+  a Git directory, not kept, and with the keep file's bytes those it was split with; anything
+  else refuses, and such a path is never deleted as layout.
 - `prune-archives --strip-build-output` never deletes an archive. A dry-run, the default, writes
   nothing. `--apply` takes exact `--id` values only, re-assesses each, and rewrites only an archive
   whose manifest is valid, whose directory holds only recorded files, whose tree path is absent and
@@ -124,15 +129,18 @@ independent policy: every decision must come from the public façade.
   keeps it. The keep file is `.worktreekeep` at the tree root, read from disk; its lines are Git
   exclude patterns matched by Git's own exclude engine (`ls-files --others --ignored
   --exclude-from`, argv only), so negation, directory-only patterns and anchoring mean what they
-  mean in `.gitignore`, and a path is kept when a pattern matches it or one of its ancestors.
-  Absent, it keeps nothing; a symbolic link, a directory or an unreadable file there refuses as
+  mean in `.gitignore`, and a path is kept when a pattern matches it or one of its ancestors; a
+  directory a pattern names is kept even when it holds no file (from the `--directory` listing,
+  less any parent Git lists only because everything in it matches). Absent, it keeps nothing; a symbolic link, a directory or an unreadable file there refuses as
   `keep-file-invalid` and deletes nothing; the keep file itself is never deleted. An entry is
   retained when it is kept, is a repository (an entry named `.git`, file, directory or symbolic
   link; a directory holding one directly; or a Git directory whatever its name, a bare repository
   or a `--separate-git-dir`: `HEAD` a regular file, `objects/` and `refs/` real directories, none
-  through a symbolic link), sits on another device than the tree root, or cannot be read. A
-  directory holding any of those at any depth, found by one walk that follows no symbolic link,
-  is never deleted whole: each of its direct entries is classified by the same rule. Everything
+  through a symbolic link), is a mount point (listed in `/proc/self/mountinfo` where that can be
+  read, so a bind mount from the same filesystem counts), sits on another device than the tree
+  root, or cannot be read (a directory whose names cannot be listed, a regular file this user
+  cannot open). A directory holding any of those at any depth, found by one walk that follows no
+  symbolic link, is never deleted whole: each of its direct entries is classified by the same rule. Everything
   else is discarded; a symbolic link is deleted itself and never followed, and no deletion leaves
   the tree. The structural rules name what they recognise: a Cargo profile holding
   `.fingerprint/` inside a validly tagged target, a whole target of nothing but Cargo's layout,
@@ -146,8 +154,8 @@ independent policy: every decision must come from the public façade.
   tagged when a tracked `Cargo.toml` sits beside it and a direct child other than `tmp/` holds
   both `.fingerprint/` and `deps/` as real directories. A target holding anything but Cargo's
   layout falls to its parts, each named by its own rule. The keep file (read again, scoped to the
-  entry) and the walk are repeated immediately before each deletion, and an entry that then is or
-  holds a kept path or a repository is retained. An ignored path that is not UTF-8 refuses the
+  entry), the mount table and the walk are repeated immediately before each deletion, and an
+  entry that then is or holds a kept path, a mount point or a repository is retained. An ignored path that is not UTF-8 refuses the
   discard as `cache-path-not-utf8` before anything is deleted. Records an agent must keep belong
   outside ignored directories or in the keep file. Keeping is not recovering: a tree whose kept
   state the archive cannot image (a nested `.git` with linked worktrees) or no walk can read

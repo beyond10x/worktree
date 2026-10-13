@@ -200,6 +200,11 @@ entities:
   # `objects/` and `refs/` as real directories, observed on disk without following a symlink),
   # stays in the archive, as worktree.cache.CacheKind keeps it in the tree. Removal re-observes
   # this too, so such a path is never deleted as build layout.
+  # A path the tree's keep file (worktree.cache.KeepFile, read from disk) keeps is never build
+  # layout either: it stays in `dirty.patch` and the fingerprint wherever it lies. A keep file
+  # that is a symbolic link, a directory or unreadable keeps every path, so nothing is left out;
+  # `archive` does not refuse for it. Removal deletes a left-out path only while the keep file's
+  # bytes are those it was split with and the path is not kept.
   # Removal through a format 3 archive re-observes each left-out path immediately before deleting
   # it: it must still be build layout below this same recognised T (or Flutter output directory)
   # and is then deleted as cache; anything else that differs from worktree_tree refuses as

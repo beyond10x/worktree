@@ -6,7 +6,7 @@ status: active
 title: Ignored entries are disposable unless the keep file keeps them
 relations:
 - informed_by: story:recognised-build-cache-is-discarded
-revision: 3
+revision: 4
 transitions:
 - {from: "draft", to: "proposed", at: "2026-10-13T02:15:30Z", actor: "human:timo", revision: 2}
 - {from: "proposed", to: "active", at: "2026-10-13T02:15:30Z", actor: "human:timo", revision: 3}
@@ -75,8 +75,12 @@ Specification: `.engineering/specs/worktree-inspection/domains/cache.yaml`
 - The same tree with `.worktreekeep` holding `target/backlog-input/`: the note is retained,
   every other entry of `target/` is discarded, and `finish --discard-cache` refuses
   `worktree-dirty` while `finish --discard-cache --archive` archives the note and finishes.
-- A `.worktreekeep` line `!target/backlog-input/keep.md` after `target/backlog-input/` keeps
-  every path below it except `keep.md`, as Git's negation does.
+- Negation follows Git's exclude engine. Corrected 2026-10-13: the first draft said
+  `!target/backlog-input/keep.md` after `target/backlog-input/` releases `keep.md`; Git cannot
+  re-include a path whose parent directory is excluded, so `keep.md` stays kept there (implementor
+  probe with git 2.55.0, test `a_negation_below_an_excluded_directory_keeps_what_git_keeps`).
+  With `target/backlog-input/*` followed by the negation, `keep.md` is discarded and the rest kept
+  (test `a_negated_keep_pattern_discards_the_one_path_it_names`).
 - An ignored directory holding a nested repository at depth 3 is not deleted whole; its other
   direct entries are discarded.
 - An ignored symbolic link to a directory outside the tree is deleted; the directory it points to

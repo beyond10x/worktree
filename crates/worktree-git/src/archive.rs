@@ -1182,6 +1182,9 @@ struct Recognised<'a> {
     indexed: BTreeSet<PathBuf>,
     /// The only directories that count, when given.
     only: Option<BTreeSet<Vec<u8>>>,
+    /// What the tree's keep file keeps: never build layout. An invalid keep file keeps
+    /// everything, so nothing is left out.
+    keep: cache::KeepSnapshot,
 }
 
 impl<'a> Recognised<'a> {
@@ -1213,12 +1216,14 @@ impl<'a> Recognised<'a> {
             tracked,
             indexed,
             only: only.cloned(),
+            keep: cache::KeepSnapshot::read(worktree)?,
         })
     }
 
     /// The outermost directory `path` is build layout below, observed on disk now, and whether
-    /// it is a Flutter app's output. A path with a `.git` component or at or below a Git
-    /// directory (`git_directory`, [`cache::git_directory`] on disk) is never build layout
+    /// it is a Flutter app's output. A path the keep file keeps ([`cache::KeepSnapshot`]; all of
+    /// them when it is invalid), one with a `.git` component, and one at or below a Git directory
+    /// (`git_directory`, [`cache::git_directory`] on disk) is never build layout
     /// ([`layout_directory`]). `facts`, `profile`, `flutter` and `git_directory` may memoise
     /// their observations.
     fn directory_of(
@@ -1229,7 +1234,7 @@ impl<'a> Recognised<'a> {
         mut flutter: impl FnMut(&[u8], &[u8]) -> Option<FlutterFacts>,
         git_directory: impl FnMut(&[u8]) -> bool,
     ) -> Option<(Vec<u8>, bool)> {
-        if self.tracked.contains(path) {
+        if self.tracked.contains(path) || self.keep.keeps(Path::new(OsStr::from_bytes(path))) {
             return None;
         }
         let cargo = layout_target(path, &self.targets, facts, profile)
@@ -1923,9 +1928,10 @@ impl<'a> LeftOut<'a> {
 
     /// Delete each layout file as cache, re-observed immediately before deletion: still a file or
     /// symlink that is build layout below the same recorded directory, recognised now, and
-    /// neither with a `.git` component nor at or below a Git directory on disk now
-    /// ([`Recognised::directory_of`]). Anything else refuses; such a path is never deleted as
-    /// layout.
+    /// neither kept, with a `.git` component nor at or below a Git directory on disk now
+    /// ([`Recognised::directory_of`]), with the keep file's bytes unchanged since the paths were
+    /// split ([`cache::KeepSnapshot::unchanged`]). Anything else refuses; such a path is never
+    /// deleted as layout.
     fn delete(
         &self,
         layout: LayoutPaths,
@@ -1943,6 +1949,7 @@ impl<'a> LeftOut<'a> {
                 .map_err(|error| io_refusal("worktree-state-unreadable", &path, &error))?
                 .file_type();
             if !(kind.is_file() || kind.is_symlink())
+                || !recognised.keep.unchanged(recognised.worktree)
                 || self.target_of(&relative).as_ref() != Some(&target)
             {
                 return Err(changed(&relative));

@@ -4,11 +4,14 @@ types:
   # Why an ignored entry is discarded (crates/worktree-domain/src/cache.rs, CacheKind). Git's own
   # exclude rules decide what is ignored: every ignored entry Git reports is disposable unless the
   # tree's keep file (worktree.cache.KeepFile) keeps it or it is or holds a repository. An ignored
-  # directory that holds a kept path or a repository at any depth is never deleted whole; it falls
-  # to its direct entries, each classified by the same rule. An ignored entry on another device
-  # than the tree root (a mount point) is retained whole. The structural variants below name the
-  # build cache an entry was also recognised as; IgnoredOutput is every other disposable entry,
-  # file or directory.
+  # directory that holds a kept path, a repository, a mount point, an entry on another device or
+  # one this user cannot read at any depth is never deleted whole; it falls to its direct
+  # entries, each classified by the same rule. An entry that is a mount point (listed in
+  # /proc/self/mountinfo where it can be read, a bind mount from the same filesystem included),
+  # on another device than the tree root, or that cannot be read (a directory whose names cannot
+  # be listed, a regular file this user cannot open) is retained whole. The structural variants
+  # below name the build cache an entry was also recognised as; IgnoredOutput is every other
+  # disposable entry, file or directory.
   # IgnoredOutput: an ignored file, symbolic link (deleted itself, never followed) or real
   # directory that no structural variant recognises, matches no keep pattern, holds no kept path
   # and is not and holds no repository.
@@ -19,21 +22,20 @@ types:
   # the directory, so a `target/` made before Cargo's first build has none. Such a directory
   # counts as tagged when it is named `target`, a tracked `Cargo.toml` sits beside it, and it
   # holds a direct child other than `tmp/` with both `.fingerprint/` and `deps/` as real
-  # directories; a CACHEDIR.TAG with a bad signature inside it is kept. The same three
+  # directories; a CACHEDIR.TAG with a bad signature inside it is not Cargo's metadata. The same three
   # kinds then apply; no new variant.
   # FlutterOutput: an ignored real directory `P/build/` or `P/.dart_tool/` that is a Flutter app's
   # output directory (worktree.archive.FlutterOutputKind) by the one build-output classifier
   # `archive` and `prune-archives --strip-build-output` use: `P/pubspec.yaml` is a regular file on
   # disk beside it, and neither HEAD's tree nor the index holds anything at or below the
-  # directory. A `build/` with no `pubspec.yaml` beside it is retained.
+  # directory. A `build/` with no `pubspec.yaml` beside it is IgnoredOutput.
   # A nested repository is never cache, whatever kind of directory holds it: it may hold commits
-  # and files no remote does. A recognised directory of any kind that holds a `.git` (file,
-  # directory or symbolic link) at any depth below it, found by a walk that follows no symbolic
-  # link (an entry it cannot read counts as one), is not deleted whole. A whole Cargo target
-  # holding one falls to its parts, each discarded under its own rule; Cargo's `tmp/` holding one
-  # discards each direct entry holding none; every other directory holding one is retained whole.
-  # The walk is repeated immediately before each deletion, and a directory that holds a `.git`
-  # then is retained whole. `archive` images each retained repository; nothing else changes.
+  # and files no remote does. An entry named `.git` (file, directory or symbolic link), a
+  # directory holding one directly, and a Git directory are retained whole; a directory holding
+  # one deeper, found by a walk that follows no symbolic link, falls to its parts as above,
+  # whatever its kind. The keep file (read again, scoped to the entry), mountinfo and the walk are
+  # repeated immediately before each deletion, and an entry that then is or holds a kept path, a
+  # mount point or a repository is retained. `archive` images each retained repository.
   - name: worktree.cache.CacheKind
     kind: enum
     variants: [CargoProfile, CargoTarget, CargoTargetTmp, FlutterOutput, NodeModules, PythonVirtualenv, ToolCache, IgnoredOutput]
@@ -46,8 +48,12 @@ entities:
   # `keep-file-invalid`; an absent file keeps nothing). Its lines are Git exclude patterns,
   # matched by Git's own exclude engine against paths relative to the tree root, so negation,
   # directory-only patterns and anchoring behave as in `.gitignore`. A path is kept when a
-  # pattern matches it or one of its ancestors. `discard-cache` retains every kept path, and an
-  # ignored directory holding one falls to its parts. `prune-archives --strip-build-output`
+  # pattern matches it or one of its ancestors; a directory a pattern names is kept even when it
+  # holds no file, and a parent Git lists only because everything in it matches is not.
+  # `discard-cache` retains every kept path, and an ignored directory holding one falls to its
+  # parts. `archive` reads it from disk too: a kept path is never build layout, and a keep file
+  # that is not a readable regular file keeps every path there, so nothing is left out, without
+  # a refusal. `prune-archives --strip-build-output`
   # reads the keep file from HEAD's tree, or from the patch when the patch purely adds it, and
   # never strips a kept path.
   - name: worktree.cache.KeepFile

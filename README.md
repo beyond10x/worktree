@@ -66,11 +66,14 @@ into an ignored directory such as `target/` are deleted unless `.worktreekeep` k
 
 A nested repository is never deleted either, because it may hold commits no remote does: an entry
 named `.git` (a file, a directory or a symbolic link), a directory holding one, or a bare or
-`--separate-git-dir` Git directory (`HEAD`, `objects/` and `refs/`) is kept whole, and so is an
-entry on another device or one that cannot be read. A directory holding a kept path or a
-repository at any depth is never deleted whole: it falls to its direct entries, each classified by
-the same rule. The walk that looks for them follows no symbolic link, and it and the keep file
-run again immediately before each deletion (`archive` images such a repository).
+`--separate-git-dir` Git directory (`HEAD`, `objects/` and `refs/`) is kept whole, and so is a
+mount point (read from `/proc/self/mountinfo` on Linux, so a bind mount from the same filesystem
+counts), an entry on another device, and one that cannot be read (a directory whose names cannot
+be listed, a file this user cannot open). A directory holding a kept path, a repository or any of
+these at any depth is never deleted whole: it falls to its direct entries, each classified by the
+same rule. A directory a keep pattern names is kept even when it holds no file. The walk that
+looks for them follows no symbolic link, and it, the mount table and the keep file run again
+immediately before each deletion (`archive` images such a repository).
 
 Each deleted entry is named by the structure that recognises it, never by a directory's name: a
 Cargo profile (it holds `.fingerprint/`) inside a target carrying a valid `CACHEDIR.TAG`, that
@@ -175,7 +178,9 @@ reaching it; the tracked file stays archived. That covers `deps/`, `build/`, `.f
 and `*.d`. Everything else below the target, such as `target/ess-conformance/report.json`, and
 every other ignored directory stays in the archive. The command prints `left out <files> file(s),
 <bytes> bytes of build output under <directory>`. An archive that left nothing out is written
-exactly as before, format 1 or 2.
+exactly as before, format 1 or 2. A path `.worktreekeep` keeps is never build layout, wherever it
+lies: it stays in `dirty.patch`. A keep file that is a symbolic link, a directory or unreadable
+keeps every path there, so nothing is left out.
 
 A Flutter app's output is left out too: a file neither HEAD nor the index tracks strictly below
 `<P>/build/` or `<P>/.dart_tool/` (the tree root included as `<P>`), whatever it holds, when

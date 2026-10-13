@@ -17,9 +17,11 @@ use std::path::PathBuf;
 
 /// The repository's keep file (`worktree.cache.KeepFile`), at the tree root: Git exclude
 /// patterns naming ignored paths `discard-cache` keeps. A path is kept when a pattern matches it
-/// or one of its ancestors, as Git's own exclude engine decides. Absent, nothing is kept; a
-/// symbolic link, a directory or an unreadable file there refuses the discard as
-/// `keep-file-invalid`. The keep file itself is never discarded.
+/// or one of its ancestors, as Git's own exclude engine decides; a directory a pattern names is
+/// kept even when it holds no file. Absent, nothing is kept; a symbolic link, a directory or an
+/// unreadable file there refuses the discard as `keep-file-invalid`. The keep file itself is
+/// never discarded. A kept path is never build layout: `archive` keeps it in `dirty.patch`, and
+/// an invalid keep file keeps every path there, so nothing is left out.
 pub const KEEP_FILE: &str = ".worktreekeep";
 
 /// The file that marks a cache directory, per the Cache Directory Tagging Specification.
@@ -129,9 +131,10 @@ pub fn is_cache_tag(contents: &[u8]) -> bool {
 ///
 /// Every ignored entry Git reports is disposable unless the keep file ([`KEEP_FILE`]) keeps it,
 /// it is a repository (an entry named `.git`, a directory holding one directly, or a Git
-/// directory), it sits on another device than the tree root, or it cannot be read. A directory
-/// holding any of those at any depth is never deleted whole: it falls to its direct entries,
-/// each classified by the same rule. The structural variants name the build cache an entry was
+/// directory), it is a mount point or sits on another device than the tree root, or it cannot be
+/// read (a directory whose names cannot be listed, a regular file that cannot be opened). A
+/// directory holding any of those at any depth is never deleted whole: it falls to its direct
+/// entries, each classified by the same rule. The structural variants name the build cache an entry was
 /// recognised as; [`CacheKind::IgnoredOutput`] is every other disposable entry.
 ///
 /// A Cargo target is tagged by a valid `CACHEDIR.TAG`. One without a valid tag counts as tagged
@@ -184,8 +187,8 @@ pub struct DiscardedCache {
 pub struct CacheClassification {
     /// Disposable entries; deleted when the discard was applied.
     pub discarded: Vec<DiscardedCache>,
-    /// Ignored entries the keep file keeps, repositories, and entries on another device or not
-    /// readable, relative to the tree root. Never deleted.
+    /// Ignored entries the keep file keeps, repositories, mount points, and entries on another
+    /// device or not readable, relative to the tree root. Never deleted.
     pub retained_ignored: Vec<PathBuf>,
     /// Allocated bytes of the retained ignored entries, without following symbolic links.
     #[serde(default)]
