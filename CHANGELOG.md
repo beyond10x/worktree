@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.18.1 — 2026-10-13
+
+- Every dependency moves to its newest release; behaviour is unchanged.
+- Cargo requirements: `rusqlite` 0.37 to 0.40 (lock 0.37.0 to 0.40.2), `sha2` 0.10 to 0.11
+  (0.10.9 to 0.11.1), `toml` 0.9 to 1.1 (0.9.12 to 1.1.8).
+- Cargo lock: `serde_json` 1.0.151 to 1.0.154, `thiserror` 2.0.20 to 2.0.21, `uuid` 1.26.1 to
+  1.28.0, and their transitive crates.
+- `rust-version` 1.85 to 1.89, which `uuid` 1.28 and `sha2` 0.11.1 need.
+- Workflows: `actions/checkout` v4 to v7 and `arduino/setup-task` v2 to v3 in the gate, now
+  pinned by commit; `dtolnay/rust-toolchain` at the current `stable` head; `upload-artifact`
+  v7.0.1 to v7.0.2; `download-artifact` v8.0.1 to v8.0.2; the shared source gate at its 0.1.18
+  release.
+
 ## 0.18.0 — 2026-10-13
 
 - `discard-cache` (and `finish --discard-cache`, `sweep`) treats every ignored entry Git reports
