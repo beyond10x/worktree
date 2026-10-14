@@ -1,0 +1,12 @@
+{
+  "at": "2026-10-14T06:38:23Z",
+  "actor": "human:timo",
+  "artifact": "story:upgrade-all-dependencies",
+  "kind": "story",
+  "revision": 3,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "https://github.com/beyond10x/worktree/actions/runs/38414484713"
+  }
+}
