@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.18.2 — 2026-10-14
+
+- `archive` (and `finish --archive`) works on Git before 2.42 again: it handed
+  `git bundle create --stdin` a `--not` line, which such a Git refuses with "options not supported
+  in --stdin mode". The advertised tips are now excluded as `^<tip>` lines, which every Git reads
+  the same way.
+- The README and `AGENTS.md` state the oldest Git supported: 2.31.
+
 ## 0.18.1 — 2026-10-13
 
 - Every dependency moves to its newest release; behaviour is unchanged.
