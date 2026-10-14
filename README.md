@@ -20,6 +20,9 @@ cargo install --git https://github.com/beyond10x/worktree --tag 0.7.0 b10x-workt
 
 [`b10x`](https://github.com/beyond10x/agentplugins) installs either way and keeps it current.
 
+It needs Git 2.31 or later on `PATH`: the oldest that has `rev-parse --path-format=absolute`,
+`log --diff-merges=off` and `bundle create --stdin`.
+
 ## Use
 
 ```bash

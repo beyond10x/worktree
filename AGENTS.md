@@ -20,6 +20,10 @@ independent policy: every decision must come from the public façade.
 ## Invariants
 
 - Never invoke a command through a shell. Git arguments are discrete argv values.
+- Git 2.31 is the oldest Git supported (README, Install). Every Git call works on it: revisions
+  fed through `--stdin` carry no option lines (`--not` included; Git before 2.42 refuses them),
+  so an exclusion there is `^<rev>`. `crates/worktree-cli/tests/old_git.rs` runs `archive`
+  through such a Git.
 - Never remove a worktree with `--force`.
 - Every removal requires an exact linked-worktree member whose HEAD remains stable across the final
   proof and intent observations, no tracked, untracked, or ignored state, no live lease or Git

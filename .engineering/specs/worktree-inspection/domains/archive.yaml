@@ -119,7 +119,10 @@ entities:
         type: String
       - name: head
         type: String
-      # Commits HEAD adds over every advertised remote ref; commits.bundle carries them.
+      # Commits HEAD adds over every advertised remote ref; commits.bundle carries them. The
+      # bundle is written on every Git the tool supports (2.31 and later): its revisions reach
+      # `git bundle create --stdin` as HEAD and one `^<tip>` line per advertised tip, never a
+      # `--not` line, which Git before 2.42 refuses in --stdin mode.
       - name: unique_commits
         type: Integer
       # Git tree id of the tree's on-disk content outside every imaged nested repository and,

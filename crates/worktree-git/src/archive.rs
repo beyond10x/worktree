@@ -1641,8 +1641,11 @@ fn write_bundle(
             .args(["update-ref", ARCHIVE_HEAD_REF, head]),
         None,
     )?;
-    let mut revisions = format!("{ARCHIVE_HEAD_REF}\n--not\n");
+    // Each tip is excluded as `^<tip>`: Git before 2.42 dies with "options not supported in
+    // --stdin mode" on a `--not` line, and `^` means the same on every Git.
+    let mut revisions = format!("{ARCHIVE_HEAD_REF}\n");
     for tip in tips.keys() {
+        revisions.push('^');
         revisions.push_str(tip);
         revisions.push('\n');
     }

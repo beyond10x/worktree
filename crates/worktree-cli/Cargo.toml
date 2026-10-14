@@ -28,3 +28,8 @@ uuid.workspace = true
 
 [lints]
 workspace = true
+
+[[test]]
+name = "old_git"
+path = "tests/old_git.rs"
+harness = false
