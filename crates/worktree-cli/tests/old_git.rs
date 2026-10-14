@@ -20,7 +20,7 @@ fn main() -> ExitCode {
     let mut args = std::env::args_os();
     let invoked = args.next().unwrap_or_default();
     if Path::new(&invoked).file_name() == Some("git".as_ref()) {
-        return old_git(args.collect());
+        return old_git(&args.collect::<Vec<_>>());
     }
     double_refuses_not_on_stdin();
     archive_bundles_on_old_git();
@@ -44,11 +44,11 @@ fn reads_revisions_from_stdin(args: &[OsString]) -> bool {
 }
 
 /// Git before 2.42: a stdin revision line starting with `-` other than `--` is fatal.
-fn old_git(args: Vec<OsString>) -> ExitCode {
+fn old_git(args: &[OsString]) -> ExitCode {
     let real = std::env::var_os(REAL_GIT).expect("the real git is named");
-    if !reads_revisions_from_stdin(&args) {
-        let status = Command::new(real).args(&args).status().unwrap();
-        return ExitCode::from(status.code().unwrap_or(1) as u8);
+    if !reads_revisions_from_stdin(args) {
+        let status = Command::new(real).args(args).status().unwrap();
+        return exit_code(status);
     }
     let mut input = Vec::new();
     std::io::stdin().read_to_end(&mut input).unwrap();
@@ -62,13 +62,13 @@ fn old_git(args: Vec<OsString>) -> ExitCode {
         }
     }
     let mut child = Command::new(real)
-        .args(&args)
+        .args(args)
         .stdin(Stdio::piped())
         .spawn()
         .unwrap();
     child.stdin.take().unwrap().write_all(&input).unwrap();
     let status = child.wait().unwrap();
-    ExitCode::from(status.code().unwrap_or(1) as u8)
+    exit_code(status)
 }
 
 fn real_git() -> PathBuf {
@@ -250,4 +250,9 @@ fn archive_bundles_on_old_git() {
             archive.join("commits.bundle").to_str().unwrap(),
         ],
     );
+}
+
+/// The real Git's exit status as this process's.
+fn exit_code(status: std::process::ExitStatus) -> ExitCode {
+    ExitCode::from(u8::try_from(status.code().unwrap_or(1)).unwrap_or(1))
 }
