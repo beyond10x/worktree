@@ -2,7 +2,7 @@
 format: aep.planning-md/3
 id: story:a-nested-keep-file-keeps-its-directory
 kind: story
-status: draft
+status: active
 title: A .worktreekeep in a subdirectory keeps paths under that directory
 summary: nested keep files, as git reads nested .gitignore
 tags:
@@ -18,7 +18,10 @@ scope:
   path: crates/worktree-domain/src/cache.rs
 - confidence: inferred
   path: crates/worktree-git/src/cache.rs
-revision: 4
+revision: 6
+transitions:
+- {from: "draft", to: "proposed", at: "2026-10-27T12:27:25Z", actor: "human:timo", revision: 5, decided_on: {"recorded":{"review_outcome":4}}}
+- {from: "proposed", to: "active", at: "2026-10-27T12:27:25Z", actor: "human:timo", revision: 6, decided_on: {"recorded":{"review_outcome":4}}}
 ---
 # Story: a-nested-keep-file-keeps-its-directory
 
