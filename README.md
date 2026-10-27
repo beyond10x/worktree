@@ -64,7 +64,12 @@ patterns, matched by Git's own exclude engine, so negation, directory-only patte
 mean what they mean in `.gitignore`, and a path is kept when a pattern matches it or one of its
 ancestors. Git cannot re-include a path below an excluded directory, so write `dir/*` rather than
 `dir/` when a `!` line should take effect. Without the file nothing is kept; a symbolic link, a
-directory or an unreadable file there refuses the discard as `keep-file-invalid`. Records written
+directory or an unreadable file there refuses the discard as `keep-file-invalid`. A `.worktreekeep`
+in a subdirectory keeps paths at and below that directory, its patterns matched relative to it as Git
+reads a nested `.gitignore`: a tool that keeps run state in an ignored directory of its own writes
+`<dir>/.worktreekeep` there (for example `cases/`) without editing the repository's root files. It
+keeps nothing outside its directory (`../x` and a link out match nothing), is never deleted itself,
+and an invalid one refuses like the root file. Records written
 into an ignored directory such as `target/` are deleted unless `.worktreekeep` keeps them.
 
 A nested repository is never deleted either, because it may hold commits no remote does: an entry
@@ -181,7 +186,7 @@ reaching it; the tracked file stays archived. That covers `deps/`, `build/`, `.f
 and `*.d`. Everything else below the target, such as `target/ess-conformance/report.json`, and
 every other ignored directory stays in the archive. The command prints `left out <files> file(s),
 <bytes> bytes of build output under <directory>`. An archive that left nothing out is written
-exactly as before, format 1 or 2. A path `.worktreekeep` keeps is never build layout, wherever it
+exactly as before, format 1 or 2. A path a `.worktreekeep` (the root's or a nested one's) keeps is never build layout, wherever it
 lies: it stays in `dirty.patch`. A keep file that is a symbolic link, a directory or unreadable
 keeps every path there, so nothing is left out.
 

@@ -1,11 +1,12 @@
 //! What a tree may discard: every ignored entry Git reports, unless the repository keeps it.
 //!
 //! Git's own exclude rules say which paths a repository calls disposable. An ignored entry is
-//! retained only when the tree's keep file ([`KEEP_FILE`]) keeps it, when it is or holds a
-//! repository, or when it sits on another device or cannot be read; a directory holding a kept
-//! path or a repository is never deleted whole and falls to its direct entries. Records an agent
-//! must keep therefore belong outside ignored directories or in the keep file: on 2026-10-06 a
-//! prune deleted review records that committed evidence cites under an ignored `target/`.
+//! retained only when a keep file of the tree ([`KEEP_FILE`], at the root or in a directory)
+//! keeps it, when it is or holds a repository, or when it sits on another device or cannot be
+//! read; a directory holding a kept path or a repository is never deleted whole and falls to its
+//! direct entries. Records an agent must keep therefore belong outside ignored directories or in
+//! the keep file: on 2026-10-06 a prune deleted review records that committed evidence cites
+//! under an ignored `target/`.
 //!
 //! A directory's name never makes it cache. The structural rules below name the build cache an
 //! entry was also recognised as ([`CacheKind`]); every other disposable entry is
@@ -15,13 +16,15 @@ use crate::{ArchiveEvidence, Refusal, WorktreeId, WorktreeRecord};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-/// The repository's keep file (`worktree.cache.KeepFile`), at the tree root: Git exclude
-/// patterns naming ignored paths `discard-cache` keeps. A path is kept when a pattern matches it
+/// The keep file (`worktree.cache.KeepFile`), at the tree root and in any directory below it: Git
+/// exclude patterns naming ignored paths `discard-cache` keeps. A nested keep file keeps paths at
+/// and below its own directory, its patterns matched relative to that directory as Git reads a
+/// nested `.gitignore`; it reaches nothing outside it. A path is kept when a pattern matches it
 /// or one of its ancestors, as Git's own exclude engine decides; a directory a pattern names is
 /// kept even when it holds no file. Absent, nothing is kept; a symbolic link, a directory or an
-/// unreadable file there refuses the discard as `keep-file-invalid`. The keep file itself is
-/// never discarded. A kept path is never build layout: `archive` keeps it in `dirty.patch`, and
-/// an invalid keep file keeps every path there, so nothing is left out.
+/// unreadable file at any of those places refuses the discard as `keep-file-invalid`. A keep file
+/// itself is never discarded. A kept path is never build layout: `archive` keeps it in
+/// `dirty.patch`, and an invalid keep file keeps every path, so nothing is left out.
 pub const KEEP_FILE: &str = ".worktreekeep";
 
 /// The file that marks a cache directory, per the Cache Directory Tagging Specification.

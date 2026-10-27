@@ -32,7 +32,7 @@
 //! The strip also removes ignored output: a pure addition whose path Git's exclude engine ignores
 //! under both HEAD's and the archived tree's `.gitignore` rules ([`ExcludeObservations`],
 //! observed by the Git adapter for the paths [`exclude_queries`] names). A path the keep file
-//! keeps is never stripped ([`keep_source`]).
+//! keeps, the root's or a nested one's, is never stripped ([`keep_sources`]).
 
 use crate::{
     ARCHIVE_PATCH_FILE, ArchiveContents, ArchiveEntryKind, ArchiveManifest, CACHEDIR_TAG_FILE,
@@ -424,7 +424,7 @@ pub struct ScannedPatch {
 /// tree's as archived (HEAD's `.gitignore` files with the patch's `.gitignore` additions,
 /// modifications and deletions applied). No `info/exclude` and no `core.excludesFile` is read:
 /// either may have changed since the archive was written. Kept paths come from the keep file
-/// ([`KEEP_FILE`], from the source [`keep_source`] names).
+/// ([`KEEP_FILE`] at the root and in any directory, each from the source [`keep_sources`] names).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ExcludeObservations {
     /// Queried paths both rule sets ignore, as a file or below an ignored directory.
@@ -464,7 +464,7 @@ pub struct ExcludeQueries {
     pub directories: Vec<Vec<u8>>,
 }
 
-/// Where the keep file ([`KEEP_FILE`]) a strip honours is read from.
+/// Where one keep file ([`KEEP_FILE`], the root's or a nested one's) a strip honours is read from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeepSource {
     /// Neither HEAD's tree nor the patch holds one: nothing is kept.
@@ -565,26 +565,52 @@ pub fn exclude_queries(patch: &ScannedPatch) -> ExcludeQueries {
     }
 }
 
-/// Where the strip reads the keep file from ([`KeepSource`]): the patch when it purely adds
-/// [`KEEP_FILE`] once, HEAD's tree when it holds it and no section names it, and nowhere when
-/// neither holds one. Anything else is [`KeepSource::Unreadable`].
-pub fn keep_source(patch: &ScannedPatch) -> KeepSource {
+/// Whether `path` names a keep file: its last component is [`KEEP_FILE`], at the root or in any
+/// directory.
+pub fn is_keep_file(path: &[u8]) -> bool {
+    path.rsplit(|byte| *byte == b'/').next() == Some(KEEP_FILE.as_bytes())
+}
+
+/// Every keep file the strip must read ([`is_keep_file`]): each path, the root's and every nested
+/// one, that HEAD's tree or the patch names, in path-byte order, with where it is read from
+/// ([`KeepSource`]): the patch when it purely adds that path once, HEAD's tree when it holds it
+/// and no section names it, and nowhere when neither holds one. Anything else is
+/// [`KeepSource::Unreadable`]. A keep file's patterns apply at and below its own directory.
+pub fn keep_sources(patch: &ScannedPatch) -> Vec<(Vec<u8>, KeepSource)> {
     let pure = pure_additions(&patch.sections);
-    let keep = KEEP_FILE.as_bytes();
-    let naming = patch
-        .sections
+    let paths = patch
+        .head_files
         .iter()
-        .enumerate()
-        .filter(|(_, section)| section.path.as_deref() == Some(keep))
-        .map(|(index, _)| index)
-        .collect::<Vec<_>>();
-    match naming.as_slice() {
-        [] if patch.head_files.contains(keep) => KeepSource::Head,
-        [] if patch.head_directories.contains(keep) => KeepSource::Unreadable,
-        [] => KeepSource::Absent,
-        [index] if pure[*index] => KeepSource::Patch(*index),
-        _ => KeepSource::Unreadable,
-    }
+        .chain(&patch.head_directories)
+        .map(Vec::as_slice)
+        .chain(
+            patch
+                .sections
+                .iter()
+                .filter_map(|section| section.path.as_deref()),
+        )
+        .filter(|path| is_keep_file(path))
+        .collect::<BTreeSet<_>>();
+    paths
+        .into_iter()
+        .map(|keep| {
+            let naming = patch
+                .sections
+                .iter()
+                .enumerate()
+                .filter(|(_, section)| section.path.as_deref() == Some(keep))
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>();
+            let source = match naming.as_slice() {
+                [] if patch.head_files.contains(keep) => KeepSource::Head,
+                [] if patch.head_directories.contains(keep) => KeepSource::Unreadable,
+                [] => KeepSource::Absent,
+                [index] if pure[*index] => KeepSource::Patch(*index),
+                _ => KeepSource::Unreadable,
+            };
+            (keep.to_vec(), source)
+        })
+        .collect()
 }
 
 impl ScannedPatch {
@@ -939,7 +965,7 @@ enum Stripped<'a> {
 ///
 /// Only a pure addition is stripped: a `new file mode` section whose path decoded, that no other
 /// section names, and that HEAD does not track ([`ScannedSection::tracked`]); and never one the
-/// keep file keeps ([`ExcludeObservations::kept`]; the root [`KEEP_FILE`] itself, and every
+/// keep file keeps ([`ExcludeObservations::kept`]; every [`KEEP_FILE`] itself, and every
 /// path when the keep file is unreadable), and none at or below a directory whose rules are
 /// unknown ([`ExcludeObservations::unknown_rules`]). It is build layout when its path lies below a
 /// directory the patch's own pure additions recognise as a cargo target, by a Cargo-signed
@@ -971,7 +997,7 @@ pub fn plan_patch_strip(patch: &ScannedPatch) -> PatchStripPlan {
     let kept = |file: &[u8]| {
         exclusion.keep_unreadable
             || exclusion.rules_unknown(file)
-            || file == KEEP_FILE.as_bytes()
+            || is_keep_file(file)
             || !exclude_query_path(file)
             || exclusion.kept.contains(file)
     };

@@ -1,5 +1,14 @@
 # Changelog
 
+## [Unreleased]
+
+- A `.worktreekeep` in a subdirectory keeps paths at and below that directory, its patterns matched
+  relative to it as Git reads a nested `.gitignore`. `discard-cache`, `sweep` and `finish
+  --discard-cache --archive` keep what it names, `archive` images it, and `prune-archives
+  --strip-build-output` never strips it. It keeps nothing outside its own directory, is never
+  deleted itself, and one that is a symbolic link, a directory or unreadable refuses as
+  `keep-file-invalid` like the root file.
+
 ## 0.18.2 — 2026-10-14
 
 - `archive` (and `finish --archive`) works on Git before 2.42 again: it handed

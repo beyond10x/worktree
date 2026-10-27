@@ -25,7 +25,7 @@ use b10x_worktree_domain::{
     KEEP_FILE, NODE_LOCKFILES, PYTHON_MANIFESTS, PYTHON_VIRTUALENV_MARKER, Refusal,
     TAGGED_TOOL_CACHES, flutter_output_kind, is_cache_tag,
 };
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::io::Read as _;
 use std::ops::Bound;
@@ -71,33 +71,38 @@ enum Observed {
     Directory,
 }
 
-/// What the tree's keep file (`worktree.cache.KeepFile`) keeps, read from disk once.
+/// The bytes of each keep file, by its path relative to the tree root (`.worktreekeep` for the
+/// root's, `<dir>/.worktreekeep` for a nested one).
+type KeepFiles = BTreeMap<PathBuf, Vec<u8>>;
+
+/// What the tree's keep files (`worktree.cache.KeepFile`: the root's and every nested one) keep,
+/// read from disk once.
 ///
 /// `discard-cache` refuses a keep file that is not a readable regular file. `archive` never
 /// refuses for it: an invalid keep file keeps everything, so nothing is left out as build layout.
 pub(crate) struct KeepSnapshot {
-    /// The keep file's bytes when it is a readable regular file; `None` when it is absent.
-    contents: Option<Vec<u8>>,
-    /// Why the keep file is invalid, when it is.
+    /// The bytes of every keep file below the tree, all readable regular files.
+    contents: KeepFiles,
+    /// Why a keep file is invalid, when one is.
     invalid: Option<Refusal>,
-    /// What it keeps, as Git lists it ([`kept_paths`]).
+    /// What they keep, as Git lists it ([`kept_paths`]); the nested keep files themselves too.
     kept: BTreeSet<PathBuf>,
 }
 
 impl KeepSnapshot {
-    /// Read the keep file and what it keeps. Only a failing Git refuses.
+    /// Read the keep files and what they keep. Only a failing Git refuses.
     pub(crate) fn read(worktree: &Path) -> Result<Self, Refusal> {
-        Ok(match keep_contents(worktree) {
+        Ok(match keep_files(worktree, None) {
             Err(invalid) => Self {
-                contents: None,
+                contents: KeepFiles::new(),
                 invalid: Some(invalid),
                 kept: BTreeSet::new(),
             },
-            Ok(None) => Self::none(),
-            Ok(Some(contents)) => Self {
-                contents: Some(contents),
+            Ok(contents) if contents.is_empty() => Self::none(),
+            Ok(contents) => Self {
+                kept: kept_paths(worktree, None, &contents)?,
+                contents,
                 invalid: None,
-                kept: kept_paths(worktree, None)?,
             },
         })
     }
@@ -105,7 +110,7 @@ impl KeepSnapshot {
     /// No keep file.
     fn none() -> Self {
         Self {
-            contents: None,
+            contents: KeepFiles::new(),
             invalid: None,
             kept: BTreeSet::new(),
         }
@@ -132,12 +137,25 @@ impl KeepSnapshot {
                 .is_some_and(|path| path.starts_with(relative))
     }
 
-    /// Whether the keep file on disk still is what this snapshot read: absent, invalid, or the
-    /// same bytes. What a path's being kept depends on is the patterns and the path alone, so an
-    /// unchanged keep file keeps exactly what it kept.
-    pub(crate) fn unchanged(&self, worktree: &Path) -> bool {
-        match keep_contents(worktree) {
-            Ok(contents) => self.invalid.is_none() && contents == self.contents,
+    /// Whether the keep files that can keep `relative` (the root's and those of each directory
+    /// above it) on disk still are what this snapshot read: absent, invalid, or the same bytes.
+    /// What a path's being kept depends on the patterns of those files and the path alone, so
+    /// unchanged keep files keep exactly what they kept.
+    pub(crate) fn unchanged(&self, worktree: &Path, relative: &Path) -> bool {
+        match keep_files_above(worktree, relative) {
+            Ok(now) => {
+                let then: KeepFiles = self
+                    .contents
+                    .iter()
+                    .filter(|(file, _)| {
+                        file.parent().is_some_and(|directory| {
+                            directory != relative && relative.starts_with(directory)
+                        })
+                    })
+                    .map(|(file, bytes)| (file.clone(), bytes.clone()))
+                    .collect();
+                self.invalid.is_none() && now == then
+            }
             Err(_) => self.invalid.is_some(),
         }
     }
@@ -364,9 +382,13 @@ impl Guard {
         if self.kept(relative) {
             return Ok(true);
         }
-        match keep_contents(worktree) {
+        match keep_files(worktree, Some(relative)) {
             Err(_) => return Ok(true),
-            Ok(Some(_)) if !kept_paths(worktree, Some(relative))?.is_empty() => return Ok(true),
+            Ok(files) if !files.is_empty() => {
+                if !kept_paths(worktree, Some(relative), &files)?.is_empty() {
+                    return Ok(true);
+                }
+            }
             Ok(_) => {}
         }
         let path = worktree.join(relative);
@@ -407,10 +429,64 @@ fn device(_metadata: &std::fs::Metadata) -> Option<u64> {
     None
 }
 
-/// The keep file's bytes: `None` when it is absent; a symbolic link, a directory, any other
-/// non-regular file or one that cannot be read refuses as `keep-file-invalid`.
-fn keep_contents(worktree: &Path) -> Result<Option<Vec<u8>>, Refusal> {
-    let path = worktree.join(KEEP_FILE);
+/// The keep files that can keep a path in `scope`, or anywhere in the tree without one: the
+/// root's and every nested one, each a regular file Git reads as exclude patterns relative to its
+/// own directory. With a `scope`, those of the directories above it and of every directory at or
+/// below it. The walk follows no symbolic link and enters neither a `.git` entry nor a
+/// repository, whose files are not this tree's. A symbolic link, directory or unreadable file in
+/// a keep file's place refuses as `keep-file-invalid` naming it.
+fn keep_files(worktree: &Path, scope: Option<&Path>) -> Result<KeepFiles, Refusal> {
+    let start = scope.unwrap_or(Path::new(""));
+    let mut files = keep_files_above(worktree, start)?;
+    let mut pending = vec![start.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        let path = worktree.join(&directory);
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_dir() => {}
+            _ => continue,
+        }
+        if !directory.as_os_str().is_empty() && repository(&path) {
+            continue;
+        }
+        collect_keep_file(worktree, &directory, &mut files)?;
+        let Ok(entries) = std::fs::read_dir(&path) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if entry.file_name() != GIT_ENTRY && entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                pending.push(directory.join(entry.file_name()));
+            }
+        }
+    }
+    Ok(files)
+}
+
+/// The keep files of the proper ancestor directories of `relative`, the tree root included.
+fn keep_files_above(worktree: &Path, relative: &Path) -> Result<KeepFiles, Refusal> {
+    let mut files = KeepFiles::new();
+    for directory in relative.ancestors().skip(1) {
+        collect_keep_file(worktree, directory, &mut files)?;
+    }
+    Ok(files)
+}
+
+/// Add the keep file of `directory` (relative to the tree root) to `files`, when it has one.
+fn collect_keep_file(
+    worktree: &Path,
+    directory: &Path,
+    files: &mut KeepFiles,
+) -> Result<(), Refusal> {
+    let relative = directory.join(KEEP_FILE);
+    if let Some(bytes) = keep_file(&worktree.join(&relative))? {
+        files.insert(relative, bytes);
+    }
+    Ok(())
+}
+
+/// The keep file at `path` (`<directory>/.worktreekeep`): its bytes, or `None` when it is
+/// absent; a symbolic link, a directory, any other non-regular file or one that cannot be read
+/// refuses as `keep-file-invalid`.
+fn keep_file(path: &Path) -> Result<Option<Vec<u8>>, Refusal> {
     let invalid = |reason: &dyn std::fmt::Display| {
         Refusal::new(
             "keep-file-invalid",
@@ -421,13 +497,13 @@ fn keep_contents(worktree: &Path) -> Result<Option<Vec<u8>>, Refusal> {
             ),
         )
     };
-    match std::fs::symlink_metadata(&path) {
+    match std::fs::symlink_metadata(path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(invalid(&format_args!("cannot be read: {error}"))),
         Ok(metadata) if metadata.is_symlink() => Err(invalid(&"is a symbolic link")),
         Ok(metadata) if metadata.is_dir() => Err(invalid(&"is a directory")),
         Ok(metadata) if !metadata.is_file() => Err(invalid(&"is not a regular file")),
-        Ok(_) => std::fs::read(&path)
+        Ok(_) => std::fs::read(path)
             .map(Some)
             .map_err(|error| invalid(&format_args!("cannot be read: {error}"))),
     }
@@ -442,7 +518,11 @@ fn keep_contents(worktree: &Path) -> Result<Option<Vec<u8>>, Refusal> {
 /// matches, together with those entries. Git does not descend into a directory a pattern matches,
 /// so a listed directory with nothing listed below it is one a pattern names, and one with
 /// something listed below it is such a parent, which is not kept.
-fn kept_paths(worktree: &Path, scope: Option<&Path>) -> Result<BTreeSet<PathBuf>, Refusal> {
+fn kept_paths(
+    worktree: &Path,
+    scope: Option<&Path>,
+    files: &KeepFiles,
+) -> Result<BTreeSet<PathBuf>, Refusal> {
     let listing = |directories: bool| -> Result<BTreeSet<PathBuf>, Refusal> {
         let mut args: Vec<OsString> = vec!["ls-files".into(), "-z".into(), "--others".into()];
         args.push("--ignored".into());
@@ -450,7 +530,7 @@ fn kept_paths(worktree: &Path, scope: Option<&Path>) -> Result<BTreeSet<PathBuf>
             args.push("--directory".into());
         }
         // Relative to `-C <tree>`, so a tree path that is not UTF-8 needs no argument of its own.
-        args.push("--exclude-from=.worktreekeep".into());
+        args.push(format!("--exclude-per-directory={KEEP_FILE}").into());
         if let Some(scope) = scope {
             args.push("--".into());
             let mut literal = OsString::from(":(literal)");
@@ -474,6 +554,14 @@ fn kept_paths(worktree: &Path, scope: Option<&Path>) -> Result<BTreeSet<PathBuf>
             kept.insert(directory.clone());
         }
     }
+    // A nested keep file is never deleted either; the root one is protected by [`KeepSnapshot::keeps`].
+    kept.extend(
+        files
+            .keys()
+            .filter(|file| file.as_path() != Path::new(KEEP_FILE))
+            .filter(|file| scope.is_none_or(|scope| file.starts_with(scope)))
+            .cloned(),
+    );
     Ok(kept)
 }
 
@@ -1605,12 +1693,68 @@ mod tests {
         std::fs::create_dir_all(root.path().join("only/mounts/data")).unwrap();
         std::fs::write(root.path().join(KEEP_FILE), "only/mounts/\n").unwrap();
 
-        let kept = kept_paths(root.path(), None).unwrap();
+        let files = keep_files(root.path(), None).unwrap();
+        let kept = kept_paths(root.path(), None, &files).unwrap();
         assert_eq!(kept, BTreeSet::from([PathBuf::from("only/mounts")]));
         let keep = KeepSnapshot::read(root.path()).unwrap();
         assert!(keep.keeps(Path::new("only/mounts/data")));
         assert!(!keep.keeps(Path::new("only")));
         assert!(keep.holds_kept(Path::new("only")));
+    }
+
+    /// A nested keep file keeps below its own directory only, is itself kept, and a keep file
+    /// that appears or changes above a path after the snapshot makes it no longer `unchanged`.
+    #[test]
+    fn a_nested_keep_file_keeps_below_its_directory_only() {
+        let root = tempfile::tempdir().unwrap();
+        git(root.path(), &["init", "-q"]);
+        let tree = root.path();
+        for file in ["tool/cases/a", "tool/cache/b", "x", "other/x"] {
+            std::fs::create_dir_all(tree.join(file).parent().unwrap()).unwrap();
+            std::fs::write(tree.join(file), "data").unwrap();
+        }
+        std::fs::write(
+            tree.join("tool").join(KEEP_FILE),
+            "cases/\n../x\n/../other\n",
+        )
+        .unwrap();
+
+        let keep = KeepSnapshot::read(tree).unwrap();
+        assert!(keep.keeps(Path::new("tool/cases/a")));
+        assert!(keep.keeps(Path::new("tool/.worktreekeep")));
+        assert!(!keep.keeps(Path::new("tool/cache/b")));
+        assert!(!keep.keeps(Path::new("x")));
+        assert!(!keep.keeps(Path::new("other/x")));
+        assert!(keep.holds_kept(Path::new("tool")));
+
+        assert!(keep.unchanged(tree, Path::new("tool/cases/a")));
+        std::fs::write(tree.join("tool/cases").join(KEEP_FILE), "!a\n").unwrap();
+        assert!(!keep.unchanged(tree, Path::new("tool/cases/a")));
+        assert!(keep.unchanged(tree, Path::new("other/x")));
+        std::fs::remove_file(tree.join("tool/cases").join(KEEP_FILE)).unwrap();
+        std::fs::write(tree.join("tool").join(KEEP_FILE), "cache/\n").unwrap();
+        assert!(!keep.unchanged(tree, Path::new("tool/cases/a")));
+    }
+
+    /// A nested keep file that is a symbolic link, or a repository's own keep file, is not read
+    /// as a keep file of this tree: the link is invalid, the repository's is out of scope.
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_nested_keep_file_is_invalid_and_a_repositorys_own_is_not_read() {
+        let root = tempfile::tempdir().unwrap();
+        git(root.path(), &["init", "-q"]);
+        let tree = root.path();
+        std::fs::create_dir_all(tree.join("tool")).unwrap();
+        std::fs::write(tree.join("elsewhere"), "tool/\n").unwrap();
+        std::os::unix::fs::symlink("../elsewhere", tree.join("tool").join(KEEP_FILE)).unwrap();
+        let refusal = keep_files(tree, None).unwrap_err();
+        assert_eq!(refusal.code, "keep-file-invalid");
+
+        std::fs::remove_file(tree.join("tool").join(KEEP_FILE)).unwrap();
+        std::fs::create_dir_all(tree.join("fixture")).unwrap();
+        git(&tree.join("fixture"), &["init", "-q"]);
+        std::fs::write(tree.join("fixture").join(KEEP_FILE), "everything\n").unwrap();
+        assert!(keep_files(tree, None).unwrap().is_empty());
     }
 
     /// A deletion never leaves the tree: a planned path below a directory that became a symbolic

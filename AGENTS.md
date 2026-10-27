@@ -64,7 +64,7 @@ independent policy: every decision must come from the public façade.
   directory observed on disk (`HEAD` a regular file, `objects/` and `refs/` real directories, none
   reached through a symbolic link; the one predicate `discard-cache` uses), stays in `dirty.patch`
   and the fingerprint; one I/O-free rule in the domain decides it for `archive`, verification,
-  removal and the strip. A path the tree's keep file (`.worktreekeep`, read from disk) keeps is
+  removal and the strip. A path the tree's keep files (`.worktreekeep`, at the root or in a directory, read from disk) keep is
   never build layout either, wherever it lies: it stays in `dirty.patch` and the fingerprint. A
   keep file that is a symbolic link, a directory or unreadable keeps every path there, so
   `archive` leaves nothing out; it does not refuse. Such an archive is `worktree.archive/3` and
@@ -102,7 +102,7 @@ independent policy: every decision must come from the public façade.
   files, with `core.excludesFile` pointed at an empty file and no user or system configuration.
   No primary checkout's working files, no `info/exclude` and no `core.excludesFile` are read:
   either may have changed since the archive was written, and an unrecognised path stays. A path
-  the keep file keeps is never stripped, layout or ignored output: `.worktreekeep` read from HEAD's
+  a keep file keeps is never stripped, layout or ignored output: each `.worktreekeep`, the root's and nested ones, read from HEAD's
   tree, or from the patch when it purely adds it once (that section stays), matched by the same
   engine; a keep file the patch changes otherwise, or one that is not a regular file (mode 100644
   or 100755) holding text (no NUL in its first 8000 bytes), in HEAD or in the patch, keeps every
@@ -138,13 +138,13 @@ independent policy: every decision must come from the public façade.
 - The only command that deletes files a tree's owner wrote is `discard-cache` (and `finish
   --discard-cache`, and `sweep` through it), and it deletes only ignored entries Git reports
   (`status --ignored=matching`, file or directory): each is disposable unless the tree's keep file
-  keeps it. The keep file is `.worktreekeep` at the tree root, read from disk; its lines are Git
+  keeps it. The keep files are `.worktreekeep` at the tree root and in any directory below it (not in or below a repository), read from disk; a nested one keeps at and below its own directory and never outside it, its patterns matched relative to that directory as Git reads a nested `.gitignore`; its lines are Git
   exclude patterns matched by Git's own exclude engine (`ls-files --others --ignored
-  --exclude-from`, argv only), so negation, directory-only patterns and anchoring mean what they
+  --exclude-per-directory`, argv only), so negation, directory-only patterns and anchoring mean what they
   mean in `.gitignore`, and a path is kept when a pattern matches it or one of its ancestors; a
   directory a pattern names is kept even when it holds no file (from the `--directory` listing,
-  less any parent Git lists only because everything in it matches). Absent, it keeps nothing; a symbolic link, a directory or an unreadable file there refuses as
-  `keep-file-invalid` and deletes nothing; the keep file itself is never deleted. An entry is
+  less any parent Git lists only because everything in it matches). Absent, it keeps nothing; a symbolic link, a directory or an unreadable file at any of those places refuses as
+  `keep-file-invalid` and deletes nothing; a keep file itself is never deleted. An entry is
   retained when it is kept, is a repository (an entry named `.git`, file, directory or symbolic
   link; a directory holding one directly; or a Git directory whatever its name, a bare repository
   or a `--separate-git-dir`: `HEAD` a regular file, `objects/` and `refs/` real directories, none

@@ -19,8 +19,8 @@ use b10x_worktree_domain::{
     ExcludeObservations, FlutterFacts, FlutterOutputKind, KEEP_FILE, KeepSource,
     NestedRepositoryImage, NewFileSize, PatchStripPlan, Refusal, ScannedPatch, ScannedSection,
     TargetFacts, WorktreeRecord, archive_image_file, diff_git_path, exclude_queries,
-    exclude_query_path, flutter_output, is_extended_header, keep_source, layout_directory,
-    layout_target, relative_path,
+    exclude_query_path, flutter_output, is_extended_header, is_keep_file, keep_sources,
+    layout_directory, layout_target, relative_path,
 };
 use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -1952,7 +1952,9 @@ impl<'a> LeftOut<'a> {
                 .map_err(|error| io_refusal("worktree-state-unreadable", &path, &error))?
                 .file_type();
             if !(kind.is_file() || kind.is_symlink())
-                || !recognised.keep.unchanged(recognised.worktree)
+                || !recognised
+                    .keep
+                    .unchanged(recognised.worktree, Path::new(OsStr::from_bytes(&relative)))
                 || self.target_of(&relative).as_ref() != Some(&target)
             {
                 return Err(changed(&relative));
@@ -2365,13 +2367,16 @@ fn keep_text(content: Vec<u8>) -> Option<Vec<u8>> {
 /// What the scan collects beside the sections for the exclude rules.
 #[derive(Debug, Default)]
 struct ScanNotes {
-    /// Per index of a section naming the root keep file, the text it adds (`None`: not a
+    /// Per index of a section naming a keep file, the text it adds (`None`: not a
     /// regular text file).
     keep_texts: BTreeMap<usize, Option<Vec<u8>>>,
     /// Indexes of the sections whose decoded path is a `.gitignore`.
     ignore_sections: Vec<usize>,
     /// A section whose path did not decode names a `.gitignore` in its header.
     undecodable_ignore: bool,
+    /// A section whose path did not decode names a keep file in its header: no keep file is
+    /// known, so every path counts as kept.
+    undecodable_keep: bool,
 }
 
 /// Stream an archive's `dirty.patch` into its `diff --git` sections, verifying the digest the
@@ -2418,7 +2423,17 @@ fn scan_sections(
                 }
                 _ => {}
             }
-            let keep = (decoded.as_deref() == Some(KEEP_FILE.as_bytes())).then(AddedText::default);
+            let keep = decoded
+                .as_deref()
+                .is_some_and(is_keep_file)
+                .then(AddedText::default);
+            if decoded.is_none()
+                && header
+                    .windows(KEEP_FILE.len())
+                    .any(|window| window == KEEP_FILE.as_bytes())
+            {
+                notes.undecodable_keep = true;
+            }
             sections.push((
                 ScannedSection {
                     path: decoded,
@@ -2500,8 +2515,9 @@ struct HeadTree {
     directories: PathSet,
     /// Path and blob of every `.gitignore` HEAD's tree holds as a regular file.
     ignore_files: Vec<(Vec<u8>, String)>,
-    /// The blob of the root keep file, when HEAD's tree holds it as a regular file.
-    keep_blob: Option<String>,
+    /// The blob of each keep file (the root's and nested ones) HEAD's tree holds as a regular
+    /// file, by path.
+    keep_blobs: BTreeMap<Vec<u8>, String>,
     /// The scratch objects HEAD was unbundled into, when the repository does not hold it.
     scratch: Option<Scratch>,
 }
@@ -2525,7 +2541,7 @@ impl HeadTree {
             files: BTreeSet::new(),
             directories: BTreeSet::new(),
             ignore_files: Vec::new(),
-            keep_blob: None,
+            keep_blobs: BTreeMap::new(),
             scratch,
         };
         for record in listing
@@ -2557,8 +2573,8 @@ impl HeadTree {
             if matches!(mode, b"100644" | b"100755") {
                 let object = String::from_utf8(object.to_vec()).map_err(|_| malformed())?;
                 ProcessGit::validate_object_id(&object)?;
-                if path == KEEP_FILE.as_bytes() {
-                    head.keep_blob = Some(object);
+                if is_keep_file(&path) {
+                    head.keep_blobs.insert(path.clone(), object);
                 } else if names_gitignore(&path) && exclude_query_path(&path) {
                     head.ignore_files.push((path.clone(), object));
                 }
@@ -2712,6 +2728,41 @@ fn ignore_directory(path: &[u8]) -> Vec<u8> {
         .map_or_else(Vec::new, |at| path[..at].to_vec())
 }
 
+/// The text of every keep file the strip reads ([`keep_sources`]), by path, the root's and each
+/// nested one's, as `(path, text)` pairs. `None` when one is not a regular text file, or a path names one the scan could
+/// not decode: no one file says what the tree kept, so every path counts as kept.
+fn keep_texts(
+    patch: &ScannedPatch,
+    head: &HeadTree,
+    notes: &ScanNotes,
+    repository: &Path,
+) -> Result<Option<IgnoreFiles>, Refusal> {
+    let mut keeps = IgnoreFiles::new();
+    let mut unreadable = notes.undecodable_keep;
+    for (path, source) in keep_sources(patch) {
+        let text = match source {
+            KeepSource::Absent => Some(Vec::new()),
+            KeepSource::Head => match head.keep_blobs.get(&path) {
+                Some(blob) => head
+                    .blobs(repository, &[blob.as_str()])?
+                    .pop()
+                    .and_then(keep_text),
+                None => None,
+            },
+            KeepSource::Patch(index) => notes.keep_texts.get(&index).cloned().flatten(),
+            KeepSource::Unreadable => None,
+        };
+        match text {
+            // A keep file below a path Git's exclude engine cannot be asked about affects only
+            // paths that are kept whatever it holds.
+            Some(text) if exclude_query_path(&path) => keeps.push((path, text)),
+            Some(_) => {}
+            None => unreadable = true,
+        }
+    }
+    Ok((!unreadable).then_some(keeps))
+}
+
 /// What Git's exclude engine says of the paths the domain asks about ([`exclude_queries`]),
 /// observed in scratch work trees in the system's temporary directory and never in a tree's or
 /// the primary checkout's working files. A path is ignored only when both rule sets ignore it:
@@ -2719,7 +2770,8 @@ fn ignore_directory(path: &[u8]) -> Vec<u8> {
 /// (HEAD's with the patch's `.gitignore` sections applied, [`tree_ignore_files`]); where the
 /// tree's rules cannot be established, nothing at or below the touched file's directory is
 /// stripped ([`ExcludeObservations::unknown_rules`]). The keep file comes from the source the
-/// domain names ([`keep_source`]); one that is not a regular text file keeps every path. No
+/// domain names ([`keep_sources`]), the root's and each nested one's, read as a `.gitignore` of
+/// its own directory; one that is not a regular text file keeps every path. No
 /// `info/exclude` and no `core.excludesFile` is read: either may have changed since the archive
 /// was written. The scratch is removed on every path out.
 fn observe_exclusion(
@@ -2735,19 +2787,7 @@ fn observe_exclusion(
         return Ok(observed);
     }
     let repository = manifest.repository_root.as_path();
-    let keep = match keep_source(patch) {
-        KeepSource::Absent => Some(Vec::new()),
-        KeepSource::Head => match &head.keep_blob {
-            Some(blob) => head
-                .blobs(repository, &[blob.as_str()])?
-                .pop()
-                .and_then(keep_text),
-            None => None,
-        },
-        KeepSource::Patch(index) => notes.keep_texts.get(&index).cloned().flatten(),
-        KeepSource::Unreadable => None,
-    };
-    let Some(keep) = keep else {
+    let Some(keeps) = keep_texts(patch, head, notes, repository)? else {
         // Every path counts as kept: nothing is stripped, so nothing more is asked.
         observed.keep_unreadable = true;
         return Ok(observed);
@@ -2816,16 +2856,27 @@ fn observe_exclusion(
             };
         }
     }
-    if !keep.is_empty() {
-        let tree = scratch_directory(scratch, "keep-tree")?;
+    let rules: IgnoreFiles = keeps
+        .into_iter()
+        .filter(|(_, text)| !text.is_empty())
+        .map(|(path, text)| {
+            let mut directory = ignore_directory(&path);
+            if !directory.is_empty() {
+                directory.push(b'/');
+            }
+            directory.extend_from_slice(GITIGNORE.as_bytes());
+            (directory, text)
+        })
+        .collect();
+    if !rules.is_empty() {
+        // Each keep file is read as a `.gitignore` of its own directory, so Git's exclude engine
+        // matches its patterns relative to that directory and nowhere else.
         let mut input = Vec::new();
         for path in &queries.paths {
             input.extend_from_slice(path);
             input.push(0);
         }
-        observed.kept = check_ignore(scratch, &tree, &keep, input)?
-            .into_iter()
-            .collect();
+        observed.kept = ignored_under(scratch, "keep-tree", &rules, input)?;
     }
     Ok(observed)
 }
