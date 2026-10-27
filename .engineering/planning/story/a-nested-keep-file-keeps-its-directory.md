@@ -11,10 +11,14 @@ scope:
 - confidence: inferred
   path: crates/worktree-cli/src/main.rs
 - confidence: inferred
+  path: crates/worktree-cli/tests/nested_keep.rs
+- confidence: inferred
+  path: crates/worktree-domain/src/build_output.rs
+- confidence: inferred
   path: crates/worktree-domain/src/cache.rs
 - confidence: inferred
   path: crates/worktree-git/src/cache.rs
-revision: 2
+revision: 4
 ---
 # Story: a-nested-keep-file-keeps-its-directory
 
@@ -23,7 +27,8 @@ revision: 2
 A `.worktreekeep` in a subdirectory keeps paths under that directory, its patterns matched relative to it, as git
 reads a nested `.gitignore`. A tool that keeps run state in an ignored directory of its own can mark that state as
 retained without editing the repository's root files. `discard-cache`, `sweep` and `finish --discard-cache --archive`
-keep the marked paths, and `archive` images them.
+keep the marked paths, `archive` images them, and `prune-archives --strip-build-output` never strips them from an
+archive. Every reader of the keep rule reads nested keep files the same way.
 
 ## Context
 
@@ -51,11 +56,17 @@ Each is a named test run by `task check`.
 5. `keep::a_nested_pattern_cannot_reach_outside_its_directory`: a pattern `../x` or `/x` in `tool/.worktreekeep` keeps
    nothing outside `tool/`.
 
+6. `keep::strip_build_output_keeps_nested_kept_paths`: an archive holding `tool/cases/a`, kept by
+   `tool/.worktreekeep`, under a directory the root `.gitignore` ignores, still holds it after
+   `prune-archives --strip-build-output`.
+
 ## Scope
 
 - `crates/worktree-git/src/cache.rs` (keep-pattern collection)
 - `crates/worktree-domain/src/cache.rs` (`KEEP_FILE`, report wording)
+- `crates/worktree-domain/src/build_output.rs` (the strip's keep rule, `:568`)
 - `crates/worktree-cli/src/main.rs` (guidance text)
+- `crates/worktree-cli/tests/nested_keep.rs` (new)
 
 ## Delivery
 
