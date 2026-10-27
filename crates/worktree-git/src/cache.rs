@@ -23,7 +23,7 @@ use b10x_worktree_domain::{
     CacheClassification, CacheKind, DiscardedCache, FlutterFacts, FlutterOutputKind,
     GIT_DIRECTORY_HEAD, GIT_DIRECTORY_OBJECTS, GIT_DIRECTORY_REFS, GIT_ENTRY, GitDirectoryFacts,
     KEEP_FILE, NODE_LOCKFILES, PYTHON_MANIFESTS, PYTHON_VIRTUALENV_MARKER, Refusal,
-    TAGGED_TOOL_CACHES, flutter_output_kind, is_cache_tag,
+    TAGGED_TOOL_CACHES, drop_keep_negations, flutter_output_kind, is_cache_tag,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
@@ -70,6 +70,9 @@ enum Observed {
     /// A real, readable directory that is not itself a repository.
     Directory,
 }
+
+/// The file Git reads ignore patterns from, in every directory.
+const GITIGNORE: &str = ".gitignore";
 
 /// The bytes of each keep file, by its path relative to the tree root (`.worktreekeep` for the
 /// root's, `<dir>/.worktreekeep` for a nested one).
@@ -509,8 +512,8 @@ fn keep_file(path: &Path) -> Result<Option<Vec<u8>>, Refusal> {
     }
 }
 
-/// What the keep file keeps, as Git's exclude engine lists it (`ls-files --others --ignored
-/// --exclude-from`): every untracked file a pattern matches, directly or through a matched
+/// What the keep files keep, as Git's exclude engine lists it (`ls-files --others --ignored`
+/// with [`exclude_arguments`]): every untracked file a pattern matches, directly or through a matched
 /// ancestor directory (and a nested repository Git does not descend into, as `<path>/`), and
 /// every directory a pattern matches itself, empty or not. `scope` limits the listing to one path.
 ///
@@ -530,7 +533,7 @@ fn kept_paths(
             args.push("--directory".into());
         }
         // Relative to `-C <tree>`, so a tree path that is not UTF-8 needs no argument of its own.
-        args.push(format!("--exclude-per-directory={KEEP_FILE}").into());
+        args.extend(exclude_arguments(files));
         if let Some(scope) = scope {
             args.push("--".into());
             let mut literal = OsString::from(":(literal)");
@@ -554,15 +557,104 @@ fn kept_paths(
             kept.insert(directory.clone());
         }
     }
-    // A nested keep file is never deleted either; the root one is protected by [`KeepSnapshot::keeps`].
-    kept.extend(
-        files
-            .keys()
-            .filter(|file| file.as_path() != Path::new(KEEP_FILE))
-            .filter(|file| scope.is_none_or(|scope| file.starts_with(scope)))
-            .cloned(),
-    );
+    // A nested keep file is never deleted either, nor is the `.gitignore` beside it: a tool that
+    // hides its own directory with one would show what the keep file keeps as untracked. The root
+    // keep file is protected by [`KeepSnapshot::keeps`].
+    for file in files
+        .keys()
+        .filter(|file| file.as_path() != Path::new(KEEP_FILE))
+    {
+        let ignore = file.with_file_name(GITIGNORE);
+        kept.extend(
+            [file.clone(), ignore]
+                .into_iter()
+                .filter(|path| scope.is_none_or(|scope| path.starts_with(scope)))
+                .filter(|path| path == file || worktree.join(path).symlink_metadata().is_ok()),
+        );
+    }
     Ok(kept)
+}
+
+/// The arguments that make Git's exclude engine read the keep files: the root's through
+/// `--exclude-from`, which Git ranks lowest, and each nested one's lines, shallow to deep, as
+/// `--exclude` patterns, which Git ranks highest, the last matching one deciding. A
+/// nested file's lines are rewritten to match relative to its own directory as a `.gitignore`
+/// there would ([`nested_patterns`]), so a deeper file keeps a path a shallower one negates, and
+/// its own negation lines, which would take a keep away, are left out.
+fn exclude_arguments(files: &KeepFiles) -> Vec<OsString> {
+    let mut args = Vec::new();
+    if files.contains_key(Path::new(KEEP_FILE)) {
+        args.push(OsString::from(format!("--exclude-from={KEEP_FILE}")));
+    }
+    let mut nested: Vec<(&PathBuf, &Vec<u8>)> = files
+        .iter()
+        .filter(|(file, _)| file.as_path() != Path::new(KEEP_FILE))
+        .collect();
+    nested.sort_by_key(|(file, _)| (file.components().count(), (*file).clone()));
+    for (file, text) in nested {
+        let directory = file.parent().unwrap_or(Path::new(""));
+        for pattern in nested_patterns(directory, text) {
+            let mut argument = b"--exclude=".to_vec();
+            argument.extend(pattern);
+            args.push(os_string(argument));
+        }
+    }
+    args
+}
+
+#[cfg(unix)]
+fn os_string(bytes: Vec<u8>) -> OsString {
+    use std::os::unix::ffi::OsStringExt as _;
+    OsString::from_vec(bytes)
+}
+
+#[cfg(not(unix))]
+fn os_string(bytes: Vec<u8>) -> OsString {
+    String::from_utf8_lossy(&bytes).into_owned().into()
+}
+
+/// The lines of the nested keep file `text` of `directory`, each as a pattern anchored at the
+/// tree root that matches what the line matches in a `.gitignore` of `directory`: a line with no
+/// slash but a trailing one matches at any depth below, any other is anchored to the directory.
+/// Git's own line rules apply first (a NUL ends a line, a carriage return before the newline and
+/// unescaped trailing spaces are dropped, blank and `#` lines are comments), and negation lines
+/// are dropped ([`drop_keep_negations`]).
+fn nested_patterns(directory: &Path, text: &[u8]) -> Vec<Vec<u8>> {
+    let mut prefix = vec![b'/'];
+    for component in directory.components() {
+        for byte in component.as_os_str().as_encoded_bytes() {
+            if matches!(byte, b'\\' | b'*' | b'?' | b'[') {
+                prefix.push(b'\\');
+            }
+            prefix.push(*byte);
+        }
+        prefix.push(b'/');
+    }
+    let text = drop_keep_negations(text);
+    let mut patterns = Vec::new();
+    for line in text.split(|byte| *byte == b'\n') {
+        let line = line.split(|byte| *byte == 0).next().unwrap_or_default();
+        let mut line = line.strip_suffix(b"\r").unwrap_or(line);
+        while let Some(rest) = line.strip_suffix(b" ") {
+            if rest.ends_with(b"\\") {
+                break;
+            }
+            line = rest;
+        }
+        let body = line.strip_suffix(b"/").unwrap_or(line);
+        if body.is_empty() || line.starts_with(b"#") {
+            continue;
+        }
+        let mut pattern = prefix.clone();
+        if body.contains(&b'/') {
+            pattern.extend(line.strip_prefix(b"/").unwrap_or(line));
+        } else {
+            pattern.extend(b"**/");
+            pattern.extend(line);
+        }
+        patterns.push(pattern);
+    }
+    patterns
 }
 
 /// Whether the real directory `path` is itself a repository: it holds a `.git` entry (file,
@@ -1700,6 +1792,32 @@ mod tests {
         assert!(keep.keeps(Path::new("only/mounts/data")));
         assert!(!keep.keeps(Path::new("only")));
         assert!(keep.holds_kept(Path::new("only")));
+    }
+
+    /// A nested keep file's lines become patterns anchored at the tree root: a line with no slash
+    /// but a trailing one matches at any depth below its directory, any other is anchored to it;
+    /// negations, comments and blank lines are dropped, and `\r` and trailing spaces are trimmed.
+    #[test]
+    fn nested_lines_become_root_anchored_patterns() {
+        let patterns = nested_patterns(
+            Path::new("a b/t*l"),
+            b"# note\n!gone\n\ncases/\r\n/anchored\nsub/dir/  \n*.log\n\\!literal\n",
+        );
+        let patterns: Vec<String> = patterns
+            .into_iter()
+            .map(|pattern| String::from_utf8(pattern).unwrap())
+            .collect();
+        assert_eq!(
+            patterns,
+            [
+                "/a b/t\\*l/**/cases/",
+                "/a b/t\\*l/anchored",
+                "/a b/t\\*l/sub/dir/",
+                "/a b/t\\*l/**/*.log",
+                "/a b/t\\*l/**/\\!literal",
+            ]
+        );
+        assert_eq!(drop_keep_negations(b"a\n!b\n\\!c\n!d"), b"a\n\\!c\n");
     }
 
     /// A nested keep file keeps below its own directory only, is itself kept, and a keep file

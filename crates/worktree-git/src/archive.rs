@@ -18,9 +18,9 @@ use b10x_worktree_domain::{
     BuildOutputOrigin, BuildOutputTarget, CACHEDIR_TAG_FILE, CARGO_PROFILE_MARKER,
     ExcludeObservations, FlutterFacts, FlutterOutputKind, KEEP_FILE, KeepSource,
     NestedRepositoryImage, NewFileSize, PatchStripPlan, Refusal, ScannedPatch, ScannedSection,
-    TargetFacts, WorktreeRecord, archive_image_file, diff_git_path, exclude_queries,
-    exclude_query_path, flutter_output, is_extended_header, is_keep_file, keep_sources,
-    layout_directory, layout_target, relative_path,
+    TargetFacts, WorktreeRecord, archive_image_file, diff_git_path, drop_keep_negations,
+    exclude_queries, exclude_query_path, flutter_output, is_extended_header, is_keep_file,
+    keep_sources, layout_directory, layout_target, relative_path,
 };
 use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -2754,8 +2754,16 @@ fn keep_texts(
         };
         match text {
             // A keep file below a path Git's exclude engine cannot be asked about affects only
-            // paths that are kept whatever it holds.
-            Some(text) if exclude_query_path(&path) => keeps.push((path, text)),
+            // paths that are kept whatever it holds. A nested keep file only adds keeps: its
+            // negation lines count for nothing, as in the tree.
+            Some(text) if exclude_query_path(&path) => {
+                let text = if ignore_directory(&path).is_empty() {
+                    text
+                } else {
+                    drop_keep_negations(&text)
+                };
+                keeps.push((path, text));
+            }
             Some(_) => {}
             None => unreadable = true,
         }
@@ -2856,6 +2864,9 @@ fn observe_exclusion(
             };
         }
     }
+    observed
+        .kept
+        .extend(ignore_beside_keep_files(&keeps, &queries.paths));
     let rules: IgnoreFiles = keeps
         .into_iter()
         .filter(|(_, text)| !text.is_empty())
@@ -2876,9 +2887,31 @@ fn observe_exclusion(
             input.extend_from_slice(path);
             input.push(0);
         }
-        observed.kept = ignored_under(scratch, "keep-tree", &rules, input)?;
+        observed
+            .kept
+            .extend(ignored_under(scratch, "keep-tree", &rules, input)?);
     }
     Ok(observed)
+}
+
+/// The queried `paths` that are the `.gitignore` of a directory holding a nested keep file of
+/// `keeps`: kept with it, as in the tree, because it hides the kept paths there.
+fn ignore_beside_keep_files(keeps: &IgnoreFiles, paths: &[Vec<u8>]) -> BTreeSet<Vec<u8>> {
+    let beside: BTreeSet<Vec<u8>> = keeps
+        .iter()
+        .map(|(path, _)| ignore_directory(path))
+        .filter(|directory| !directory.is_empty())
+        .map(|mut directory| {
+            directory.push(b'/');
+            directory.extend_from_slice(GITIGNORE.as_bytes());
+            directory
+        })
+        .collect();
+    paths
+        .iter()
+        .filter(|path| beside.contains(path.as_slice()))
+        .cloned()
+        .collect()
 }
 
 /// The `input` paths Git's exclude engine ignores under `rules`, the `.gitignore` files written

@@ -23,9 +23,25 @@ use std::path::PathBuf;
 /// or one of its ancestors, as Git's own exclude engine decides; a directory a pattern names is
 /// kept even when it holds no file. Absent, nothing is kept; a symbolic link, a directory or an
 /// unreadable file at any of those places refuses the discard as `keep-file-invalid`. A keep file
-/// itself is never discarded. A kept path is never build layout: `archive` keeps it in
-/// `dirty.patch`, and an invalid keep file keeps every path, so nothing is left out.
+/// itself is never discarded, and neither is the `.gitignore` of a directory that holds a nested
+/// keep file: a tool that hides its own directory with it would otherwise show what the keep file
+/// keeps as untracked once the `.gitignore` is gone. A nested keep file only adds keeps: its
+/// negation lines (`!pattern`) are ignored, because Git would give the deeper file precedence and
+/// take away what a file above keeps ([`drop_keep_negations`]). A kept path is never build layout:
+/// `archive` keeps it in `dirty.patch`, and an invalid keep file keeps every path, so nothing is
+/// left out.
 pub const KEEP_FILE: &str = ".worktreekeep";
+
+/// A nested keep file's `text` without its negation lines, the lines that start with `!`. A
+/// nested keep file only adds keeps; Git would let such a line take away a path a keep file above
+/// keeps, so the lines count for nothing.
+pub fn drop_keep_negations(text: &[u8]) -> Vec<u8> {
+    text.split_inclusive(|byte| *byte == b'\n')
+        .filter(|line| !line.starts_with(b"!"))
+        .flatten()
+        .copied()
+        .collect()
+}
 
 /// The file that marks a cache directory, per the Cache Directory Tagging Specification.
 pub const CACHEDIR_TAG_FILE: &str = "CACHEDIR.TAG";

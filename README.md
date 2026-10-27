@@ -68,8 +68,10 @@ directory or an unreadable file there refuses the discard as `keep-file-invalid`
 in a subdirectory keeps paths at and below that directory, its patterns matched relative to it as Git
 reads a nested `.gitignore`: a tool that keeps run state in an ignored directory of its own writes
 `<dir>/.worktreekeep` there (for example `cases/`) without editing the repository's root files. It
-keeps nothing outside its directory (`../x` and a link out match nothing), is never deleted itself,
-and an invalid one refuses like the root file. Records written
+keeps nothing outside its directory (`../x` and a link out match nothing), is never deleted itself
+(nor is the `.gitignore` beside it, which may hide what it keeps), and an invalid one refuses like the
+root file. It only adds keeps: its `!` lines are ignored, so it never takes away what a keep file
+above it keeps. Records written
 into an ignored directory such as `target/` are deleted unless `.worktreekeep` keeps them.
 
 A nested repository is never deleted either, because it may hold commits no remote does: an entry

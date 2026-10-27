@@ -9,6 +9,12 @@
   deleted itself, and one that is a symbolic link, a directory or unreadable refuses as
   `keep-file-invalid` like the root file.
 
+- A nested `.worktreekeep` only adds keeps: its `!` lines are ignored, so it cannot un-keep what the
+  root file or its own other lines keep, and a nested file keeps a path the root file negates. The
+  `.gitignore` of a directory that holds a nested `.worktreekeep` is kept with it by `discard-cache`,
+  `sweep`, `finish --discard-cache` and the strip, so a tool's self-ignoring directory still hides
+  what the keep file keeps.
+
 ## 0.18.2 — 2026-10-14
 
 - `archive` (and `finish --archive`) works on Git before 2.42 again: it handed

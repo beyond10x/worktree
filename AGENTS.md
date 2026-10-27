@@ -138,9 +138,11 @@ independent policy: every decision must come from the public façade.
 - The only command that deletes files a tree's owner wrote is `discard-cache` (and `finish
   --discard-cache`, and `sweep` through it), and it deletes only ignored entries Git reports
   (`status --ignored=matching`, file or directory): each is disposable unless the tree's keep file
-  keeps it. The keep files are `.worktreekeep` at the tree root and in any directory below it (not in or below a repository), read from disk; a nested one keeps at and below its own directory and never outside it, its patterns matched relative to that directory as Git reads a nested `.gitignore`; its lines are Git
-  exclude patterns matched by Git's own exclude engine (`ls-files --others --ignored
-  --exclude-per-directory`, argv only), so negation, directory-only patterns and anchoring mean what they
+  keeps it. The keep files are `.worktreekeep` at the tree root and in any directory below it (not in or below a repository), read from disk; a nested one keeps at and below its own directory and never outside it, and never takes a keep away (its `!` lines count for nothing), and its directory's `.gitignore` is kept with it, its patterns matched relative to that directory as Git reads a nested `.gitignore`; its lines are Git
+  exclude patterns matched by Git's own exclude engine (`ls-files --others --ignored`
+  with `--exclude-from` for the root file and `--exclude` for the lines of nested ones, rewritten
+  to match relative to their directory and ranked above the root's, `!` lines of a nested file
+  dropped; argv only), so negation (the root file's), directory-only patterns and anchoring mean what they
   mean in `.gitignore`, and a path is kept when a pattern matches it or one of its ancestors; a
   directory a pattern names is kept even when it holds no file (from the `--directory` listing,
   less any parent Git lists only because everything in it matches). Absent, it keeps nothing; a symbolic link, a directory or an unreadable file at any of those places refuses as
