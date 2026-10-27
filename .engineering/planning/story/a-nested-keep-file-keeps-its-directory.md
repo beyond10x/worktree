@@ -2,7 +2,7 @@
 format: aep.planning-md/3
 id: story:a-nested-keep-file-keeps-its-directory
 kind: story
-status: active
+status: implemented
 title: A .worktreekeep in a subdirectory keeps paths under that directory
 summary: nested keep files, as git reads nested .gitignore
 tags:
@@ -18,10 +18,11 @@ scope:
   path: crates/worktree-domain/src/cache.rs
 - confidence: inferred
   path: crates/worktree-git/src/cache.rs
-revision: 6
+revision: 8
 transitions:
 - {from: "draft", to: "proposed", at: "2026-10-27T12:27:25Z", actor: "human:timo", revision: 5, decided_on: {"recorded":{"review_outcome":4}}}
 - {from: "proposed", to: "active", at: "2026-10-27T12:27:25Z", actor: "human:timo", revision: 6, decided_on: {"recorded":{"review_outcome":4}}}
+- {from: "active", to: "implemented", at: "2026-10-27T12:44:07Z", actor: "human:timo", revision: 8, decided_on: {"recorded":{"test_result":1,"review_outcome":4}}}
 ---
 # Story: a-nested-keep-file-keeps-its-directory
 
@@ -76,3 +77,17 @@ Each is a named test run by `task check`.
 The consumer is takt's `story:a-cases-root-survives-worktree-cleanup`. That story's end-to-end check runs takt
 against this working tree's locally built `worktree` binary on `PATH`. The release follows once it passes; there is
 no release of this story before that check.
+
+## Status
+
+Implemented on `unit/tr-nested-keep` (6ab5d96, review fix e171145).
+
+- A nested `.worktreekeep` keeps paths at and below its own directory in `discard-cache`, `sweep`,
+  `finish --discard-cache --archive`, `archive` and the strip; escapes (`..`, absolute, links out) keep nothing outside
+  it.
+- After the review: the `.gitignore` beside a nested keep file is kept too, so a self-ignoring `.gitignore` (`*`) no
+  longer leaves the kept paths untracked; `!` lines in a nested keep file are ignored, so a nested file only adds keeps.
+- Partly met: the report says "kept by a .worktreekeep file" and lists the keep file, but does not name which keep file
+  kept each record; that needs a new wire-format field.
+- Tests: `nested_keep` 10, `nested_keep_adv1` 12, `cache_discard` 23, `sweep` 2, `ignored_output_strip` 7,
+  `nested_archive` 11 passed.

@@ -1,0 +1,12 @@
+{
+  "at": "2026-10-27T12:44:07Z",
+  "actor": "human:timo",
+  "artifact": "story:a-nested-keep-file-keeps-its-directory",
+  "kind": "story",
+  "revision": 7,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "cargo test -p worktree-cli --test nested_keep --test nested_keep_adv1 at e171145: 10 passed, 12 passed"
+  }
+}
