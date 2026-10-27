@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## 0.19.0 — 2026-10-27
 
 - A `.worktreekeep` in a subdirectory keeps paths at and below that directory, its patterns matched
   relative to it as Git reads a nested `.gitignore`. `discard-cache`, `sweep` and `finish
