@@ -398,6 +398,41 @@ fn an_archived_dirty_tree_is_finished_retired_and_restorable() {
 }
 
 #[test]
+fn an_archived_tree_with_an_uninitialised_submodule_is_retired() {
+    let fixture = Fixture::new();
+    let gitlink = fixture.head();
+    git_ok(
+        &fixture.tree,
+        &[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("160000,{gitlink},deps/sub"),
+        ],
+    );
+    git_ok(&fixture.tree, &["commit", "-m", "gitlink"]);
+    // A checkout leaves an uninitialised submodule as an empty directory.
+    std::fs::create_dir_all(fixture.tree.join("deps/sub")).unwrap();
+    assert_eq!(git_ok(&fixture.tree, &["status", "--porcelain"]), "");
+    fixture.make_dirty();
+
+    fixture.archive();
+    fixture.finish();
+    assert_eq!(fixture.gc("--dry-run")["eligible"], true);
+    // A removal that pruned the directory and then refused leaves Git reporting the gitlink
+    // deleted; the next apply must still return the tree to HEAD and remove it.
+    std::fs::remove_dir(fixture.tree.join("deps/sub")).unwrap();
+    assert!(
+        git_ok(&fixture.tree, &["status", "--porcelain"])
+            .lines()
+            .any(|line| line == " D deps/sub")
+    );
+    let applied = fixture.gc("--apply");
+    assert!(applied["evidence"].is_object(), "{applied}");
+    assert!(!fixture.tree.exists());
+}
+
+#[test]
 fn an_edit_after_the_archive_is_refused_as_stale() {
     let fixture = Fixture::new();
     fixture.make_dirty();

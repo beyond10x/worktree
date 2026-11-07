@@ -2115,6 +2115,34 @@ pub(crate) fn discard(record: &WorktreeRecord, archive: &Path, head: &str) -> Re
     // Git reports an empty ignored directory as ignored state, and no archive holds a directory
     // without files, so empty directories go too. The caller re-observes the tree afterwards.
     prune_empty_directories(worktree, true);
+    restore_gitlink_directories(worktree)
+}
+
+/// Recreate the empty directory of every gitlink in the index.
+///
+/// An uninitialised submodule is an empty directory at its gitlink's path; `checkout-index`
+/// writes nothing for a gitlink and the pruning above removes the directory, after which Git
+/// reports the path deleted and the tree is never clean again. An initialised submodule never
+/// reaches here: its `.git` file refuses the archive as `archive-unsupported-entry`.
+fn restore_gitlink_directories(worktree: &Path) -> Result<(), Refusal> {
+    let listing = run(
+        Command::new("git")
+            .arg("-C")
+            .arg(worktree)
+            .args(["ls-files", "-z", "--stage"]),
+        None,
+    )?;
+    for entry in listing.split(|byte| *byte == 0) {
+        let Some(tab) = entry.iter().position(|byte| *byte == b'\t') else {
+            continue;
+        };
+        if !entry.starts_with(b"160000 ") {
+            continue;
+        }
+        let path = worktree.join(OsStr::from_bytes(&entry[tab + 1..]));
+        std::fs::create_dir_all(&path)
+            .map_err(|error| io_refusal("archive-discard-failed", &path, &error))?;
+    }
     Ok(())
 }
 

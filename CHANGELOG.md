@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.19.4 — 2026-11-07
+
+- Removing an archived dirty tree that holds an uninitialised submodule no longer refuses as
+  `worktree-dirty`. Returning the tree to HEAD pruned the submodule's empty directory, after which
+  Git reported the gitlink deleted and every later apply refused the same way while the dry-run
+  kept reporting the tree eligible; 22 trees of one repository were stuck so. The directory is
+  recreated for every gitlink in the index after the pruning.
+
 ## 0.19.3 — 2026-11-07
 
 - Patch-equivalence proof costs a bounded number of Git calls per tree instead of two per
