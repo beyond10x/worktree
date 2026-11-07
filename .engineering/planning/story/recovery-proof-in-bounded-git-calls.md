@@ -2,7 +2,7 @@
 format: aep.planning-md/3
 id: story:recovery-proof-in-bounded-git-calls
 kind: story
-status: active
+status: implemented
 title: Recovery proof costs a bounded number of Git calls per remote, and gc shares one advertisement per assessment
 summary: A removal proof ran two Git processes per advertised ref, twice, and two ls-remote calls per tree; gc --apply refused a whole run after one reviewed id stopped being a candidate. Batch the per-ref questions, read a remote once unless a fetch happened, share the advertisement across an assessment, and retain the one id instead of refusing the run.
 scope:
@@ -10,10 +10,11 @@ scope:
   path: crates/worktree-git/src/lib.rs
 - confidence: cited
   path: crates/worktree/src/lib.rs
-revision: 4
+revision: 5
 transitions:
 - {from: "draft", to: "proposed", at: "2026-11-07T04:41:06Z", actor: "human:timo", revision: 2}
 - {from: "proposed", to: "active", at: "2026-11-07T04:41:06Z", actor: "human:timo", revision: 3}
+- {from: "active", to: "implemented", at: "2026-11-07T05:02:24Z", actor: "human:timo", revision: 5, decided_on: {"recorded":{"test_result":1}}}
 ---
 # Story: recovery proof in bounded Git calls
 
