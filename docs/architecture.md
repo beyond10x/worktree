@@ -72,11 +72,18 @@ locked, live, local-only, changed, and ambiguous states retain the tree.
 
 Ancestry is tried first. When no advertised ref contains the exact HEAD, the adapter lists the
 commits HEAD adds over every confirmed advertised tip. Each must have exactly one parent and a
-non-empty patch. One tip must then pass two checks: Git's `--cherry-pick` equivalence leaves no
-commit on the HEAD side, and `git patch-id --verbatim` over `--binary` patches finds every unique
-commit's whitespace-exact patch among the tip's own commits. Default branches are tried first. The
-resulting proof has kind `patch-equivalent` and names the unique commits it covers; the final
-re-observation before removal repeats the same two-kind check.
+non-empty patch. One tip must then pass two checks: `git patch-id --verbatim` over `--binary`
+patches finds every unique commit's whitespace-exact patch among the tip's own commits, and Git's
+`--cherry-pick` equivalence leaves no commit on the HEAD side. The work is bounded by the unique
+commits, not by the advertisement: a verbatim carrier touches the same paths, so one
+`rev-list --full-history --no-merges` over every tip with those paths lists the only possible
+carriers, one `git log --patch` over them yields their verbatim ids, and one `rev-list --parents`
+per carrier names the tips containing it. A tip containing a carrier of every unique commit
+qualifies; Git's `--cherry-pick` is asked only when that tip lacks other commits of HEAD, since a
+verbatim match is already a loose one. Default branches are tried first. The resulting proof has
+kind `patch-equivalent` and names the unique commits it covers; the final re-observation before
+removal repeats the same two-kind check. A unique commit touching a path with a newline in it
+stays unproven: `rev-list --stdin` cannot carry that path.
 
 ## Archive proof
 

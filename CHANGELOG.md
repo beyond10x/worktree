@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.19.3 — 2026-11-07
+
+- Patch-equivalence proof costs a bounded number of Git calls per tree instead of two per
+  advertised tip. The tips' own commits that touch the unique commits' paths are listed once, their
+  verbatim patch ids read once, and the tips containing each carrier found with one `rev-list
+  --parents` per carrier; Git's `--cherry-pick` equivalence is asked only of a tip that carries
+  every unique commit and lacks other commits of HEAD. Against a repository advertising 1,608 refs
+  a one-tree dry-run with unpublished commits took 64 s and now takes 4 s. The proof is unchanged:
+  the same tips qualify, in the same order.
+- A unique commit touching a path with a newline in it is reported as unproven instead of being
+  checked tip by tip.
+
 ## 0.19.2 — 2026-11-07
 
 - The batched recovery questions of 0.19.1 (`cat-file --batch-check`, `rev-list --parents

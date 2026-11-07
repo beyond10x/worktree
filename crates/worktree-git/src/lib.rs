@@ -641,16 +641,25 @@ impl ProcessGit {
         if unique.is_empty() {
             return Ok(unproven);
         }
-        let unique_ids = Self::verbatim_patch_ids(repository, &unique_range)?;
+        let unique_ids = Self::verbatim_patch_ids(repository, &unique_range, None)?;
         let Some(wanted) = unique
             .iter()
             .map(|commit| unique_ids.get(commit).cloned())
-            .collect::<Option<std::collections::BTreeSet<_>>>()
+            .collect::<Option<BTreeSet<_>>>()
         else {
             return Ok(unproven);
         };
 
-        let mut candidates = tips.iter().collect::<Vec<_>>();
+        let qualified = Self::carrying_tips(repository, head, tips, &unique, &wanted)?;
+        if qualified.is_empty() {
+            return Ok(unproven);
+        }
+        let unique_set = unique.iter().map(String::as_str).collect::<BTreeSet<_>>();
+
+        let mut candidates = tips
+            .iter()
+            .filter(|(tip, _)| qualified.contains(tip.as_str()))
+            .collect::<Vec<_>>();
         candidates.sort_by_key(|(tip, labels)| {
             let rank = labels
                 .iter()
@@ -660,42 +669,160 @@ impl ProcessGit {
             (rank, (*tip).clone())
         });
         for (tip, labels) in candidates {
-            let symmetric = format!("{tip}...{head}");
-            // Git's own whitespace-insensitive equivalence must hold for every commit on the
-            // HEAD side, merges included, before the stricter verbatim comparison is attempted.
-            let loose = Self::containment_output(
-                repository,
-                [
-                    "rev-list",
-                    "--right-only",
-                    "--cherry-pick",
-                    symmetric.as_str(),
-                ],
-            )?;
-            if !loose.trim().is_empty() {
-                continue;
+            // Git's own whitespace-insensitive equivalence must also hold for every commit on the
+            // HEAD side, merges included. The unique commits pass it (a verbatim match is a loose
+            // match), so Git is asked only when the tip lacks other commits of HEAD.
+            let lacking =
+                Self::containment_output(repository, ["rev-list", head, &format!("^{tip}")])?;
+            if lacking
+                .lines()
+                .any(|commit| !unique_set.contains(commit.trim()))
+            {
+                let loose = Self::containment_output(
+                    repository,
+                    [
+                        "rev-list",
+                        "--right-only",
+                        "--cherry-pick",
+                        &format!("{tip}...{head}"),
+                    ],
+                )?;
+                if !loose.trim().is_empty() {
+                    continue;
+                }
             }
-            let carried = Self::verbatim_patch_ids(
-                repository,
-                &[
-                    "--no-merges".to_owned(),
-                    "--left-only".to_owned(),
-                    symmetric,
-                ],
-            )?
-            .into_values()
-            .collect::<std::collections::BTreeSet<_>>();
-            if wanted.is_subset(&carried) {
-                let mut refs = labels.clone();
-                refs.sort();
-                return Ok(RecoveryEvidence {
-                    kind: RecoveryKind::PatchEquivalent,
-                    refs,
-                    equivalent_commits: unique,
-                });
-            }
+            let mut refs = labels.clone();
+            refs.sort();
+            return Ok(RecoveryEvidence {
+                kind: RecoveryKind::PatchEquivalent,
+                refs,
+                equivalent_commits: unique,
+            });
         }
         Ok(unproven)
+    }
+
+    /// The advertised tips containing a verbatim carrier of every unique commit.
+    ///
+    /// The work is bounded by the unique commits, not by the advertisement. A commit carrying one
+    /// of their patches verbatim touches the same paths, so the tips' own commits touching those
+    /// paths are the only possible carriers: they are listed once, their verbatim ids read once,
+    /// and the tips containing each carrier asked once, instead of two Git calls per tip.
+    fn carrying_tips(
+        repository: &Path,
+        head: &str,
+        tips: &AdvertisedTips,
+        unique: &[String],
+        wanted: &BTreeSet<String>,
+    ) -> Result<BTreeSet<String>, Refusal> {
+        let none = BTreeSet::new();
+        let Some(paths) = Self::touched_paths(repository, unique)? else {
+            return Ok(none);
+        };
+        if paths.is_empty() {
+            return Ok(none);
+        }
+        let touching = Self::commits_touching(repository, head, tips, &paths)?;
+        if touching.is_empty() {
+            return Ok(none);
+        }
+        let carried = Self::verbatim_patch_ids(
+            repository,
+            &["--no-walk=unsorted".to_owned(), "--stdin".to_owned()],
+            Some(&touching.join("\n")),
+        )?;
+        let mut carriers: BTreeMap<&str, Vec<&String>> = BTreeMap::new();
+        for (commit, patch_id) in &carried {
+            if wanted.contains(patch_id) {
+                carriers.entry(patch_id.as_str()).or_default().push(commit);
+            }
+        }
+        if carriers.len() != wanted.len() {
+            return Ok(none);
+        }
+        let mut qualified: Option<BTreeSet<String>> = None;
+        for commits in carriers.values() {
+            let mut reaching = BTreeSet::new();
+            for commit in commits {
+                reaching.extend(Self::commits_containing(repository, commit, tips.keys())?);
+            }
+            qualified = Some(match qualified {
+                None => reaching,
+                Some(so_far) => so_far.intersection(&reaching).cloned().collect(),
+            });
+        }
+        Ok(qualified.unwrap_or_default())
+    }
+
+    /// Every path the patches of `commits` touch, with local ancestry overrides disabled, or
+    /// `None` when one holds a newline, which `rev-list --stdin` cannot carry.
+    fn touched_paths(
+        repository: &Path,
+        commits: &[String],
+    ) -> Result<Option<BTreeSet<String>>, Refusal> {
+        let disabled_grafts = tempfile::NamedTempFile::new()
+            .map_err(|error| Refusal::new("graft-isolation-failed", error.to_string()))?;
+        let mut input = commits.join("\n");
+        input.push('\n');
+        let listed = Self::output_with_stdin(
+            repository,
+            [
+                "diff-tree",
+                "--stdin",
+                "-r",
+                "--no-commit-id",
+                "--name-only",
+                "--no-renames",
+                "-z",
+            ],
+            disabled_grafts.path(),
+            input.as_bytes(),
+        )?;
+        let mut paths = BTreeSet::new();
+        for path in listed.split('\0').filter(|path| !path.is_empty()) {
+            if path.contains('\n') {
+                return Ok(None);
+            }
+            paths.insert(path.to_owned());
+        }
+        Ok(Some(paths))
+    }
+
+    /// The tips' own commits (those `head` does not reach), merges left out, whose patch touches
+    /// one of `paths`, newest first; the only commits that can carry a unique commit's patch.
+    fn commits_touching(
+        repository: &Path,
+        head: &str,
+        tips: &AdvertisedTips,
+        paths: &BTreeSet<String>,
+    ) -> Result<Vec<String>, Refusal> {
+        let disabled_grafts = tempfile::NamedTempFile::new()
+            .map_err(|error| Refusal::new("graft-isolation-failed", error.to_string()))?;
+        let mut input = String::new();
+        for tip in tips.keys() {
+            input.push_str(tip);
+            input.push('\n');
+        }
+        input.push('^');
+        input.push_str(head);
+        input.push_str("\n--\n");
+        for path in paths {
+            input.push_str(path);
+            input.push('\n');
+        }
+        let listed = Self::output_with_stdin(
+            repository,
+            [
+                "--literal-pathspecs",
+                "rev-list",
+                "--full-history",
+                "--no-merges",
+                "--stdin",
+            ],
+            disabled_grafts.path(),
+            input.as_bytes(),
+        )?;
+        Ok(listed.lines().map(str::to_owned).collect())
     }
 
     /// Revision arguments selecting what `head` adds over every confirmed advertised tip.
@@ -735,9 +862,23 @@ impl ProcessGit {
     fn verbatim_patch_ids(
         repository: &Path,
         revisions: &[String],
+        stdin: Option<&str>,
     ) -> Result<BTreeMap<String, String>, Refusal> {
         let disabled_grafts = tempfile::NamedTempFile::new()
             .map_err(|error| Refusal::new("graft-isolation-failed", error.to_string()))?;
+        // Revisions read with `--stdin` come from a file: Git only reads it, so nothing
+        // can fill while the patch is written.
+        let input = match stdin {
+            Some(text) => {
+                let mut file = tempfile::tempfile()
+                    .map_err(|error| Refusal::new("patch-id-failed", error.to_string()))?;
+                file.write_all(text.as_bytes())
+                    .and_then(|()| std::io::Seek::rewind(&mut file))
+                    .map_err(|error| Refusal::new("patch-id-failed", error.to_string()))?;
+                Stdio::from(file)
+            }
+            None => Stdio::null(),
+        };
         let log_errors = tempfile::tempfile()
             .map_err(|error| Refusal::new("patch-id-failed", error.to_string()))?;
         let log_stderr = log_errors
@@ -764,7 +905,7 @@ impl ProcessGit {
             ])
             .args(revisions)
             .env("GIT_GRAFT_FILE", disabled_grafts.path())
-            .stdin(Stdio::null())
+            .stdin(input)
             .stdout(Stdio::piped())
             .stderr(Stdio::from(log_stderr))
             .spawn()
@@ -2696,6 +2837,111 @@ mod tests {
         expected.sort();
         observed.sort();
         assert_eq!(observed, expected);
+    }
+
+    #[test]
+    fn carriers_are_sought_only_among_tip_commits_touching_the_unique_paths() {
+        let (_temporary, repository) = diverged_feature();
+        let head = feature_head(&repository);
+        let first = run(&repository, &["rev-parse", "feature~1"]);
+        let second = run(&repository, &["rev-parse", "feature"]);
+        let unique = vec![second.clone(), first.clone()];
+
+        let paths = ProcessGit::touched_paths(&repository, &unique)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            paths,
+            BTreeSet::from(["first".to_owned(), "second".to_owned()])
+        );
+
+        let tip = |repository: &Path| {
+            AdvertisedTips::from([(
+                run(repository, &["rev-parse", "main"]),
+                vec!["origin:refs/heads/main".to_owned()],
+            )])
+        };
+        // main's own commit touches `unrelated` only.
+        assert_eq!(
+            ProcessGit::commits_touching(&repository, &head, &tip(&repository), &paths).unwrap(),
+            Vec::<String>::new()
+        );
+        run(&repository, &["cherry-pick", "main..feature"]);
+        let picked_first = run(&repository, &["rev-parse", "main~1"]);
+        let picked_second = run(&repository, &["rev-parse", "main"]);
+        assert_eq!(
+            ProcessGit::commits_touching(&repository, &head, &tip(&repository), &paths).unwrap(),
+            vec![picked_second, picked_first.clone()]
+        );
+        assert_eq!(
+            ProcessGit::commits_touching(
+                &repository,
+                &head,
+                &tip(&repository),
+                &BTreeSet::from(["first".to_owned()])
+            )
+            .unwrap(),
+            vec![picked_first]
+        );
+    }
+
+    #[test]
+    fn a_tip_lacking_other_head_commits_passes_only_with_git_equivalence_for_them() {
+        let (_temporary, repository, _remote) = repository_with_remote();
+        let base = run(&repository, &["rev-parse", "HEAD"]);
+        commit_file(
+            &repository,
+            "unrelated",
+            "unrelated\n",
+            "unrelated main commit",
+        );
+        run(&repository, &["push", "origin", "main"]);
+        run(&repository, &["switch", "-c", "feature"]);
+        commit_file(&repository, "first", "first\n", "first unit commit");
+        commit_file(&repository, "second", "second\n", "second unit commit");
+        // `side` carries the unit commits verbatim but branched before main's own commit.
+        run(&repository, &["switch", "-c", "side", &base]);
+        run(&repository, &["cherry-pick", "main..feature"]);
+        run(&repository, &["push", "origin", "side"]);
+        let head = feature_head(&repository);
+
+        let evidence = ProcessGit::default()
+            .recovery_evidence(&repository, &head)
+            .unwrap();
+        assert_eq!(evidence.refs, [] as [std::string::String; 0]);
+
+        run(&repository, &["cherry-pick", "main"]);
+        run(&repository, &["push", "origin", "side"]);
+
+        let evidence = ProcessGit::default()
+            .recovery_evidence(&repository, &head)
+            .unwrap();
+        assert_eq!(evidence.kind, RecoveryKind::PatchEquivalent);
+        assert_eq!(evidence.refs, vec!["origin:refs/heads/side"]);
+        let mut expected = run(&repository, &["rev-list", "main..feature"])
+            .lines()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let mut observed = evidence.equivalent_commits;
+        expected.sort();
+        observed.sort();
+        assert_eq!(observed, expected);
+    }
+
+    #[test]
+    fn a_unique_commit_touching_a_path_with_a_newline_is_unproven() {
+        let (_temporary, repository) = diverged_feature();
+        run(&repository, &["switch", "feature"]);
+        commit_file(&repository, "odd\nname", "odd\n", "odd path");
+        run(&repository, &["switch", "main"]);
+        run(&repository, &["cherry-pick", "main..feature"]);
+        run(&repository, &["push", "origin", "main"]);
+        let head = feature_head(&repository);
+
+        let evidence = ProcessGit::default()
+            .recovery_evidence(&repository, &head)
+            .unwrap();
+        assert_eq!(evidence.refs, [] as [std::string::String; 0]);
     }
 
     #[test]
