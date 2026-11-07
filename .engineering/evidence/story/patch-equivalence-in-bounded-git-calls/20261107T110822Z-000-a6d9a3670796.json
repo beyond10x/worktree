@@ -1,0 +1,12 @@
+{
+  "at": "2026-11-07T11:08:22Z",
+  "actor": "human:timo",
+  "artifact": "story:patch-equivalence-in-bounded-git-calls",
+  "kind": "story",
+  "revision": 5,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "task check 2026-11-07 on perf/bounded-patch-equivalence at 822ac30: fmt, clippy -D warnings, 425 tests passed, exit 0; PR #49 checks gate, common / Security and privacy, b10x-docs-check success; released 0.19.3 with 5 assets; one-tree dry-run against 1,608 refs 64 s -> 4 s"
+  }
+}

@@ -2,16 +2,17 @@
 format: aep.planning-md/3
 id: story:gitlink-directory-survives-archive-discard
 kind: story
-status: active
+status: implemented
 title: An archived tree with an uninitialised submodule is removable
 summary: archive::discard pruned an uninitialised submodule's empty directory, Git then reported the gitlink deleted and every apply refused worktree-dirty while the dry-run said eligible; recreate the directory of every gitlink after pruning.
 scope:
 - confidence: cited
   path: crates/worktree-git/src/archive.rs
-revision: 5
+revision: 6
 transitions:
 - {from: "draft", to: "proposed", at: "2026-11-07T11:00:06Z", actor: "human:timo", revision: 4}
 - {from: "proposed", to: "active", at: "2026-11-07T11:00:06Z", actor: "human:timo", revision: 5}
+- {from: "active", to: "implemented", at: "2026-11-07T11:08:22Z", actor: "human:timo", revision: 6, decided_on: {"recorded":{"test_result":1}}}
 ---
 # Story: an archived tree with an uninitialised submodule is removable
 
