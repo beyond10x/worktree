@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.19.2 — 2026-11-07
+
+- The batched recovery questions of 0.19.1 (`cat-file --batch-check`, `rev-list --parents
+  --stdin`) no longer deadlock when the input and Git's replies both exceed what a pipe holds
+  (64 KiB). Git was fed every line before its first reply was read; a repository advertising
+  3,316 refs blocked every `gc`, `finish`, `archive`, `sweep` and `prune-archives` proof
+  against it indefinitely. The input is now written beside the reader.
+
 ## 0.19.1 — 2026-11-07
 
 - Recovery proof (`gc`, `finish`, `archive`, `sweep`, `prune-archives`) asks Git a bounded number

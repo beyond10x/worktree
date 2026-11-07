@@ -528,18 +528,28 @@ impl ProcessGit {
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|error| Refusal::new("git-unavailable", error.to_string()))?;
-        {
-            let mut input = child
-                .stdin
-                .take()
-                .ok_or_else(|| Refusal::new("git-command-failed", "git stdin was unavailable"))?;
-            input
-                .write_all(stdin)
-                .map_err(|error| Refusal::new("git-command-failed", error.to_string()))?;
-        }
+        let mut input = child
+            .stdin
+            .take()
+            .ok_or_else(|| Refusal::new("git-command-failed", "git stdin was unavailable"))?;
+        // Git writes a reply per input line while the input is still being
+        // written. Both pipes hold 64 KiB; feeding every line before reading
+        // the first reply deadlocks once the replies fill the stdout pipe
+        // (a remote advertising 3316 refs did). The writer runs beside the
+        // reader so neither pipe fills.
+        let stdin = stdin.to_vec();
+        let writer = std::thread::spawn(move || input.write_all(&stdin));
         let output = child
             .wait_with_output()
             .map_err(|error| Refusal::new("git-command-failed", error.to_string()))?;
+        let written = writer
+            .join()
+            .map_err(|_| Refusal::new("git-command-failed", "git stdin writer panicked"))?;
+        if let Err(error) = written
+            && output.status.success()
+        {
+            return Err(Refusal::new("git-command-failed", error.to_string()));
+        }
         if !output.status.success() {
             return Err(Refusal::new(
                 "git-command-failed",
@@ -2327,6 +2337,36 @@ mod tests {
             present,
             BTreeMap::from([(head.clone(), head.clone()), (tag, head)])
         );
+    }
+
+    #[test]
+    fn present_commits_handles_more_candidates_than_a_pipe_holds() {
+        let (_temporary, repository, _remote) = repository_with_remote();
+        let head = run(&repository, &["rev-parse", "HEAD"]);
+        // 4000 unknown objects: ~200 KiB of input, ~230 KiB of replies, both
+        // past the 64 KiB a pipe holds. A writer that waits for the reader
+        // never returns here.
+        let unknown = (1..=4000u32)
+            .map(|index| format!("{index:040x}"))
+            .collect::<Vec<_>>();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = {
+            let repository = repository.clone();
+            let head = head.clone();
+            let unknown = unknown.clone();
+            std::thread::spawn(move || {
+                let objects = std::iter::once(&head).chain(unknown.iter());
+                let _ = sender.send(ProcessGit::present_commits(&repository, objects));
+            })
+        };
+
+        let present = receiver
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("present_commits deadlocked on its own pipes")
+            .unwrap();
+        worker.join().unwrap();
+
+        assert_eq!(present, BTreeMap::from([(head.clone(), head)]));
     }
 
     #[test]

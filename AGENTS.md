@@ -38,7 +38,9 @@ independent policy: every decision must come from the public façade.
   proof. Within one observation a remote is read once, and again only after objects were fetched
   from it. Which advertised objects are commits this repository holds (one `cat-file
   --batch-check`) and which of them contain HEAD (one `rev-list --parents`) are each asked of Git
-  once per remote, never once per advertised ref.
+  once per remote, never once per advertised ref. The input of such a call is written from its own
+  thread while the reply is read: Git answers each line as it arrives, both pipes hold 64 KiB, and
+  writing every line before reading deadlocked against a remote advertising 3,316 refs.
 - Every removal also refuses state Git status does not report: assume-unchanged and skip-worktree
   entries, staged content that differs from both HEAD and the working copy, any `.git` below the
   tree's root, and per-worktree refs. No proof, remote or archived, covers it, with one exception:
