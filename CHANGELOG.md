@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.19.1 — 2026-11-07
+
+- Recovery proof (`gc`, `finish`, `archive`, `sweep`, `prune-archives`) asks Git a bounded number
+  of questions per remote instead of two per advertised ref: one `cat-file --batch-check` says
+  which advertised objects are commits the repository holds, and one `rev-list --parents` says
+  which of them contain the tree's HEAD. Before, every advertised ref cost one `cat-file -e` and
+  one `merge-base --is-ancestor`, twice; a one-tree dry-run against a repository advertising 18
+  refs ran 87 Git processes, and one advertising 949 refs ran about 3,800.
+- A remote is read (`ls-remote`) once per observation, and again only after objects were fetched
+  from it. Before, every observation read each remote twice.
+- `gc` reads each repository's remotes once for a whole assessment (the dry-run, and the planning
+  pass of `--apply`), shared across every tree it assesses; the proof immediately before a removal
+  still reads them afresh. A profile-wide dry-run over N trees cost 2N `ls-remote` calls; it now
+  costs one per repository and remote, and the apply one per tree.
+- `gc --apply` no longer refuses the whole run when a reviewed id stopped being a candidate since
+  the dry-run (removed by another run, or seen again). That id is reported as retained with
+  `selected-worktree-not-cleanup-candidate`, and the other reviewed ids proceed. Before, a run
+  that had assessed 403 trees for 34 minutes ended with that one refusal and removed nothing.
+- `GitPort` gains `begin_shared_observation` and `end_shared_observation`, which share nothing by
+  default. `ProcessGit` holds the shared advertisement, so it is constructed with
+  `ProcessGit::default()` and is no longer `Copy`.
+
 ## 0.19.0 — 2026-10-27
 
 - A `.worktreekeep` in a subdirectory keeps paths at and below that directory, its patterns matched
