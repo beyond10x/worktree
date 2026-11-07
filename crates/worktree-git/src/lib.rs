@@ -1257,7 +1257,7 @@ impl GitPort for ProcessGit {
         head: &str,
         state: ArchiveStateCheck<'_>,
     ) -> Result<ArchiveReference, Refusal> {
-        archive::verify(record, archive, head, state)
+        archive::verify(Some(&self.shared), record, archive, head, state)
     }
 
     #[cfg(unix)]

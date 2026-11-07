@@ -9,7 +9,7 @@
 //! of its root directory and every entry below it, written from and verified against a canonical
 //! listing whose SHA-256 is the image's fingerprint.
 
-use crate::{AdvertisedTips, ProcessGit, cache};
+use crate::{AdvertisedTips, ProcessGit, SharedAdvertisements, cache};
 use b10x_worktree::GitPort as _;
 use b10x_worktree_domain::{
     ARCHIVE_BUNDLE_FILE, ARCHIVE_HEAD_REF, ARCHIVE_MANIFEST_FILE, ARCHIVE_PATCH_FILE,
@@ -1783,7 +1783,11 @@ fn require_patch_recreates(
 }
 
 /// Complete verification of an archive as recovery proof.
+///
+/// With `shared`, the advertisement an assessment already read since sharing began serves this
+/// verification too; the verification before a removal runs after sharing ended, so it reads afresh.
 pub(crate) fn verify(
+    shared: Option<&SharedAdvertisements>,
     record: &WorktreeRecord,
     archive: &Path,
     head: &str,
@@ -1802,7 +1806,7 @@ pub(crate) fn verify(
     };
     let parent = archive.parent().unwrap_or(archive);
     let scratch = Scratch::new(repository, parent)?;
-    let (_, tips) = ProcessGit::observe_recovery(None, repository, head)?;
+    let (_, tips) = ProcessGit::observe_recovery(shared, repository, head)?;
     let commits = ProcessGit::unique_commits(repository, head, &tips)?
         .into_iter()
         .map(|(commit, _)| commit)
