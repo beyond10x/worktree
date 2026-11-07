@@ -2,16 +2,17 @@
 format: aep.planning-md/3
 id: story:batched-git-questions-do-not-deadlock
 kind: story
-status: active
+status: implemented
 title: Batched Git questions do not deadlock on their pipes
 summary: output_with_stdin wrote every input line before reading a reply; with 3,316 advertised refs both pipes filled and every recovery proof against that repository hung. Write the input beside the reader.
 scope:
 - confidence: cited
   path: crates/worktree-git/src/lib.rs
-revision: 5
+revision: 6
 transitions:
 - {from: "draft", to: "proposed", at: "2026-11-07T10:11:05Z", actor: "human:timo", revision: 4}
 - {from: "proposed", to: "active", at: "2026-11-07T10:11:05Z", actor: "human:timo", revision: 5}
+- {from: "active", to: "implemented", at: "2026-11-07T10:21:10Z", actor: "human:timo", revision: 6, decided_on: {"recorded":{"test_result":1}}}
 ---
 # Story: batched Git questions do not deadlock on their pipes
 

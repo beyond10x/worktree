@@ -1,0 +1,12 @@
+{
+  "at": "2026-11-07T10:21:10Z",
+  "actor": "human:timo",
+  "artifact": "story:batched-git-questions-do-not-deadlock",
+  "kind": "story",
+  "revision": 5,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "task check 2026-11-07 on fix/stdin-pipe-deadlock at 297f955: fmt, clippy -D warnings, 422 tests passed, exit 0; PR #47 checks gate and common / Security and privacy success; released 0.19.2 with 5 assets"
+  }
+}
