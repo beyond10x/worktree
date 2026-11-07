@@ -32,6 +32,13 @@ independent policy: every decision must come from the public façade.
   no advertised ref holds is a single-parent, non-empty commit whose whitespace-exact patch one
   advertised ref carries. Patch equivalence never weakens to Git's whitespace-insensitive patch ids
   alone.
+- The proof immediately before a removal reads every remote afresh. An assessment (`gc` without
+  `--apply`, and the planning pass of `--apply`) shares one advertisement per repository and remote
+  across the trees it assesses, read again only after a fetch; its verdict is never a removal's
+  proof. Within one observation a remote is read once, and again only after objects were fetched
+  from it. Which advertised objects are commits this repository holds (one `cat-file
+  --batch-check`) and which of them contain HEAD (one `rev-list --parents`) are each asked of Git
+  once per remote, never once per advertised ref.
 - Every removal also refuses state Git status does not report: assume-unchanged and skip-worktree
   entries, staged content that differs from both HEAD and the working copy, any `.git` below the
   tree's root, and per-worktree refs. No proof, remote or archived, covers it, with one exception:

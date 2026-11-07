@@ -1544,7 +1544,7 @@ pub(crate) fn write(request: &ArchiveRequest<'_>) -> Result<ArchiveEvidence, Ref
         .map_err(|error| io_refusal("archive-write-failed", parent, &error))?;
     let scratch = Scratch::new(repository, parent)?;
 
-    let (_, tips) = ProcessGit::observe_recovery(repository, head)?;
+    let (_, tips) = ProcessGit::observe_recovery(None, repository, head)?;
     let unique = ProcessGit::unique_commits(repository, head, &tips)?
         .into_iter()
         .map(|(commit, _)| commit)
@@ -1588,7 +1588,7 @@ pub(crate) fn write(request: &ArchiveRequest<'_>) -> Result<ArchiveEvidence, Ref
 
     // The tree must still be what was archived: same HEAD, same content, the same nested
     // repositories, each re-walked to its recorded fingerprint.
-    let after = ProcessGit.worktree_snapshot(repository, worktree)?;
+    let after = ProcessGit::default().worktree_snapshot(repository, worktree)?;
     let (after_tree, _, after_roots, _) =
         capture(worktree, &scratch, false, LeaveOut::everything(head))?;
     if after.head != head
@@ -1802,7 +1802,7 @@ pub(crate) fn verify(
     };
     let parent = archive.parent().unwrap_or(archive);
     let scratch = Scratch::new(repository, parent)?;
-    let (_, tips) = ProcessGit::observe_recovery(repository, head)?;
+    let (_, tips) = ProcessGit::observe_recovery(None, repository, head)?;
     let commits = ProcessGit::unique_commits(repository, head, &tips)?
         .into_iter()
         .map(|(commit, _)| commit)

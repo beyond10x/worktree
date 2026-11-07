@@ -10,11 +10,12 @@ use b10x_worktree_domain::{
     CacheClassification, CreatePlan, DiscoveredWorktree, RecoveryEvidence, RecoveryKind, Refusal,
     RepositorySnapshot, WorktreeSnapshot,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::OsStr;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
 
 #[cfg(unix)]
 mod archive;
@@ -25,9 +26,18 @@ mod inspection;
 /// Confirmed advertised commits, each mapped to the `remote:ref` names advertising it.
 type AdvertisedTips = BTreeMap<String, Vec<String>>;
 
+/// One remote's advertisement: each advertised ref mapped to the object it points at.
+type Advertisement = BTreeMap<String, String>;
+
+/// Advertisements shared between observations while sharing is begun, keyed by repository and
+/// remote; `None` while every observation reads its remotes afresh.
+type SharedAdvertisements = Mutex<Option<BTreeMap<(PathBuf, String), Advertisement>>>;
+
 /// Process-backed Git port.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct ProcessGit;
+#[derive(Debug, Default, Clone)]
+pub struct ProcessGit {
+    shared: Arc<SharedAdvertisements>,
+}
 
 impl ProcessGit {
     fn output_bytes<I, S>(repository: &Path, args: I) -> Result<Vec<u8>, Refusal>
@@ -177,10 +187,48 @@ impl ProcessGit {
         Ok(remotes)
     }
 
+    /// One remote's advertisement: shared when sharing is in effect and this repository's remote
+    /// was already read since it began, otherwise read now (and kept for sharing).
     fn advertised_refs(
+        shared: Option<&SharedAdvertisements>,
         repository: &Path,
         remote: &str,
-    ) -> Result<BTreeMap<String, String>, Refusal> {
+    ) -> Result<Advertisement, Refusal> {
+        let key = (repository.to_path_buf(), remote.to_owned());
+        if let Some(shared) = shared
+            && let Some(advertised) = shared
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+                .and_then(|advertisements| advertisements.get(&key))
+        {
+            return Ok(advertised.clone());
+        }
+        Self::advertised_refs_fresh(shared, repository, remote)
+    }
+
+    /// Read one remote's advertisement now, replacing what sharing held for it.
+    fn advertised_refs_fresh(
+        shared: Option<&SharedAdvertisements>,
+        repository: &Path,
+        remote: &str,
+    ) -> Result<Advertisement, Refusal> {
+        let advertised = Self::read_advertisement(repository, remote)?;
+        if let Some(shared) = shared
+            && let Some(advertisements) = shared
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_mut()
+        {
+            advertisements.insert(
+                (repository.to_path_buf(), remote.to_owned()),
+                advertised.clone(),
+            );
+        }
+        Ok(advertised)
+    }
+
+    fn read_advertisement(repository: &Path, remote: &str) -> Result<Advertisement, Refusal> {
         let output = Self::output(repository, ["ls-remote", "--quiet", "--refs", "--", remote])
             .map_err(|error| {
                 Refusal::new(
@@ -349,33 +397,167 @@ impl ProcessGit {
         Ok(())
     }
 
-    fn contains_commit(repository: &Path, head: &str, tip: &str) -> Result<bool, Refusal> {
+    /// Map each of `objects` that peels to a commit this repository holds to that commit's id,
+    /// in one `cat-file --batch-check` with replacement objects and graft ancestry disabled.
+    ///
+    /// An object the repository lacks, or one that peels to no commit, is absent from the map.
+    fn present_commits<'a>(
+        repository: &Path,
+        objects: impl IntoIterator<Item = &'a String>,
+    ) -> Result<BTreeMap<String, String>, Refusal> {
+        let objects = objects.into_iter().collect::<BTreeSet<_>>();
+        let mut present = BTreeMap::new();
+        if objects.is_empty() {
+            return Ok(present);
+        }
         let disabled_grafts = tempfile::NamedTempFile::new()
             .map_err(|error| Refusal::new("graft-isolation-failed", error.to_string()))?;
-        let tip = format!("{tip}^{{commit}}");
-        let output = Command::new("git")
+        let mut queries = String::new();
+        for object in &objects {
+            queries.push_str(object);
+            queries.push_str("^{commit}\n");
+        }
+        let output = Self::output_with_stdin(
+            repository,
+            ["cat-file", "--batch-check"],
+            disabled_grafts.path(),
+            queries.as_bytes(),
+        )?;
+        let mut answers = output.lines();
+        for object in &objects {
+            let Some(answer) = answers.next() else {
+                return Err(Refusal::new(
+                    "git-command-failed",
+                    format!(
+                        "cat-file --batch-check answered fewer objects than asked for {object}"
+                    ),
+                ));
+            };
+            let mut fields = answer.split(' ');
+            let (Some(commit), Some("commit")) = (fields.next(), fields.next()) else {
+                continue;
+            };
+            present.insert((*object).clone(), commit.to_owned());
+        }
+        Ok(present)
+    }
+
+    /// Which of `commits`, each a commit this repository holds, contain `head`: `head` itself
+    /// and every one from which Git's walk reaches a child of `head`, in one `rev-list` with
+    /// replacement objects and graft ancestry disabled.
+    fn commits_containing<'a>(
+        repository: &Path,
+        head: &str,
+        commits: impl IntoIterator<Item = &'a String>,
+    ) -> Result<BTreeSet<String>, Refusal> {
+        let candidates = commits.into_iter().cloned().collect::<BTreeSet<_>>();
+        let mut containing = BTreeSet::new();
+        if candidates.contains(head) {
+            containing.insert(head.to_owned());
+        }
+        if candidates.len() == containing.len() {
+            return Ok(containing);
+        }
+        // Everything reachable from a candidate that is not an ancestor of `head`: every commit
+        // on a path from a candidate down to `head`, with `head` itself named only as a parent.
+        let disabled_grafts = tempfile::NamedTempFile::new()
+            .map_err(|error| Refusal::new("graft-isolation-failed", error.to_string()))?;
+        let mut revisions = String::new();
+        for candidate in &candidates {
+            revisions.push_str(candidate);
+            revisions.push('\n');
+        }
+        revisions.push('^');
+        revisions.push_str(head);
+        revisions.push('\n');
+        let listing = Self::output_with_stdin(
+            repository,
+            ["rev-list", "--parents", "--stdin"],
+            disabled_grafts.path(),
+            revisions.as_bytes(),
+        )?;
+        let mut children: HashMap<&str, Vec<&str>> = HashMap::new();
+        for line in listing.lines() {
+            let mut fields = line.split(' ');
+            let Some(commit) = fields.next() else {
+                continue;
+            };
+            for parent in fields {
+                children.entry(parent).or_default().push(commit);
+            }
+        }
+        let mut reached = HashSet::new();
+        let mut frontier = children.get(head).cloned().unwrap_or_default();
+        while let Some(commit) = frontier.pop() {
+            if !reached.insert(commit) {
+                continue;
+            }
+            if let Some(next) = children.get(commit) {
+                frontier.extend(next.iter().copied());
+            }
+        }
+        containing.extend(
+            candidates
+                .iter()
+                .filter(|candidate| reached.contains(candidate.as_str()))
+                .cloned(),
+        );
+        Ok(containing)
+    }
+
+    /// Run one Git query fed through its standard input, with replacement objects disabled and
+    /// `grafts` as the (empty) graft file.
+    fn output_with_stdin<I, S>(
+        repository: &Path,
+        args: I,
+        grafts: &Path,
+        stdin: &[u8],
+    ) -> Result<String, Refusal>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        let mut child = Command::new("git")
             .arg("--no-replace-objects")
             .arg("-C")
             .arg(repository)
-            .args(["merge-base", "--is-ancestor", head, tip.as_str()])
-            .env("GIT_GRAFT_FILE", disabled_grafts.path())
-            .output()
+            .args(args)
+            .env("GIT_GRAFT_FILE", grafts)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
             .map_err(|error| Refusal::new("git-unavailable", error.to_string()))?;
-        match output.status.code() {
-            Some(0) => Ok(true),
-            Some(1) => Ok(false),
-            _ => Err(Refusal::new(
+        {
+            let mut input = child
+                .stdin
+                .take()
+                .ok_or_else(|| Refusal::new("git-command-failed", "git stdin was unavailable"))?;
+            input
+                .write_all(stdin)
+                .map_err(|error| Refusal::new("git-command-failed", error.to_string()))?;
+        }
+        let output = child
+            .wait_with_output()
+            .map_err(|error| Refusal::new("git-command-failed", error.to_string()))?;
+        if !output.status.success() {
+            return Err(Refusal::new(
                 "git-command-failed",
                 String::from_utf8_lossy(&output.stderr).trim().to_owned(),
-            )),
+            ));
         }
+        String::from_utf8(output.stdout)
+            .map_err(|error| Refusal::new("git-output-not-utf8", error.to_string()))
     }
 
     /// Return the exact advertised refs containing `head`, and every confirmed advertised tip.
     ///
-    /// A tip is confirmed when the final re-advertisement lists it and its commit is local. The
-    /// tips map each commit to the `remote:ref` names advertising it.
+    /// Each remote is read once, and again only after objects were fetched from it. A tip is
+    /// confirmed when the final advertisement lists it and its commit is local. The tips map each
+    /// commit to the `remote:ref` names advertising it. With `shared`, a remote read since
+    /// sharing began is not read again unless a fetch makes that necessary.
     fn observe_recovery(
+        shared: Option<&SharedAdvertisements>,
         repository: &Path,
         head: &str,
     ) -> Result<(Vec<String>, AdvertisedTips), Refusal> {
@@ -390,29 +572,29 @@ impl ProcessGit {
         let mut refs = Vec::new();
         let mut tips = AdvertisedTips::new();
         for remote in Self::remote_names(repository)? {
-            let advertised = Self::advertised_refs(repository, &remote)?;
-            let mut already_proves_recovery = false;
-            let mut missing = BTreeMap::new();
-            for (reference, tip) in &advertised {
-                if Self::commitish_exists(repository, tip)? {
-                    already_proves_recovery |= Self::contains_commit(repository, head, tip)?;
-                } else {
-                    missing.insert(reference.clone(), tip.clone());
-                }
-            }
-            if !already_proves_recovery {
+            let mut advertised = Self::advertised_refs(shared, repository, &remote)?;
+            let mut present = Self::present_commits(repository, advertised.values())?;
+            let mut containing = Self::commits_containing(repository, head, present.values())?;
+            let missing = advertised
+                .iter()
+                .filter(|(_, tip)| !present.contains_key(*tip))
+                .map(|(reference, tip)| (reference.clone(), tip.clone()))
+                .collect::<BTreeMap<_, _>>();
+            if containing.is_empty() && !missing.is_empty() {
                 Self::fetch_advertised_refs(repository, &remote, &missing)?;
+                // Observation and the fetch are separate protocol transactions. Re-advertise and
+                // only report these final remote facts. A racing update whose object is not
+                // available locally is conservatively ignored.
+                advertised = Self::advertised_refs_fresh(shared, repository, &remote)?;
+                present = Self::present_commits(repository, advertised.values())?;
+                containing = Self::commits_containing(repository, head, present.values())?;
             }
-
-            // Observation and any fetch are separate protocol transactions. Re-advertise and only
-            // report these final remote facts. A racing update whose object is not available
-            // locally is conservatively ignored.
-            for (reference, tip) in Self::advertised_refs(repository, &remote)? {
-                if !Self::commitish_exists(repository, &tip)? {
+            for (reference, tip) in advertised {
+                let Some(commit) = present.get(&tip) else {
                     continue;
-                }
+                };
                 let label = format!("{remote}:{reference}");
-                if Self::contains_commit(repository, head, &tip)? {
+                if containing.contains(commit) {
                     refs.push(label.clone());
                 }
                 tips.entry(tip).or_default().push(label);
@@ -901,7 +1083,21 @@ impl GitPort for ProcessGit {
     }
 
     fn recovery_refs(&self, repository: &Path, head: &str) -> Result<Vec<String>, Refusal> {
-        Self::observe_recovery(repository, head).map(|(refs, _)| refs)
+        Self::observe_recovery(Some(&self.shared), repository, head).map(|(refs, _)| refs)
+    }
+
+    fn begin_shared_observation(&self) {
+        *self
+            .shared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(BTreeMap::new());
+    }
+
+    fn end_shared_observation(&self) {
+        *self
+            .shared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     }
 
     fn commits_not_on_remote(
@@ -930,18 +1126,12 @@ impl GitPort for ProcessGit {
         let Some(anchor) = anchor else {
             return Ok(commits.to_vec());
         };
-        let (_, tips) = Self::observe_recovery(repository, anchor)?;
+        let (_, tips) = Self::observe_recovery(Some(&self.shared), repository, anchor)?;
+        let tip_commits = Self::present_commits(repository, tips.keys())?;
         let mut missing = Vec::new();
         for commit in commits {
-            let mut held = false;
-            if Self::commitish_exists(repository, commit)? {
-                for tip in tips.keys() {
-                    if Self::contains_commit(repository, commit, tip)? {
-                        held = true;
-                        break;
-                    }
-                }
-            }
+            let held = Self::commitish_exists(repository, commit)?
+                && !Self::commits_containing(repository, commit, tip_commits.values())?.is_empty();
             if !held {
                 missing.push(commit.clone());
             }
@@ -954,7 +1144,7 @@ impl GitPort for ProcessGit {
         repository: &Path,
         head: &str,
     ) -> Result<RecoveryEvidence, Refusal> {
-        let (refs, tips) = Self::observe_recovery(repository, head)?;
+        let (refs, tips) = Self::observe_recovery(Some(&self.shared), repository, head)?;
         if !refs.is_empty() {
             return Ok(RecoveryEvidence::ancestor(refs));
         }
@@ -1627,7 +1817,7 @@ mod tests {
         }
         assert!(linked.exists());
         assert!(
-            !ProcessGit
+            !ProcessGit::default()
                 .list_worktrees(repository)
                 .unwrap()
                 .iter()
@@ -1640,7 +1830,7 @@ mod tests {
     #[test]
     fn removes_a_linked_tree_holding_a_read_only_directory() {
         let (_temporary, repository, linked, _head) = linked_with_read_only_directory();
-        ProcessGit.remove(&repository, &linked).unwrap();
+        ProcessGit::default().remove(&repository, &linked).unwrap();
         assert!(!linked.exists());
     }
 
@@ -1651,10 +1841,10 @@ mod tests {
         if !interrupt_removal(&repository, &linked) {
             return;
         }
-        ProcessGit
+        ProcessGit::default()
             .verify_removal_residue(&repository, &linked, &head)
             .unwrap();
-        ProcessGit.delete_residue(&linked).unwrap();
+        ProcessGit::default().delete_residue(&linked).unwrap();
         assert!(!linked.exists());
     }
 
@@ -1666,14 +1856,14 @@ mod tests {
             return;
         }
         std::fs::write(linked.join("app/jobs/Job.txt"), "changed\n").unwrap();
-        let changed = ProcessGit
+        let changed = ProcessGit::default()
             .verify_removal_residue(&repository, &linked, &head)
             .unwrap_err();
         assert_eq!(changed.code, "removal-residue-unproven");
 
         std::fs::write(linked.join("app/jobs/Job.txt"), "job\n").unwrap();
         std::fs::write(linked.join("notes.txt"), "new work\n").unwrap();
-        let untracked = ProcessGit
+        let untracked = ProcessGit::default()
             .verify_removal_residue(&repository, &linked, &head)
             .unwrap_err();
         assert_eq!(untracked.code, "removal-residue-unproven");
@@ -1692,10 +1882,10 @@ mod tests {
         std::fs::write(legacy.join("untracked"), "preserve me\n").unwrap();
         let managed = temporary.path().join("managed").join("one");
 
-        ProcessGit
+        ProcessGit::default()
             .validate_move_worktree(&legacy, &managed)
             .unwrap();
-        ProcessGit
+        ProcessGit::default()
             .move_worktree(&repository, &legacy, &managed)
             .unwrap();
 
@@ -1705,12 +1895,12 @@ mod tests {
             "preserve me\n"
         );
         assert!(
-            ProcessGit
+            ProcessGit::default()
                 .worktree_snapshot(&repository, &managed)
                 .unwrap()
                 .dirty
         );
-        let discovered = ProcessGit.list_worktrees(&repository).unwrap();
+        let discovered = ProcessGit::default().list_worktrees(&repository).unwrap();
         assert!(discovered.iter().any(|item| item.path == managed));
     }
 
@@ -1733,7 +1923,7 @@ mod tests {
         add_linked(&repository, &linked);
 
         assert!(
-            !ProcessGit
+            !ProcessGit::default()
                 .worktree_snapshot(&repository, &linked)
                 .unwrap()
                 .dirty
@@ -1741,7 +1931,7 @@ mod tests {
         std::fs::create_dir(linked.join("ignored")).unwrap();
         std::fs::write(linked.join("ignored/cache"), "must survive\n").unwrap();
         assert!(
-            ProcessGit
+            ProcessGit::default()
                 .worktree_snapshot(&repository, &linked)
                 .unwrap()
                 .dirty
@@ -1771,7 +1961,7 @@ mod tests {
             std::fs::create_dir_all(lock.parent().unwrap()).unwrap();
             std::fs::write(&lock, "").unwrap();
             assert!(
-                ProcessGit
+                ProcessGit::default()
                     .worktree_snapshot(&repository, &linked)
                     .unwrap()
                     .locked,
@@ -1814,7 +2004,7 @@ mod tests {
             ""
         );
         assert!(
-            ProcessGit
+            ProcessGit::default()
                 .worktree_snapshot(&repository, &linked)
                 .unwrap()
                 .locked
@@ -1848,7 +2038,7 @@ mod tests {
         );
 
         assert!(
-            !ProcessGit
+            !ProcessGit::default()
                 .worktree_snapshot(&repository, &linked)
                 .unwrap()
                 .locked,
@@ -1858,7 +2048,7 @@ mod tests {
         // And the two that do mean a paused rebase still do.
         std::fs::create_dir(git_dir.join("rebase-merge")).unwrap();
         assert!(
-            ProcessGit
+            ProcessGit::default()
                 .worktree_snapshot(&repository, &linked)
                 .unwrap()
                 .locked,
@@ -1896,12 +2086,15 @@ mod tests {
         };
 
         assert_eq!(
-            ProcessGit.create_detached(&plan).unwrap_err().code,
+            ProcessGit::default()
+                .create_detached(&plan)
+                .unwrap_err()
+                .code,
             "non-canonical-worktree-path"
         );
         assert!(!external.join("symlink-escape").exists());
         assert!(
-            ProcessGit
+            ProcessGit::default()
                 .list_worktrees(&repository)
                 .unwrap()
                 .iter()
@@ -1918,11 +2111,11 @@ mod tests {
         add_linked(&repository, &linked);
         let primary_head = commit_change(&repository, "two\n", "advance primary");
 
-        let snapshot = ProcessGit.repository_snapshot(&linked).unwrap();
+        let snapshot = ProcessGit::default().repository_snapshot(&linked).unwrap();
         assert_eq!(snapshot.root, std::fs::canonicalize(&repository).unwrap());
         assert_eq!(snapshot.head, primary_head);
         assert_eq!(
-            ProcessGit
+            ProcessGit::default()
                 .worktree_snapshot(&repository, &repository)
                 .unwrap_err()
                 .code,
@@ -1934,7 +2127,7 @@ mod tests {
         let other_linked = temporary.path().join("other-linked");
         add_linked(&other_repository, &other_linked);
         assert_eq!(
-            ProcessGit
+            ProcessGit::default()
                 .worktree_snapshot(&repository, &other_linked)
                 .unwrap_err()
                 .code,
@@ -1955,7 +2148,7 @@ mod tests {
             .join(std::ffi::OsString::from_vec(b"linked-\xff".to_vec()));
         add_linked(&repository, &linked);
 
-        let worktrees = ProcessGit.list_worktrees(&repository).unwrap();
+        let worktrees = ProcessGit::default().list_worktrees(&repository).unwrap();
         assert!(worktrees.iter().any(|item| item.path == linked));
     }
 
@@ -1996,7 +2189,9 @@ mod tests {
             ],
         );
 
-        let recovery_refs = ProcessGit.recovery_refs(&repository, &head).unwrap();
+        let recovery_refs = ProcessGit::default()
+            .recovery_refs(&repository, &head)
+            .unwrap();
         assert_eq!(
             git(
                 &repository,
@@ -2034,11 +2229,15 @@ mod tests {
 
         // Local branches still hold it, even though no remote advertises it.
         assert_eq!(
-            ProcessGit.recovery_refs(&repository, &head).unwrap(),
+            ProcessGit::default()
+                .recovery_refs(&repository, &head)
+                .unwrap(),
             [] as [std::string::String; 0]
         );
         assert_eq!(
-            ProcessGit.containing_refs(&repository, &head).unwrap(),
+            ProcessGit::default()
+                .containing_refs(&repository, &head)
+                .unwrap(),
             Some(vec![
                 "refs/heads/main".to_owned(),
                 "refs/heads/wave/hardening".to_owned(),
@@ -2067,13 +2266,15 @@ mod tests {
             &[OsStr::new("branch"), OsStr::new("-D"), OsStr::new("main")],
         );
         assert_eq!(
-            ProcessGit.containing_refs(&repository, &head).unwrap(),
+            ProcessGit::default()
+                .containing_refs(&repository, &head)
+                .unwrap(),
             Some(Vec::new())
         );
 
         // An id Git holds no object for is reported as absent rather than as an error.
         assert_eq!(
-            ProcessGit
+            ProcessGit::default()
                 .containing_refs(&repository, &"0".repeat(head.len()))
                 .unwrap(),
             None
@@ -2090,12 +2291,146 @@ mod tests {
         std::fs::write(&grafts, format!("{head} {head}\n")).unwrap();
 
         assert_eq!(
-            ProcessGit
+            ProcessGit::default()
                 .containing_refs(&repository, &head)
                 .unwrap_err()
                 .code,
             "git-grafts-present"
         );
+    }
+
+    #[test]
+    fn present_commits_peels_tags_and_leaves_out_blobs_and_unknown_objects() {
+        let (_temporary, repository, _remote) = repository_with_remote();
+        let head = run(&repository, &["rev-parse", "HEAD"]);
+        let message = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(message.path(), "tagged\n").unwrap();
+        run(
+            &repository,
+            &[
+                "tag",
+                "-a",
+                "-F",
+                message.path().to_str().unwrap(),
+                "tagged",
+            ],
+        );
+        let tag = run(&repository, &["rev-parse", "tagged"]);
+        let blob = run(&repository, &["rev-parse", "HEAD:tracked"]);
+        let unknown = "0000000000000000000000000000000000000001".to_owned();
+
+        let present =
+            ProcessGit::present_commits(&repository, [&head, &tag, &blob, &unknown, &head])
+                .unwrap();
+
+        assert_eq!(
+            present,
+            BTreeMap::from([(head.clone(), head.clone()), (tag, head)])
+        );
+    }
+
+    #[test]
+    fn commits_containing_names_the_head_itself_and_its_descendants_only() {
+        let (_temporary, repository) = diverged_feature();
+        let base = run(&repository, &["rev-parse", "main~1"]);
+        let main = run(&repository, &["rev-parse", "main"]);
+        let feature = feature_head(&repository);
+        let first = run(&repository, &["rev-parse", "feature~1"]);
+
+        let containing =
+            ProcessGit::commits_containing(&repository, &first, [&base, &main, &feature, &first])
+                .unwrap();
+
+        assert_eq!(containing, BTreeSet::from([feature.clone(), first]));
+        assert!(
+            ProcessGit::commits_containing(&repository, &main, [&base, &feature])
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn shared_observation_reads_a_remote_once_until_sharing_ends() {
+        let (temporary, repository, remote) = repository_with_remote();
+        let head = run(&repository, &["rev-parse", "HEAD"]);
+        let publisher = temporary.path().join("publisher");
+        git(
+            temporary.path(),
+            &[
+                OsStr::new("clone"),
+                remote.as_os_str(),
+                publisher.as_os_str(),
+            ],
+        );
+        run(
+            &publisher,
+            &["config", "user.email", "test@example.invalid"],
+        );
+        run(&publisher, &["config", "user.name", "Worktree Test"]);
+        let port = ProcessGit::default();
+
+        port.begin_shared_observation();
+        assert_eq!(
+            port.recovery_refs(&repository, &head).unwrap(),
+            vec!["origin:refs/heads/main"]
+        );
+        run(&publisher, &["push", "origin", "HEAD:refs/heads/shared"]);
+        // The remote advertises `shared` now, but the shared observation still holds the
+        // advertisement read before the push.
+        assert_eq!(
+            port.recovery_refs(&repository, &head).unwrap(),
+            vec!["origin:refs/heads/main"]
+        );
+        port.end_shared_observation();
+
+        assert_eq!(
+            port.recovery_refs(&repository, &head).unwrap(),
+            vec!["origin:refs/heads/main", "origin:refs/heads/shared"]
+        );
+    }
+
+    #[test]
+    fn a_fetch_refreshes_the_shared_advertisement() {
+        let (temporary, repository, remote) = repository_with_remote();
+        let head = run(&repository, &["rev-parse", "HEAD"]);
+        let publisher = temporary.path().join("publisher");
+        git(
+            temporary.path(),
+            &[
+                OsStr::new("clone"),
+                remote.as_os_str(),
+                publisher.as_os_str(),
+            ],
+        );
+        run(
+            &publisher,
+            &["config", "user.email", "test@example.invalid"],
+        );
+        run(&publisher, &["config", "user.name", "Worktree Test"]);
+        // Only a commit this repository does not hold advertises `head` from now on.
+        let descendant = commit_change(&publisher, "remote descendant\n", "remote descendant");
+        run(
+            &publisher,
+            &["push", "--force", "origin", "HEAD:refs/heads/main"],
+        );
+        let port = ProcessGit::default();
+
+        port.begin_shared_observation();
+        assert_eq!(
+            port.recovery_refs(&repository, &head).unwrap(),
+            vec!["origin:refs/heads/main"]
+        );
+        assert!(ProcessGit::commitish_exists(&repository, &descendant).unwrap());
+        run(
+            &publisher,
+            &["push", "origin", "HEAD:refs/heads/after-fetch"],
+        );
+        // The advertisement read again after the fetch is the one shared from then on.
+        assert_eq!(
+            port.recovery_refs(&repository, &head).unwrap(),
+            vec!["origin:refs/heads/main"]
+        );
+        port.end_shared_observation();
     }
 
     #[test]
@@ -2122,11 +2457,13 @@ mod tests {
         std::fs::write(&grafts, format!("{remote_tip} {local_head}\n")).unwrap();
 
         assert!(
-            !ProcessGit::contains_commit(&repository, &local_head, &remote_tip).unwrap(),
+            ProcessGit::commits_containing(&repository, &local_head, [&remote_tip])
+                .unwrap()
+                .is_empty(),
             "proof subprocess unexpectedly honored repository grafts"
         );
         assert_eq!(
-            ProcessGit
+            ProcessGit::default()
                 .recovery_refs(&repository, &local_head)
                 .unwrap_err()
                 .code,
@@ -2172,7 +2509,9 @@ mod tests {
         );
 
         assert_eq!(
-            ProcessGit.recovery_refs(&repository, &head).unwrap(),
+            ProcessGit::default()
+                .recovery_refs(&repository, &head)
+                .unwrap(),
             vec!["origin:refs/pull/42/head"]
         );
     }
@@ -2198,7 +2537,9 @@ mod tests {
             .unwrap();
         assert!(!local_tag.status.success());
         assert_eq!(
-            ProcessGit.recovery_refs(&repository, &head).unwrap(),
+            ProcessGit::default()
+                .recovery_refs(&repository, &head)
+                .unwrap(),
             vec!["origin:refs/tags/recovery"]
         );
         let local_tag = Command::new("git")
@@ -2249,7 +2590,7 @@ mod tests {
         assert!(!ProcessGit::commitish_exists(&repository, &remote_tip).unwrap());
 
         assert_eq!(
-            ProcessGit
+            ProcessGit::default()
                 .recovery_refs(&repository, &recoverable_head)
                 .unwrap(),
             vec!["origin:refs/heads/main"]
@@ -2297,10 +2638,14 @@ mod tests {
         let head = feature_head(&repository);
 
         assert_eq!(
-            ProcessGit.recovery_refs(&repository, &head).unwrap(),
+            ProcessGit::default()
+                .recovery_refs(&repository, &head)
+                .unwrap(),
             [] as [std::string::String; 0]
         );
-        let evidence = ProcessGit.recovery_evidence(&repository, &head).unwrap();
+        let evidence = ProcessGit::default()
+            .recovery_evidence(&repository, &head)
+            .unwrap();
         assert_eq!(evidence.kind, RecoveryKind::PatchEquivalent);
         assert_eq!(evidence.refs, vec!["origin:refs/heads/main"]);
         let mut expected = run(&repository, &["rev-list", "main..feature"])
@@ -2319,7 +2664,9 @@ mod tests {
         run(&repository, &["push", "origin", "feature"]);
         let head = feature_head(&repository);
 
-        let evidence = ProcessGit.recovery_evidence(&repository, &head).unwrap();
+        let evidence = ProcessGit::default()
+            .recovery_evidence(&repository, &head)
+            .unwrap();
         assert_eq!(evidence.kind, RecoveryKind::Ancestor);
         assert_eq!(evidence.refs, vec!["origin:refs/heads/feature"]);
         assert_eq!(evidence.equivalent_commits, [] as [std::string::String; 0]);
@@ -2332,7 +2679,9 @@ mod tests {
         run(&repository, &["push", "origin", "main"]);
         let head = feature_head(&repository);
 
-        let evidence = ProcessGit.recovery_evidence(&repository, &head).unwrap();
+        let evidence = ProcessGit::default()
+            .recovery_evidence(&repository, &head)
+            .unwrap();
         assert_eq!(evidence.refs, [] as [std::string::String; 0]);
         assert_eq!(evidence.equivalent_commits, [] as [std::string::String; 0]);
     }
@@ -2376,7 +2725,9 @@ mod tests {
             ),
             ""
         );
-        let evidence = ProcessGit.recovery_evidence(&repository, &head).unwrap();
+        let evidence = ProcessGit::default()
+            .recovery_evidence(&repository, &head)
+            .unwrap();
         assert_eq!(evidence.refs, [] as [std::string::String; 0]);
     }
 
@@ -2400,7 +2751,9 @@ mod tests {
         run(&repository, &["push", "origin", "main"]);
         let head = feature_head(&repository);
 
-        let evidence = ProcessGit.recovery_evidence(&repository, &head).unwrap();
+        let evidence = ProcessGit::default()
+            .recovery_evidence(&repository, &head)
+            .unwrap();
         assert_eq!(evidence.refs, [] as [std::string::String; 0]);
     }
 
@@ -2421,7 +2774,9 @@ mod tests {
         );
         let head = feature_head(&repository);
 
-        let evidence = ProcessGit.recovery_evidence(&repository, &head).unwrap();
+        let evidence = ProcessGit::default()
+            .recovery_evidence(&repository, &head)
+            .unwrap();
         assert_eq!(evidence.refs, [] as [std::string::String; 0]);
     }
 
@@ -2437,7 +2792,9 @@ mod tests {
         run(&repository, &["replace", &remote_tip, &forged]);
         let head = feature_head(&repository);
 
-        let evidence = ProcessGit.recovery_evidence(&repository, &head).unwrap();
+        let evidence = ProcessGit::default()
+            .recovery_evidence(&repository, &head)
+            .unwrap();
         assert_eq!(evidence.refs, [] as [std::string::String; 0]);
     }
 
@@ -2451,7 +2808,7 @@ mod tests {
         let head = feature_head(&repository);
 
         assert_eq!(
-            ProcessGit
+            ProcessGit::default()
                 .recovery_evidence(&repository, &head)
                 .unwrap_err()
                 .code,

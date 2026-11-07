@@ -446,7 +446,10 @@ fn run(cli: &Cli) -> Result<()> {
 fn manager() -> Result<Manager> {
     let registry = SqliteRegistry::open(&registry_path().map_err(anyhow::Error::new)?)
         .map_err(anyhow::Error::new)?;
-    Ok(WorktreeManager::new(ProcessGit, registry, SystemClock).with_archive_root(archive_root()?))
+    Ok(
+        WorktreeManager::new(ProcessGit::default(), registry, SystemClock)
+            .with_archive_root(archive_root()?),
+    )
 }
 
 /// Archives live beside the registry, under `<state home>/worktree/archives`.
@@ -595,7 +598,7 @@ fn sweep(args: &SweepArgs, json: bool) -> Result<()> {
     let policies = if args.all_profiles {
         config.profiles.iter().collect::<Vec<_>>()
     } else {
-        let repository = ProcessGit
+        let repository = ProcessGit::default()
             .repository_snapshot(&args.repo)
             .map_err(anyhow::Error::new)?;
         vec![resolve_policy(&config, &repository.root).map_err(anyhow::Error::new)?]
@@ -712,7 +715,7 @@ fn cache_lines(cache: &b10x_worktree_domain::CacheDiscard) -> String {
 
 fn inspect(args: &InspectArgs, json: bool) -> Result<()> {
     let service = manager()?;
-    let repository = ProcessGit
+    let repository = ProcessGit::default()
         .repository_snapshot(&args.repo)
         .map_err(anyhow::Error::new)?;
     let config =
@@ -822,7 +825,7 @@ fn activate(args: &ActivateArgs, json: bool) -> Result<()> {
 
 fn create(args: &CreateArgs, json: bool) -> Result<()> {
     let service = manager()?;
-    let repository = ProcessGit
+    let repository = ProcessGit::default()
         .repository_snapshot(&args.repo)
         .map_err(anyhow::Error::new)?;
     let config =
@@ -882,7 +885,7 @@ fn gc(args: &GcArgs, json: bool) -> Result<()> {
     if args.apply && args.ids.is_empty() {
         return Err(anyhow!("gc --apply requires at least one reviewed --id"));
     }
-    let repository = ProcessGit
+    let repository = ProcessGit::default()
         .repository_snapshot(&args.repo)
         .map_err(anyhow::Error::new)?;
     let config =
@@ -957,7 +960,7 @@ fn prune_archives(args: &PruneArchivesArgs, json: bool) -> Result<()> {
             ),
         )));
     }
-    let repository = ProcessGit
+    let repository = ProcessGit::default()
         .repository_snapshot(&args.repo)
         .map_err(anyhow::Error::new)?;
     let config =
@@ -1106,7 +1109,7 @@ fn reconcile(args: &ReconcileArgs, json: bool) -> Result<()> {
             "reconcile --apply requires at least one reviewed --id"
         ));
     }
-    let repository = ProcessGit
+    let repository = ProcessGit::default()
         .repository_snapshot(&args.repo)
         .map_err(anyhow::Error::new)?;
     let config =
@@ -1244,7 +1247,7 @@ fn repo(command: &RepoCommand, json: bool) -> Result<()> {
         RepoCommand::List { repo } => {
             let manager = manager()?;
             let records = manager.registry().list().map_err(anyhow::Error::new)?;
-            let discovered = ProcessGit
+            let discovered = ProcessGit::default()
                 .list_worktrees(repo)
                 .map_err(anyhow::Error::new)?;
             let items = discovered
@@ -1288,7 +1291,7 @@ fn repo(command: &RepoCommand, json: bool) -> Result<()> {
             purpose,
             owner,
         } => {
-            let repository = ProcessGit
+            let repository = ProcessGit::default()
                 .repository_snapshot(repo)
                 .map_err(anyhow::Error::new)?;
             let config = load_config(&config_path().map_err(anyhow::Error::new)?)

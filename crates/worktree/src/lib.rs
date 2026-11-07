@@ -65,6 +65,15 @@ pub trait GitPort: Send + Sync {
         self.recovery_refs(repository, head)
             .map(RecoveryEvidence::ancestor)
     }
+    /// Share each remote's advertisement between the recovery observations that follow, until
+    /// [`GitPort::end_shared_observation`]: a repository's remote is read once, and again only
+    /// after objects were fetched from it. For an assessment whose verdict is reviewed and proven
+    /// afresh before any removal; never for the proof immediately before one. The default shares
+    /// nothing.
+    fn begin_shared_observation(&self) {}
+    /// End the sharing [`GitPort::begin_shared_observation`] began; every later observation reads
+    /// its remotes afresh.
+    fn end_shared_observation(&self) {}
     /// Return every local ref - branch, tag, or remote-tracking - that contains the commit.
     ///
     /// Reports `None` when this repository holds no such commit object at all. It reads only
@@ -1299,7 +1308,7 @@ where
         let now = self.clock.now();
         let records = self.registry.list()?;
         validate_selected_records(policy, &records, selected_ids)?;
-        let mut planned = Vec::new();
+        let mut selected = Vec::new();
         for record in records {
             if !record.repository_root.starts_with(&policy.workspace_root)
                 || (!selected_ids.is_empty() && !selected_ids.contains(&record.id))
@@ -1308,25 +1317,33 @@ where
             {
                 continue;
             }
-            if record.lifecycle != Lifecycle::Finished
-                && !(record.lifecycle == Lifecycle::Active
-                    && now.saturating_sub(record.last_seen_at) >= policy.expire_after_seconds)
-            {
-                continue;
+            let candidate = record.lifecycle == Lifecycle::Finished
+                || (record.lifecycle == Lifecycle::Active
+                    && now.saturating_sub(record.last_seen_at) >= policy.expire_after_seconds);
+            // A reviewed id that stopped being a candidate since its dry-run (removed by another
+            // run, or seen again) is reported as retained; the other reviewed ids still proceed.
+            if candidate || apply {
+                selected.push((record, candidate));
             }
-            let assessment = self.assess_cleanup(policy, &record, now);
-            planned.push((record, assessment));
         }
-        if apply {
-            for id in selected_ids {
-                if !planned.iter().any(|(record, _)| record.id == *id) {
-                    return Err(Refusal::new(
+        // One advertisement per repository and remote serves this assessment of every candidate.
+        // A removal proves its tree afresh in `apply_cleanup`, after sharing has ended.
+        self.git.begin_shared_observation();
+        let planned = selected
+            .into_iter()
+            .map(|(record, candidate)| {
+                let assessment = if candidate {
+                    self.assess_cleanup(policy, &record, now)
+                } else {
+                    Err(Refusal::new(
                         "selected-worktree-not-cleanup-candidate",
-                        format!("{} is no longer a cleanup candidate", id.as_str()),
-                    ));
-                }
-            }
-        }
+                        format!("{} is no longer a cleanup candidate", record.id.as_str()),
+                    ))
+                };
+                (record, assessment)
+            })
+            .collect::<Vec<_>>();
+        self.git.end_shared_observation();
 
         let mut assessments = Vec::with_capacity(planned.len());
         for (record, assessment) in planned {
@@ -3324,7 +3341,7 @@ pub fn default_worktree_root(state_home: &Path) -> PathBuf {
 mod tests {
     use super::*;
     use std::collections::{BTreeMap, VecDeque};
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
     use tempfile::{TempDir, tempdir};
 
     struct FixedClock;
@@ -3349,6 +3366,8 @@ mod tests {
         repository_absent: bool,
         /// The archive each hidden-state observation was told it may rely on, in call order.
         hidden_archives: Mutex<Vec<Option<PathBuf>>>,
+        /// Sharing begun and ended, and each recovery proof asked for, in call order.
+        observations: Arc<Mutex<Vec<&'static str>>>,
     }
 
     #[derive(Clone, Copy, PartialEq, Eq)]
@@ -3402,11 +3421,20 @@ mod tests {
         }
 
         fn recovery_refs(&self, _repository: &Path, _head: &str) -> Result<Vec<String>, Refusal> {
+            self.observations.lock().unwrap().push("proof");
             Ok(if self.recoverable {
                 vec!["refs/remotes/origin/main".into()]
             } else {
                 Vec::new()
             })
+        }
+
+        fn begin_shared_observation(&self) {
+            self.observations.lock().unwrap().push("begin");
+        }
+
+        fn end_shared_observation(&self) {
+            self.observations.lock().unwrap().push("end");
         }
 
         fn containing_refs(
@@ -3752,6 +3780,7 @@ mod tests {
             residue_matches: true,
             repository_absent: false,
             hidden_archives: Mutex::new(Vec::new()),
+            observations: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -3883,6 +3912,7 @@ mod tests {
                 residue_matches: true,
                 repository_absent: false,
                 hidden_archives: Mutex::new(Vec::new()),
+                observations: Arc::new(Mutex::new(Vec::new())),
             },
             FakeRegistry {
                 records: Mutex::new(vec![registered.clone()]),
@@ -3949,6 +3979,7 @@ mod tests {
                 residue_matches: true,
                 repository_absent: false,
                 hidden_archives: Mutex::new(Vec::new()),
+                observations: Arc::new(Mutex::new(Vec::new())),
             },
             FakeRegistry {
                 records: Mutex::new(vec![registered.clone()]),
@@ -4980,6 +5011,85 @@ mod tests {
             registered,
             manager,
         )
+    }
+
+    #[test]
+    fn gc_shares_advertisements_while_assessing_and_proves_each_removal_afresh() {
+        let (_temporary, policy, registered, manager) = archive_fixture(false, true, false);
+        let observations = manager.git.observations.clone();
+
+        let assessment = assess_one(&manager, &policy, &registered);
+        assert!(assessment.eligible, "{:?}", assessment.refusal);
+        assert_eq!(*observations.lock().unwrap(), ["begin", "proof", "end"]);
+        observations.lock().unwrap().clear();
+
+        let applied = manager
+            .gc(&policy, std::slice::from_ref(&registered.id), true)
+            .unwrap();
+        assert!(applied[0].evidence.is_some(), "{:?}", applied[0].refusal);
+        assert_eq!(
+            *observations.lock().unwrap(),
+            ["begin", "proof", "end", "proof"]
+        );
+    }
+
+    #[test]
+    fn gc_apply_retains_a_reviewed_id_that_is_no_longer_a_candidate_and_removes_the_rest() {
+        let temporary = tempdir().unwrap();
+        let workspace = temporary.path().join("workspace");
+        let repository = workspace.join("repo");
+        let managed_root = temporary.path().join("managed");
+        let candidate_path = managed_root.join("repo/candidate");
+        let gone_path = managed_root.join("repo/gone");
+        std::fs::create_dir_all(&repository).unwrap();
+        std::fs::create_dir_all(&candidate_path).unwrap();
+        let candidate = named_record(
+            "candidate",
+            repository.clone(),
+            candidate_path.clone(),
+            Lifecycle::Finished,
+        );
+        // Removed by another run between the dry-run and this apply.
+        let gone = named_record("gone", repository.clone(), gone_path, Lifecycle::Removed);
+        let git = FakeGit {
+            snapshots: Mutex::new(BTreeMap::from([(
+                candidate_path.clone(),
+                WorktreeSnapshot {
+                    path: candidate_path.clone(),
+                    head: "abc".into(),
+                    dirty: false,
+                    locked: false,
+                },
+            )])),
+            discovered: Mutex::new(vec![discovered_worktree(&candidate_path, "abc")]),
+            ..fake_git(repository)
+        };
+        let manager = WorktreeManager::new(
+            git,
+            fake_registry(vec![candidate.clone(), gone.clone()]),
+            FixedClock,
+        );
+        let policy = policy(workspace, managed_root);
+
+        let applied = manager
+            .gc(&policy, &[candidate.id.clone(), gone.id.clone()], true)
+            .unwrap();
+        assert_eq!(applied.len(), 2);
+        let removed = applied
+            .iter()
+            .find(|item| item.record.id == candidate.id)
+            .unwrap();
+        assert!(removed.evidence.is_some(), "{:?}", removed.refusal);
+        assert!(!candidate_path.exists());
+        let retained = applied
+            .iter()
+            .find(|item| item.record.id == gone.id)
+            .unwrap();
+        assert_eq!(
+            retained.refusal.as_ref().unwrap().code,
+            "selected-worktree-not-cleanup-candidate"
+        );
+        assert!(retained.evidence.is_none());
     }
 
     fn assess_one(
