@@ -4,7 +4,14 @@ id: story:archive-on-old-git
 kind: story
 status: active
 title: Archive works on Git before 2.42
-revision: 3
+relations:
+- decomposes: epic:open-defects-2026-11
+scope:
+- confidence: cited
+  path: crates/worktree-cli/tests/old_git.rs
+- confidence: cited
+  path: crates/worktree-git/src/archive.rs
+revision: 5
 transitions:
 - {from: "draft", to: "proposed", at: "2026-10-14T06:38:10Z", actor: "human:timo", revision: 2}
 - {from: "proposed", to: "active", at: "2026-10-14T06:38:10Z", actor: "human:timo", revision: 3}
