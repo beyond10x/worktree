@@ -2,9 +2,19 @@
 format: aep.planning-md/3
 id: story:skill-prints-without-out
 kind: story
-status: draft
+status: active
 title: Reading the skill leaves no file in the checkout
-revision: 1
+relations:
+- decomposes: epic:open-defects-2026-11
+scope:
+- confidence: cited
+  path: crates/worktree-cli/src/main.rs
+- confidence: cited
+  path: crates/worktree-cli/tests/skill.rs
+revision: 5
+transitions:
+- {from: "draft", to: "proposed", at: "2026-11-09T21:49:41Z", actor: "human:timo", revision: 2}
+- {from: "proposed", to: "active", at: "2026-11-09T21:49:41Z", actor: "human:timo", revision: 3}
 ---
 ## Outcome
 

@@ -1,0 +1,13 @@
+{
+  "at": "2026-11-09T22:01:21Z",
+  "actor": "human:timo",
+  "artifact": "story:archive-on-old-git",
+  "kind": "story",
+  "revision": 5,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "cargo test --locked -p b10x-worktree-cli --test old_git (on fix/open-defects 6e7f599, fix 69c6af3): old_git: 2 passed, exit 0",
+    "reference": "commit:69c6af3"
+  }
+}

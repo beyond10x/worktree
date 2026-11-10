@@ -376,6 +376,21 @@ pub enum CleanupScope {
     Profile,
 }
 
+/// One finished assessment of a cleanup run, reported as it finishes and before the run ends.
+///
+/// `assessment` is the planning pass's verdict: without apply it is the entry the run returns;
+/// with apply an eligible one is re-assessed before its removal, and the run returns that.
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub struct CleanupProgress<'a> {
+    /// The assessment that just finished.
+    pub assessment: &'a CleanupAssessment,
+    /// How many assessments have finished, this one included.
+    pub done: usize,
+    /// How many assessments the run makes.
+    pub of: usize,
+}
+
 /// One resolved tree reference (`worktree.selection.TreeSelection`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TreeSelection {
@@ -1260,7 +1275,7 @@ where
         apply: bool,
     ) -> Result<Vec<CleanupAssessment>, Refusal> {
         require_canonical_policy(policy)?;
-        self.gc_selected(policy, None, selected_ids, apply)
+        self.gc_selected(policy, None, selected_ids, apply, &mut |_| {})
     }
 
     /// Assess cleanup candidates in `scope` and optionally remove those with fresh recovery proof.
@@ -1277,6 +1292,20 @@ where
         selected_ids: &[WorktreeId],
         apply: bool,
     ) -> Result<Vec<CleanupAssessment>, Refusal> {
+        self.gc_scoped_with_progress(policy, repository, scope, selected_ids, apply, &mut |_| {})
+    }
+
+    /// [`Self::gc_scoped`], calling `progress` once per assessment as soon as it finishes, in
+    /// the order of the returned assessments, before the next assessment starts.
+    pub fn gc_scoped_with_progress(
+        &self,
+        policy: &WorkspacePolicy,
+        repository: &Path,
+        scope: CleanupScope,
+        selected_ids: &[WorktreeId],
+        apply: bool,
+        progress: &mut dyn FnMut(CleanupProgress<'_>),
+    ) -> Result<Vec<CleanupAssessment>, Refusal> {
         require_canonical_policy(policy)?;
         let repository = match scope {
             CleanupScope::Profile => None,
@@ -1289,7 +1318,7 @@ where
                 })?)
             }
         };
-        self.gc_selected(policy, repository.as_deref(), selected_ids, apply)
+        self.gc_selected(policy, repository.as_deref(), selected_ids, apply, progress)
     }
 
     fn gc_selected(
@@ -1298,6 +1327,7 @@ where
         repository: Option<&Path>,
         selected_ids: &[WorktreeId],
         apply: bool,
+        progress: &mut dyn FnMut(CleanupProgress<'_>),
     ) -> Result<Vec<CleanupAssessment>, Refusal> {
         if apply && selected_ids.is_empty() {
             return Err(Refusal::new(
@@ -1328,44 +1358,54 @@ where
         }
         // One advertisement per repository and remote serves this assessment of every candidate.
         // A removal proves its tree afresh in `apply_cleanup`, after sharing has ended.
+        // Each verdict is reported as it finishes, so a caller stopped early keeps those made.
         self.git.begin_shared_observation();
-        let planned = selected
-            .into_iter()
-            .map(|(record, candidate)| {
-                let assessment = if candidate {
-                    self.assess_cleanup(policy, &record, now)
-                } else {
-                    Err(Refusal::new(
-                        "selected-worktree-not-cleanup-candidate",
-                        format!("{} is no longer a cleanup candidate", record.id.as_str()),
-                    ))
-                };
-                (record, assessment)
-            })
-            .collect::<Vec<_>>();
-        self.git.end_shared_observation();
-
-        let mut assessments = Vec::with_capacity(planned.len());
-        for (record, assessment) in planned {
-            match assessment {
-                Ok(proof) if !apply => assessments.push(CleanupAssessment {
+        let of = selected.len();
+        let mut planned = Vec::with_capacity(of);
+        for (index, (record, candidate)) in selected.into_iter().enumerate() {
+            let verdict = if candidate {
+                self.assess_cleanup(policy, &record, now)
+            } else {
+                Err(Refusal::new(
+                    "selected-worktree-not-cleanup-candidate",
+                    format!("{} is no longer a cleanup candidate", record.id.as_str()),
+                ))
+            };
+            let assessment = match verdict {
+                Ok(proof) => CleanupAssessment {
                     record,
                     eligible: true,
                     refusal: None,
                     evidence: None,
                     archive: proof.archive.map(|reference| reference.path),
-                }),
-                Ok(_) => assessments.push(self.apply_cleanup(policy, record)),
-                Err(refusal) => assessments.push(CleanupAssessment {
+                },
+                Err(refusal) => CleanupAssessment {
                     record,
                     eligible: false,
                     refusal: Some(refusal),
                     evidence: None,
                     archive: None,
-                }),
-            }
+                },
+            };
+            progress(CleanupProgress {
+                assessment: &assessment,
+                done: index + 1,
+                of,
+            });
+            planned.push(assessment);
         }
-        Ok(assessments)
+        self.git.end_shared_observation();
+
+        Ok(planned
+            .into_iter()
+            .map(|assessment| {
+                if apply && assessment.eligible {
+                    self.apply_cleanup(policy, assessment.record)
+                } else {
+                    assessment
+                }
+            })
+            .collect())
     }
 
     /// Claim, re-assess and remove one reviewed cleanup candidate.
@@ -5030,6 +5070,77 @@ mod tests {
         assert_eq!(
             *observations.lock().unwrap(),
             ["begin", "proof", "end", "proof"]
+        );
+    }
+
+    #[test]
+    fn gc_reports_each_assessment_before_the_next_one_starts() {
+        let temporary = tempdir().unwrap();
+        let workspace = temporary.path().join("workspace");
+        let repository = workspace.join("repo");
+        let managed_root = temporary.path().join("managed");
+        std::fs::create_dir_all(&repository).unwrap();
+        let mut records = Vec::new();
+        let mut snapshots = BTreeMap::new();
+        let mut discovered = Vec::new();
+        for name in ["first", "second"] {
+            let path = managed_root.join("repo").join(name);
+            std::fs::create_dir_all(&path).unwrap();
+            records.push(named_record(
+                name,
+                repository.clone(),
+                path.clone(),
+                Lifecycle::Finished,
+            ));
+            snapshots.insert(
+                path.clone(),
+                WorktreeSnapshot {
+                    path: path.clone(),
+                    head: "abc".into(),
+                    dirty: false,
+                    locked: false,
+                },
+            );
+            discovered.push(discovered_worktree(&path, "abc"));
+        }
+        let git = FakeGit {
+            snapshots: Mutex::new(snapshots),
+            discovered: Mutex::new(discovered),
+            ..fake_git(repository.clone())
+        };
+        let observations = git.observations.clone();
+        let manager = WorktreeManager::new(git, fake_registry(records), FixedClock);
+        let policy = policy(workspace, managed_root);
+
+        let mut reported = Vec::new();
+        let assessments = manager
+            .gc_scoped_with_progress(
+                &policy,
+                &repository,
+                CleanupScope::Profile,
+                &[],
+                false,
+                &mut |progress| {
+                    observations.lock().unwrap().push("report");
+                    reported.push((progress.assessment.clone(), progress.done, progress.of));
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            *manager.git.observations.lock().unwrap(),
+            ["begin", "proof", "report", "proof", "report", "end"]
+        );
+        assert_eq!(assessments.len(), 2);
+        assert!(assessments.iter().all(|item| item.eligible));
+        assert_eq!(
+            reported,
+            assessments
+                .iter()
+                .cloned()
+                .enumerate()
+                .map(|(index, item)| (item, index + 1, 2))
+                .collect::<Vec<_>>()
         );
     }
 

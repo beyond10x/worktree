@@ -2,8 +2,8 @@
 
 use anyhow::{Context, Result, anyhow};
 use b10x_worktree::{
-    CleanupScope, GitPort, ReadinessFailure, ReadinessObservation, RegistryPort, SystemClock,
-    WorktreeManager, readiness_failures,
+    CleanupProgress, CleanupScope, GitPort, ReadinessFailure, ReadinessObservation, RegistryPort,
+    SystemClock, WorktreeManager, readiness_failures,
 };
 use b10x_worktree_domain::{
     CLI_PROTOCOL_VERSION, CreateRequest, GitRevision, HOOK_PROTOCOL_VERSION,
@@ -881,6 +881,53 @@ fn status(json: bool) -> Result<()> {
     )
 }
 
+/// One line on standard error per finished assessment, flushed at once; standard output keeps
+/// the protocol envelope. A failed write never fails the run.
+fn report_gc_progress(json: bool, progress: CleanupProgress<'_>) {
+    let assessment = progress.assessment;
+    let line = if json {
+        let mut value = serde_json::json!({
+            "progress": "gc-assessment",
+            "id": assessment.record.id,
+            "eligible": assessment.eligible,
+            "done": progress.done,
+            "of": progress.of,
+        });
+        if let Some(refusal) = &assessment.refusal {
+            value["code"] = refusal.code.as_str().into();
+        }
+        value.to_string()
+    } else {
+        let outcome = assessment.refusal.as_ref().map_or_else(
+            || "eligible".to_owned(),
+            |refusal| format!("retained: {refusal}"),
+        );
+        let outcome = match &assessment.archive {
+            Some(archive) => format!("{outcome} (archive {})", archive.display()),
+            None => outcome,
+        };
+        // A refusal quotes Git's output and tree content: every control character in it is
+        // escaped, so it can neither split the line nor drive the terminal.
+        let outcome: String = outcome
+            .chars()
+            .flat_map(|c| {
+                let escaped: Vec<char> = if c.is_control() {
+                    c.escape_default().collect()
+                } else {
+                    vec![c]
+                };
+                escaped
+            })
+            .collect();
+        format!(
+            "assessed {}/{} {}\t{outcome}",
+            progress.done, progress.of, assessment.record.id
+        )
+    };
+    let mut stderr = std::io::stderr().lock();
+    let _ = writeln!(stderr, "{line}").and_then(|()| stderr.flush());
+}
+
 fn gc(args: &GcArgs, json: bool) -> Result<()> {
     if args.apply && args.ids.is_empty() {
         return Err(anyhow!("gc --apply requires at least one reviewed --id"));
@@ -896,12 +943,13 @@ fn gc(args: &GcArgs, json: bool) -> Result<()> {
         .resolve_references(&args.ids, Some(policy))
         .map_err(anyhow::Error::new)?;
     let assessments = service
-        .gc_scoped(
+        .gc_scoped_with_progress(
             policy,
             &repository.root,
             args.scope.into(),
             &ids,
             args.apply,
+            &mut |progress| report_gc_progress(json, progress),
         )
         .map_err(anyhow::Error::new)?;
     emit_success(
