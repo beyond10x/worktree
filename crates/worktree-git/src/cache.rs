@@ -131,6 +131,24 @@ impl KeepSnapshot {
                 .any(|ancestor| self.kept.contains(ancestor))
     }
 
+    /// Whether a keep pattern could match a path too long for Git to list ([`GIT_PATH_LIMIT`]):
+    /// a line that floats (no `/` but a trailing one) or holds `**`. Any other pattern is anchored
+    /// and names one path per component it has, so what it keeps is short enough for Git to list.
+    /// A comment, a blank line and a negation keep nothing.
+    fn may_keep_beyond_git(&self) -> bool {
+        self.invalid.is_some()
+            || self.contents.values().any(|text| {
+                text.split(|byte| *byte == b'\n').any(|line| {
+                    let line = line.trim_ascii();
+                    if line.is_empty() || line.starts_with(b"#") || line.starts_with(b"!") {
+                        return false;
+                    }
+                    let line = line.strip_suffix(b"/").unwrap_or(line);
+                    !line.contains(&b'/') || line.windows(2).any(|pair| pair == b"**")
+                })
+            })
+    }
+
     /// Whether a kept path lies strictly below `relative`.
     fn holds_kept(&self, relative: &Path) -> bool {
         self.invalid.is_some()
@@ -362,6 +380,13 @@ impl Guard {
                     return true;
                 }
                 let child = current.child(&entry.file_name());
+                // Past what Git can name, no keep pattern was asked about the entry: with any
+                // keep file in the tree it may be kept, and a keep file there keeps its directory.
+                if child.beyond_git()
+                    && (self.keep.may_keep_beyond_git() || entry.file_name() == KEEP_FILE)
+                {
+                    return true;
+                }
                 let Ok(metadata) = std::fs::symlink_metadata(&child.address) else {
                     return true;
                 };
@@ -413,6 +438,10 @@ impl Guard {
 /// address of one of its entries still resolve.
 const ANCHOR_BEYOND: usize = 1024;
 
+/// The shortest path Git cannot name (`PATH_MAX` on Linux): Git's exclude engine lists nothing
+/// at or past it, so no keep pattern's verdict on such a path is known.
+const GIT_PATH_LIMIT: usize = 4096;
+
 /// A directory as the walks below a tree reach it: by its path, or, where that path would grow
 /// past `PATH_MAX`, by a path relative to a directory held open, so a tree a test nested deeper
 /// than any path can name (`ENAMETOOLONG`) is still walked to its end. Where no directory can
@@ -423,14 +452,23 @@ struct Place {
     address: PathBuf,
     /// The open directory `address` starts at, kept open while a place below it is pending.
     anchor: Option<Rc<std::fs::File>>,
+    /// The length in bytes of the directory's own path, whatever `address` is.
+    length: usize,
 }
 
 impl Place {
     fn at(path: PathBuf) -> Self {
         Self {
+            length: path.as_os_str().len(),
             address: path,
             anchor: None,
         }
+    }
+
+    /// Whether this place's own path is too long for Git to name (`PATH_MAX`), so Git's exclude
+    /// engine never lists it and a keep pattern's verdict on it is unknown.
+    fn beyond_git(&self) -> bool {
+        self.length >= GIT_PATH_LIMIT
     }
 
     /// This place, addressed through itself held open once its address is longer than
@@ -444,6 +482,7 @@ impl Place {
             Some((file, address)) => Self {
                 address,
                 anchor: Some(Rc::new(file)),
+                length: self.length,
             },
             None => self,
         }
@@ -454,6 +493,7 @@ impl Place {
         Self {
             address: self.address.join(name),
             anchor: self.anchor.clone(),
+            length: self.length + 1 + name.len(),
         }
     }
 }

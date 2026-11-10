@@ -167,7 +167,10 @@ independent policy: every decision must come from the public façade.
   read, so a bind mount from the same filesystem counts), sits on another device than the tree
   root, or cannot be read (a directory whose names cannot be listed, a regular file this user
   cannot open). A directory holding any of those at any depth, found by one walk that follows no
-  symbolic link, is never deleted whole: each of its direct entries is classified by the same rule. Everything
+  symbolic link, is never deleted whole: each of its direct entries is classified by the same rule.
+  The walk reaches entries past `PATH_MAX` through directories held open; Git lists none of them,
+  so such an entry counts as kept when it is a keep file or when any keep file holds a pattern
+  that floats (no `/` but a trailing one) or holds `**`. Everything
   else is discarded; a symbolic link is deleted itself and never followed, and no deletion leaves
   the tree. The structural rules name what they recognise: a Cargo profile holding
   `.fingerprint/` inside a validly tagged target, a whole target of nothing but Cargo's layout,
