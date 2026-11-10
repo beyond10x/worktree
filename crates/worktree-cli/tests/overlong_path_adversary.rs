@@ -11,10 +11,6 @@ const TAG: &str =
 /// The longest path the kernel resolves in one call, the terminating NUL included.
 const PATH_MAX: usize = 4096;
 
-/// The issue's shape: 1100 levels of `d/` in each half of the over-long chain. One half stays
-/// addressable below a temporary directory, two do not.
-const NARROW: (&str, usize) = ("d", 1100);
-
 /// The same length in few levels: 11 names of 200 bytes in each half. Splitting a chain down to
 /// a retained entry costs more than its depth squared, so the case that splits uses this one.
 const WIDE: (&str, usize) = (
@@ -169,16 +165,6 @@ impl Fixture {
         serde_json::from_slice(&output.stdout).unwrap()
     }
 
-    fn refused(&self, args: &[&str]) -> Value {
-        let output = self.command(args);
-        assert!(
-            !output.status.success(),
-            "expected a refusal from {args:?}: {}",
-            String::from_utf8_lossy(&output.stdout)
-        );
-        serde_json::from_slice(&output.stderr).unwrap()
-    }
-
     fn tree_str(&self) -> &str {
         self.tree.to_str().unwrap()
     }
@@ -236,22 +222,6 @@ impl Fixture {
     }
 }
 
-fn paths(cache: &Value, field: &str) -> Vec<String> {
-    cache[field]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|entry| {
-            entry
-                .get("path")
-                .unwrap_or(entry)
-                .as_str()
-                .unwrap()
-                .to_owned()
-        })
-        .collect()
-}
-
 /// `(path, kind)` of every discarded entry.
 fn discarded(cache: &Value) -> Vec<(String, String)> {
     cache["discarded"]
@@ -266,18 +236,6 @@ fn discarded(cache: &Value) -> Vec<(String, String)> {
         })
         .collect()
 }
-
-fn pairs(expected: &[(&str, &str)]) -> Vec<(String, String)> {
-    expected
-        .iter()
-        .map(|(path, kind)| ((*path).to_owned(), (*kind).to_owned()))
-        .collect()
-}
-
-/// The defect of GitHub #44: the keep-file lookup inside the fixture met `ENAMETOOLONG` and
-/// refused the whole discard as `keep-file-invalid`. The target holds nothing but a profile and
-/// scratch, so it is disposable whole, the profile with it; the deletion follows no symbolic
-/// link out of the tree.
 
 /// Run `finish --discard-cache --archive` and then `gc --apply`; either may refuse. Returns
 /// whether the tree still exists afterwards.

@@ -2,7 +2,7 @@
 format: aep.planning-md/3
 id: story:discard-cache-survives-overlong-paths
 kind: story
-status: active
+status: implemented
 title: discard-cache does not refuse on a path longer than PATH_MAX below target/tmp
 refs:
 - provider: github
@@ -14,10 +14,11 @@ scope:
   path: crates/worktree-cli/tests/overlong_path.rs
 - confidence: cited
   path: crates/worktree-git/src/cache.rs
-revision: 6
+revision: 7
 transitions:
 - {from: "draft", to: "proposed", at: "2026-11-09T21:49:41Z", actor: "human:timo", revision: 2}
 - {from: "proposed", to: "active", at: "2026-11-09T21:49:41Z", actor: "human:timo", revision: 3}
+- {from: "active", to: "implemented", at: "2026-11-10T01:57:57Z", actor: "human:timo", revision: 7, decided_on: {"recorded":{"test_result":1}}}
 ---
 ## Defect (GitHub #44, observed on 0.19.0)
 

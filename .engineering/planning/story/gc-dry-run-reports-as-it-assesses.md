@@ -2,7 +2,7 @@
 format: aep.planning-md/3
 id: story:gc-dry-run-reports-as-it-assesses
 kind: story
-status: active
+status: implemented
 title: gc --dry-run reports each assessment as it finishes
 refs:
 - provider: github
@@ -20,10 +20,11 @@ scope:
   path: crates/worktree-state/src/lib.rs
 - confidence: cited
   path: crates/worktree/src/lib.rs
-revision: 9
+revision: 10
 transitions:
 - {from: "draft", to: "proposed", at: "2026-11-09T21:49:41Z", actor: "human:timo", revision: 2}
 - {from: "proposed", to: "active", at: "2026-11-09T21:49:41Z", actor: "human:timo", revision: 3}
+- {from: "active", to: "implemented", at: "2026-11-10T01:57:58Z", actor: "human:timo", revision: 10, decided_on: {"recorded":{"test_result":1}}}
 ---
 ## Defect (GitHub #45, observed on 0.19.0)
 

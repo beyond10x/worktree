@@ -1,0 +1,13 @@
+{
+  "at": "2026-11-10T01:57:57Z",
+  "actor": "human:timo",
+  "artifact": "story:discard-cache-survives-overlong-paths",
+  "kind": "story",
+  "revision": 6,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "task check 2026-11-10 on integrate/worktree-0-20-0 at 6979e67 plus the 0.20.0 bump: fmt, clippy -D warnings, 445 tests passed, exit 0; adversary finding fixed with its red-first test",
+    "reference": "commit:6979e67"
+  }
+}

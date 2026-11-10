@@ -61,8 +61,8 @@ Build directory: `target/` inside each tree. Scratch: `<session scratch>/worktre
 |---|---|---|---|---|
 | integration | `open-defects-integration` | `fix/open-defects` | open | |
 | `archive-on-old-git` | (integration) | | wave 1, verification | |
-| `discard-cache-survives-overlong-paths` | `open-defects-u44` | `impl/discard-cache-survives-overlong-paths` | wave 1, planned | |
-| `gc-dry-run-reports-as-it-assesses` | `open-defects-u45` | `impl/gc-dry-run-reports-as-it-assesses` | wave 1, planned | |
+| `discard-cache-survives-overlong-paths` | `open-defects-u44` | `impl/discard-cache-survives-overlong-paths` | wave 1, implemented | |
+| `gc-dry-run-reports-as-it-assesses` | `open-defects-u45` | `impl/gc-dry-run-reports-as-it-assesses` | wave 1, implemented | |
 | `rebase-head-is-not-a-lock` | `open-defects-rebase` | `impl/rebase-head-is-not-a-lock` | wave 2, planned | |
 | `skill-prints-without-out` | (integration) | | wave 3, verification | |
 | `strip-dry-run-is-fast` | `open-defects-strip` | `impl/strip-dry-run-is-fast` | wave 4, planned | |
@@ -77,6 +77,13 @@ Stopped 2026-11-09 by operator correction (the goal applies to another repositor
 request, no merge, no issue closed. `story:archive-on-old-git` has its `test_result` recorded and
 stays `active`. Units #44 and #45 are committed on their `impl/` branches, not yet attacked by an
 adversary and not merged. Waves 2 to 4 were not started.
+
+Resumed 2026-11-10 for release 0.20.0: both units were merged onto `integrate/worktree-0-20-0`
+with the plan branch and attacked by one adversary each. #45: the plain progress line let control
+characters from tree content reach the terminal; fixed, `gc_progress_adversary.rs`. #44: the
+re-anchored walk deleted a path past `PATH_MAX` that a floating keep pattern names, because Git
+cannot list it as kept; fixed, `overlong_path_adversary.rs`. Both stories implemented; waves 2 to
+4 remain unstarted.
 
 ### Wave 2 of 4
 

@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.20.0 — 2026-11-10
+
+- `gc` reports each assessment on standard error as it finishes, so a long dry run no longer
+  looks hung: `assessed <n>/<of> <id>` with the verdict, or with `--json` one
+  `{"progress":"gc-assessment",...}` object per line. Standard output and the protocol 4
+  envelope are unchanged. Control characters a refusal quotes from tree content are escaped in
+  the plain line. The library adds a `gc` variant that calls back once per finished assessment.
+- `discard-cache` no longer refuses a whole tree as `keep-file-invalid` when a test left a path
+  longer than `PATH_MAX` below `target/tmp`. Its walks reach such paths through directories held
+  open and discard them. Git cannot list a path that long, so where a keep file holds a pattern
+  that could match at any depth (no `/` but a trailing one, or `**`), a directory holding such a
+  path is kept rather than deleted whole.
+
 ## 0.19.4 — 2026-11-07
 
 - Removing an archived dirty tree that holds an uninitialised submodule no longer refuses as
