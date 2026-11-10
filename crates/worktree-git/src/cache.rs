@@ -30,6 +30,7 @@ use std::ffi::{OsStr, OsString};
 use std::io::Read as _;
 use std::ops::Bound;
 use std::path::{Component, Path, PathBuf};
+use std::rc::Rc;
 
 /// Classified ignored entries, relative to the tree root.
 #[derive(Default)]
@@ -347,9 +348,10 @@ impl Guard {
         if git_directory(&directory) || self.mounts.at_or_below(&directory) {
             return true;
         }
-        let mut pending = vec![directory];
+        let mut pending = vec![Place::at(directory)];
         while let Some(current) = pending.pop() {
-            let Ok(entries) = std::fs::read_dir(&current) else {
+            let current = current.anchored();
+            let Ok(entries) = std::fs::read_dir(&current.address) else {
                 return true;
             };
             for entry in entries {
@@ -359,18 +361,18 @@ impl Guard {
                 if entry.file_name() == GIT_ENTRY {
                     return true;
                 }
-                let path = entry.path();
-                let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+                let child = current.child(&entry.file_name());
+                let Ok(metadata) = std::fs::symlink_metadata(&child.address) else {
                     return true;
                 };
-                if self.foreign_device(&metadata) || !readable(&path, &metadata) {
+                if self.foreign_device(&metadata) || !readable(&child.address, &metadata) {
                     return true;
                 }
                 if metadata.is_dir() {
-                    if git_directory(&path) {
+                    if git_directory(&child.address) {
                         return true;
                     }
-                    pending.push(path);
+                    pending.push(child);
                 }
             }
         }
@@ -404,6 +406,79 @@ impl Guard {
             Observed::Directory => self.holds_protected(worktree, relative),
         })
     }
+}
+
+/// The longest address a walk reads a directory at before it re-anchors ([`Place::anchored`]):
+/// far enough below `PATH_MAX` (4096 bytes on Linux) that a name and a marker joined to the
+/// address of one of its entries still resolve.
+const ANCHOR_BEYOND: usize = 1024;
+
+/// A directory as the walks below a tree reach it: by its path, or, where that path would grow
+/// past `PATH_MAX`, by a path relative to a directory held open, so a tree a test nested deeper
+/// than any path can name (`ENAMETOOLONG`) is still walked to its end. Where no directory can
+/// be held open the address stays the path, which then fails as it always did, and the caller
+/// treats the place as one it cannot read.
+struct Place {
+    /// What names the directory in a call: its path, or `/proc/self/fd/<n>/<names>`.
+    address: PathBuf,
+    /// The open directory `address` starts at, kept open while a place below it is pending.
+    anchor: Option<Rc<std::fs::File>>,
+}
+
+impl Place {
+    fn at(path: PathBuf) -> Self {
+        Self {
+            address: path,
+            anchor: None,
+        }
+    }
+
+    /// This place, addressed through itself held open once its address is longer than
+    /// [`ANCHOR_BEYOND`]: called once before its entries are read, so each entry's address is
+    /// short again. A walk keeps one directory open per [`ANCHOR_BEYOND`] bytes of depth.
+    fn anchored(self) -> Self {
+        if self.address.as_os_str().len() <= ANCHOR_BEYOND {
+            return self;
+        }
+        match open_real_directory(&self.address) {
+            Some((file, address)) => Self {
+                address,
+                anchor: Some(Rc::new(file)),
+            },
+            None => self,
+        }
+    }
+
+    /// The entry `name` of this directory.
+    fn child(&self, name: &OsStr) -> Self {
+        Self {
+            address: self.address.join(name),
+            anchor: self.anchor.clone(),
+        }
+    }
+}
+
+/// The real directory at `path` held open, with the path that names it through the open
+/// descriptor. The open follows a symbolic link, so the opened directory must be the very one
+/// (device and inode) `path` names without following one: a link put there in between is not
+/// entered.
+#[cfg(target_os = "linux")]
+fn open_real_directory(path: &Path) -> Option<(std::fs::File, PathBuf)> {
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::fs::MetadataExt as _;
+    let seen = std::fs::symlink_metadata(path)
+        .ok()
+        .filter(std::fs::Metadata::is_dir)?;
+    let file = std::fs::File::open(path).ok()?;
+    let opened = file.metadata().ok()?;
+    let same = opened.is_dir() && opened.dev() == seen.dev() && opened.ino() == seen.ino();
+    let address = PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()));
+    same.then_some((file, address))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn open_real_directory(_path: &Path) -> Option<(std::fs::File, PathBuf)> {
+    None
 }
 
 /// Whether this process can read the entry: a regular file it cannot open is not, and every
@@ -441,23 +516,27 @@ fn device(_metadata: &std::fs::Metadata) -> Option<u64> {
 fn keep_files(worktree: &Path, scope: Option<&Path>) -> Result<KeepFiles, Refusal> {
     let start = scope.unwrap_or(Path::new(""));
     let mut files = keep_files_above(worktree, start)?;
-    let mut pending = vec![start.to_path_buf()];
-    while let Some(directory) = pending.pop() {
-        let path = worktree.join(&directory);
-        match std::fs::symlink_metadata(&path) {
+    let mut pending = vec![(start.to_path_buf(), Place::at(worktree.join(start)))];
+    while let Some((directory, place)) = pending.pop() {
+        match std::fs::symlink_metadata(&place.address) {
             Ok(metadata) if metadata.is_dir() => {}
             _ => continue,
         }
-        if !directory.as_os_str().is_empty() && repository(&path) {
+        let place = place.anchored();
+        if !directory.as_os_str().is_empty() && repository(&place.address) {
             continue;
         }
-        collect_keep_file(worktree, &directory, &mut files)?;
-        let Ok(entries) = std::fs::read_dir(&path) else {
+        let relative = directory.join(KEEP_FILE);
+        if let Some(bytes) = keep_file(&place.address.join(KEEP_FILE), &worktree.join(&relative))? {
+            files.insert(relative, bytes);
+        }
+        let Ok(entries) = std::fs::read_dir(&place.address) else {
             continue;
         };
         for entry in entries.flatten() {
-            if entry.file_name() != GIT_ENTRY && entry.file_type().is_ok_and(|kind| kind.is_dir()) {
-                pending.push(directory.join(entry.file_name()));
+            let name = entry.file_name();
+            if name != GIT_ENTRY && entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                pending.push((directory.join(&name), place.child(&name)));
             }
         }
     }
@@ -480,28 +559,32 @@ fn collect_keep_file(
     files: &mut KeepFiles,
 ) -> Result<(), Refusal> {
     let relative = directory.join(KEEP_FILE);
-    if let Some(bytes) = keep_file(&worktree.join(&relative))? {
+    let path = worktree.join(&relative);
+    if let Some(bytes) = keep_file(&path, &path)? {
         files.insert(relative, bytes);
     }
     Ok(())
 }
 
-/// The keep file at `path` (`<directory>/.worktreekeep`): its bytes, or `None` when it is
-/// absent; a symbolic link, a directory, any other non-regular file or one that cannot be read
-/// refuses as `keep-file-invalid`.
-fn keep_file(path: &Path) -> Result<Option<Vec<u8>>, Refusal> {
+/// The keep file at `path` (`<directory>/.worktreekeep`, named `named` in a refusal): its bytes,
+/// or `None` when it is absent; a symbolic link, a directory, any other non-regular file or one
+/// that cannot be read refuses as `keep-file-invalid`. A place too deep for `path` to name
+/// (`ENAMETOOLONG`) holds no keep file this lookup can read and is no invalid one: the walk
+/// before a deletion ([`Guard::holds_protected`]) retains whatever it cannot reach either.
+fn keep_file(path: &Path, named: &Path) -> Result<Option<Vec<u8>>, Refusal> {
     let invalid = |reason: &dyn std::fmt::Display| {
         Refusal::new(
             "keep-file-invalid",
             format!(
                 "{} {reason}; it must be a regular file of Git exclude patterns, and nothing was \
                  deleted",
-                path.display()
+                named.display()
             ),
         )
     };
     match std::fs::symlink_metadata(path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::InvalidFilename => Ok(None),
         Err(error) => Err(invalid(&format_args!("cannot be read: {error}"))),
         Ok(metadata) if metadata.is_symlink() => Err(invalid(&"is a symbolic link")),
         Ok(metadata) if metadata.is_dir() => Err(invalid(&"is a directory")),
@@ -1423,8 +1506,64 @@ fn remove(worktree: &Path, relative: &Path, kind: CacheKind) -> Result<(), Refus
         }
         return Err(changed("is no longer a directory"));
     }
-    crate::make_directories_owner_writable(&path)?;
+    make_directories_owner_writable(&path)?;
     std::fs::remove_dir_all(&path).map_err(failed)
+}
+
+/// Make every directory at and below `root` that this user owns on the root's device writable
+/// by its owner, so its entries can be deleted: [`crate::make_directories_owner_writable`],
+/// reaching directories nested past `PATH_MAX` through a [`Place`].
+#[cfg(unix)]
+fn make_directories_owner_writable(root: &Path) -> Result<(), Refusal> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    let failed = |path: &Path, error: std::io::Error| {
+        Refusal::new(
+            "worktree-permission-repair-failed",
+            format!("{}: {error}", path.display()),
+        )
+    };
+    let root_metadata = std::fs::symlink_metadata(root).map_err(|error| failed(root, error))?;
+    if !root_metadata.is_dir() {
+        return Ok(());
+    }
+    let (device, owner) = (root_metadata.dev(), root_metadata.uid());
+    let mut pending = vec![(root.to_path_buf(), Place::at(root.to_path_buf()))];
+    while let Some((directory, place)) = pending.pop() {
+        let metadata =
+            std::fs::symlink_metadata(&place.address).map_err(|error| failed(&directory, error))?;
+        if !metadata.is_dir() || metadata.dev() != device || metadata.uid() != owner {
+            continue;
+        }
+        let mode = metadata.permissions().mode();
+        if mode & 0o700 != 0o700 {
+            std::fs::set_permissions(
+                &place.address,
+                std::fs::Permissions::from_mode(mode | 0o700),
+            )
+            .map_err(|error| failed(&directory, error))?;
+        }
+        let place = place.anchored();
+        let entries =
+            std::fs::read_dir(&place.address).map_err(|error| failed(&directory, error))?;
+        for entry in entries {
+            let entry = entry.map_err(|error| failed(&directory, error))?;
+            let name = entry.file_name();
+            if entry
+                .file_type()
+                .map_err(|error| failed(&directory.join(&name), error))?
+                .is_dir()
+            {
+                pending.push((directory.join(&name), place.child(&name)));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn make_directories_owner_writable(root: &Path) -> Result<(), Refusal> {
+    crate::make_directories_owner_writable(root)
 }
 
 fn in_use(worktree: &Path, users: &[(u32, String)]) -> Refusal {
@@ -1873,6 +2012,18 @@ mod tests {
         git(&tree.join("fixture"), &["init", "-q"]);
         std::fs::write(tree.join("fixture").join(KEEP_FILE), "everything\n").unwrap();
         assert!(keep_files(tree, None).unwrap().is_empty());
+    }
+
+    /// A place too deep to name (`ENAMETOOLONG`) holds no keep file a path can read: it is not an
+    /// invalid keep file, and the lookup above an over-long path does not refuse.
+    #[test]
+    fn a_keep_file_place_that_cannot_be_named_is_not_invalid() {
+        let root = tempfile::tempdir().unwrap();
+        let deep: PathBuf = std::iter::repeat_n("d", 3000).collect();
+        assert_eq!(
+            keep_files_above(root.path(), &deep.join("leaf")).map_err(|refusal| refusal.code),
+            Ok(KeepFiles::new())
+        );
     }
 
     /// A deletion never leaves the tree: a planned path below a directory that became a symbolic
