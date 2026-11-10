@@ -906,12 +906,23 @@ fn report_gc_progress(json: bool, progress: CleanupProgress<'_>) {
             Some(archive) => format!("{outcome} (archive {})", archive.display()),
             None => outcome,
         };
-        // A refusal quoting Git's own output must not split the line.
+        // A refusal quotes Git's output and tree content: every control character in it is
+        // escaped, so it can neither split the line nor drive the terminal.
+        let outcome: String = outcome
+            .chars()
+            .flat_map(|c| {
+                let escaped: Vec<char> = if c.is_control() {
+                    c.escape_default().collect()
+                } else {
+                    vec![c]
+                };
+                escaped
+            })
+            .collect();
         format!(
             "assessed {}/{} {}\t{outcome}",
             progress.done, progress.of, assessment.record.id
         )
-        .replace(['\n', '\r'], " ")
     };
     let mut stderr = std::io::stderr().lock();
     let _ = writeln!(stderr, "{line}").and_then(|()| stderr.flush());

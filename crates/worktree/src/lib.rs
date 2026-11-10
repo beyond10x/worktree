@@ -381,6 +381,7 @@ pub enum CleanupScope {
 /// `assessment` is the planning pass's verdict: without apply it is the entry the run returns;
 /// with apply an eligible one is re-assessed before its removal, and the run returns that.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct CleanupProgress<'a> {
     /// The assessment that just finished.
     pub assessment: &'a CleanupAssessment,
