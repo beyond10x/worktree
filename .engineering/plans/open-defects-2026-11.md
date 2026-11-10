@@ -73,6 +73,11 @@ Build directory: `target/` inside each tree. Scratch: `<session scratch>/worktre
 
 Proposed and run under `approval-record:wave-1-open-defects-2026-11-09`.
 
+Stopped 2026-11-09 by operator correction (the goal applies to another repository): no pull
+request, no merge, no issue closed. `story:archive-on-old-git` has its `test_result` recorded and
+stays `active`. Units #44 and #45 are committed on their `impl/` branches, not yet attacked by an
+adversary and not merged. Waves 2 to 4 were not started.
+
 ### Wave 2 of 4
 
 ### Wave 3 of 4
