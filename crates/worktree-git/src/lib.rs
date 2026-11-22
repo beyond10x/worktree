@@ -4,7 +4,7 @@ use b10x_worktree::GitPort;
 #[cfg(unix)]
 use b10x_worktree_domain::{
     ArchiveContents, ArchiveEvidence, ArchiveManifest, ArchiveReference, ArchiveRequest,
-    ArchiveStateCheck, PatchStripPlan, ScannedPatch, WorktreeRecord,
+    ArchiveStateCheck, PatchStripPlan, ScannedPatch, TargetSeed, WorktreeRecord,
 };
 use b10x_worktree_domain::{
     CacheClassification, CreatePlan, DiscoveredWorktree, RecoveryEvidence, RecoveryKind, Refusal,
@@ -22,6 +22,8 @@ mod archive;
 mod cache;
 mod hidden;
 mod inspection;
+#[cfg(unix)]
+mod seed;
 
 /// Confirmed advertised commits, each mapped to the `remote:ref` names advertising it.
 type AdvertisedTips = BTreeMap<String, Vec<String>>;
@@ -1448,6 +1450,11 @@ impl GitPort for ProcessGit {
 
     fn last_activity(&self, worktree: &Path) -> Option<i64> {
         cache::last_activity(worktree)
+    }
+
+    #[cfg(unix)]
+    fn seed_target(&self, candidates: &[PathBuf], worktree: &Path) -> TargetSeed {
+        seed::seed_target(candidates, worktree)
     }
 
     #[cfg(unix)]

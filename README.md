@@ -58,6 +58,28 @@ are canonical, disjoint paths. Create plans resolve the requested base to an imm
 revalidate the repository, policy-derived destination, and exact Git worktree membership before
 changing state.
 
+`worktree create --seed-target` starts the new tree with the dependency artifacts of a built
+checkout of the same repository, so the first `cargo build` there compiles only the workspace's
+own crates. `WORKTREE_SEED_TARGET=1` in the environment switches it on for every `create`; it is
+off by default, and without it `create` copies nothing and prints nothing new.
+
+- The seed is the repository's primary checkout or one of its managed trees: the one whose
+  `target/debug` last gained a unit directory, among those that hold a valid `CACHEDIR.TAG`, a
+  `.rustc_info.json` with what `rustc -vV` prints in the new tree, and no lock a building Cargo
+  holds.
+- Copied are `CACHEDIR.TAG`, `.rustc_info.json` and the dependency units of the `debug` profile,
+  with their modification times, in the layout of Cargo before 1.100 (`.fingerprint/`, `build/`,
+  `deps/`) and of Cargo 1.100 (`build/<package>/<unit>/`). Never copied: `incremental/`, another
+  profile, the files at the top of the profile, a lock file, and the units of the workspace's own
+  packages, which no other checkout can use.
+- Every file is a copy, never a hard link to the seed, and the seed is only read.
+- `create` says what it did in one line on standard error: `target seeded from <checkout>: <n>
+  files, <n> bytes`, or `target not seeded: <why>`. `--json` carries it as `seed`, and the tree's
+  record in `worktree status` keeps it. When nothing can be copied, the tree is created as
+  without the option.
+- A target placed elsewhere (`CARGO_TARGET_DIR`, `build.target-dir`) is neither read nor seeded,
+  and neither is a new tree that already holds `target` or does not ignore it.
+
 `worktree discard-cache` deletes every ignored entry Git reports, file or directory, unless the
 repository keeps it. A repository keeps paths in `.worktreekeep` at the tree root: Git exclude
 patterns, matched by Git's own exclude engine, so negation, directory-only patterns and anchoring

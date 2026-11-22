@@ -8,10 +8,12 @@ mod archive;
 mod build_output;
 mod cache;
 mod inspection;
+mod seed;
 pub use archive::*;
 pub use build_output::*;
 pub use cache::*;
 pub use inspection::*;
+pub use seed::*;
 
 /// Configuration and workspace-policy schema version.
 pub const SURFACE_VERSION: u32 = 1;
@@ -326,6 +328,11 @@ pub struct WorktreeRecord {
     pub finished_at: Option<i64>,
     /// Last observed HEAD.
     pub head: Option<String>,
+    /// What seeding the tree's Cargo target did when the tree was created: the seed's path
+    /// with the files and bytes copied, or why nothing was copied. Absent unless `create`
+    /// was asked to seed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed: Option<TargetSeed>,
 }
 
 /// How advertised remote refs establish that a commit's work is recoverable.

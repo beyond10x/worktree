@@ -219,6 +219,15 @@ independent policy: every decision must come from the public façade.
   remote recovery proof.
 - Create plans use immutable commits and canonical policy-derived paths; plans and exact repository
   membership are revalidated immediately before mutation.
+- `create --seed-target` only reads the seed and writes only below the new tree's `target/`,
+  which it creates itself. It never writes, creates or deletes anything in the seed: a lock file
+  there is opened read-only, never created, and locked shared through the open file. No name in
+  the new tree is a hard link to a file of the seed. The one removal is of the `target/` the same
+  call created, when its copy failed. Seeding refuses no creation: a seed that cannot be used leaves
+  `create` as without the option, with the reason in one line, and a new tree that already holds
+  `target`, or whose `target/` Git does not ignore, is not seeded. Which units are the
+  workspace's own is decided in `b10x-worktree-domain` (`seed.rs`) from the dep-info files
+  alone: no Cargo is run and no manifest is read. Off by default.
 - Apply operations for GC and reconciliation require exact reviewed worktree ids. Cleanup and
   relocation lifecycle claims, final HEAD updates, and lease exclusions are atomic, and
   proof-bearing removal intent is durable.

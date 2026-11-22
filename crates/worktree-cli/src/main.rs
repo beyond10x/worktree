@@ -104,6 +104,26 @@ struct CreateArgs {
     /// Owner class recorded for cleanup delegation.
     #[arg(long, default_value = "agent")]
     owner: String,
+    /// Copy the dependency artifacts of the repository's newest built checkout into the new
+    /// tree's `target/`, so the first `cargo build` there compiles only the workspace's own
+    /// crates. `WORKTREE_SEED_TARGET=1` in the environment sets it for every `create`.
+    #[arg(long)]
+    seed_target: bool,
+}
+
+/// The environment variable that turns `create --seed-target` on for every `create`.
+const SEED_TARGET_VARIABLE: &str = "WORKTREE_SEED_TARGET";
+
+/// Whether the environment turns target seeding on: the variable is `1` or `true`.
+fn seed_target_from_environment() -> bool {
+    std::env::var_os(SEED_TARGET_VARIABLE).is_some_and(|value| value == "1" || value == "true")
+}
+
+#[derive(Serialize)]
+struct CreatePayload<'a> {
+    evidence: &'a b10x_worktree_domain::OperationEvidence,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    seed: Option<&'a b10x_worktree_domain::TargetSeed>,
 }
 
 #[derive(Debug, Args)]
@@ -842,14 +862,24 @@ fn create(args: &CreateArgs, json: bool) -> Result<()> {
     let plan = service
         .plan_create(policy, request)
         .map_err(anyhow::Error::new)?;
-    let evidence = service.create(policy, &plan).map_err(anyhow::Error::new)?;
+    let options = b10x_worktree::CreateOptions {
+        seed_target: args.seed_target || seed_target_from_environment(),
+    };
+    let created = service
+        .create_with(policy, &plan, options)
+        .map_err(anyhow::Error::new)?;
+    // Standard output stays the tree's path alone; the seed's one line goes beside it.
+    if let Some(seed) = created.seed.as_ref().filter(|_| !json) {
+        eprintln!("{}", seed.line());
+    }
     emit_success(
         json,
         CLI_PROTOCOL_VERSION,
-        EvidencePayload {
-            evidence: &evidence,
+        CreatePayload {
+            evidence: &created.evidence,
+            seed: created.seed.as_ref(),
         },
-        || evidence.path.display().to_string(),
+        || created.evidence.path.display().to_string(),
     )
 }
 
@@ -1579,7 +1609,7 @@ Use the `worktree` CLI as the sole owner of linked-worktree lifecycle. It keeps 
 
 ## Start repository work
 
-1. Invoke `$worktree`, then from a primary checkout run `worktree create --purpose <short-purpose>`. Add `--repo <path>`, `--base <revision>`, or `--id <stable-id>` when needed.
+1. Invoke `$worktree`, then from a primary checkout run `worktree create --purpose <short-purpose>`. Add `--repo <path>`, `--base <revision>`, or `--id <stable-id>` when needed. In a Cargo workspace, `--seed-target` copies the dependency artifacts of the repository's newest built checkout into the new tree's `target/`, so the first build compiles only the workspace's own crates; one line on standard error (`seed` in the JSON) says what was copied or why nothing was, and the tree is created either way.
 2. Treat the printed path as the task checkout and do all changes there.
 3. If already inside a managed tree, reuse it; do not nest another worktree.
 4. For automation, add `--json` and consume the versioned output.

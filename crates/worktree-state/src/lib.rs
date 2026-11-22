@@ -3,7 +3,7 @@
 use b10x_worktree::RegistryPort;
 use b10x_worktree_domain::{
     Lifecycle, OperationEvidence, RecoveryProof, Refusal, RelocationIntent, RemovalIntent,
-    SURFACE_VERSION, WorkspacePolicy, WorktreeId, WorktreeRecord,
+    SURFACE_VERSION, TargetSeed, WorkspacePolicy, WorktreeId, WorktreeRecord,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -267,6 +267,10 @@ impl SqliteRegistry {
                    operation TEXT NOT NULL,
                    planned_at INTEGER NOT NULL
                  );
+                 CREATE TABLE IF NOT EXISTS target_seeds (
+                   worktree_id TEXT PRIMARY KEY REFERENCES worktrees(id) ON DELETE CASCADE,
+                   seed_json TEXT NOT NULL
+                 );
                  PRAGMA user_version=3;",
             )
             .map_err(|error| Refusal::new("registry-migration-failed", error.to_string()))?;
@@ -309,11 +313,24 @@ impl RegistryPort for SqliteRegistry {
         )
     }
 
+    fn record_seed(&self, id: &str, seed: &TargetSeed) -> Result<(), Refusal> {
+        let json = serde_json::to_string(seed)
+            .map_err(|error| Refusal::new("registry-seed-invalid", error.to_string()))?;
+        changed(
+            self.connection()?.execute(
+                "INSERT INTO target_seeds(worktree_id,seed_json)
+                 SELECT id,?2 FROM worktrees WHERE id=?1 AND lifecycle='provisioning'",
+                params![id, json],
+            ),
+            "record-seed",
+        )
+    }
+
     fn find_by_path(&self, path: &Path) -> Result<Option<WorktreeRecord>, Refusal> {
         let path = path_text(path)?;
         self.connection()?
             .query_row(
-                "SELECT id,repository_root,path,purpose,owner,lifecycle,created_at,last_seen_at,finished_at,head FROM worktrees WHERE path=?1",
+                "SELECT id,repository_root,path,purpose,owner,lifecycle,created_at,last_seen_at,finished_at,head,(SELECT seed_json FROM target_seeds WHERE worktree_id=worktrees.id) FROM worktrees WHERE path=?1",
                 [path],
                 row_record,
             )
@@ -324,7 +341,7 @@ impl RegistryPort for SqliteRegistry {
     fn list(&self) -> Result<Vec<WorktreeRecord>, Refusal> {
         let connection = self.connection()?;
         let mut statement = connection
-            .prepare("SELECT id,repository_root,path,purpose,owner,lifecycle,created_at,last_seen_at,finished_at,head FROM worktrees ORDER BY created_at,id")
+            .prepare("SELECT id,repository_root,path,purpose,owner,lifecycle,created_at,last_seen_at,finished_at,head,(SELECT seed_json FROM target_seeds WHERE worktree_id=worktrees.id) FROM worktrees ORDER BY created_at,id")
             .map_err(database_error)?;
         let rows = statement
             .query_map([], row_record)
@@ -810,6 +827,13 @@ fn row_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorktreeRecord> {
         last_seen_at: row.get(7)?,
         finished_at: row.get(8)?,
         head: row.get(9)?,
+        seed: row
+            .get::<_, Option<String>>(10)?
+            .map(|json| serde_json::from_str(&json))
+            .transpose()
+            .map_err(|error| {
+                sql_conversion_error(Refusal::new("registry-seed-invalid", error.to_string()))
+            })?,
     })
 }
 
@@ -988,9 +1012,58 @@ mod tests {
             last_seen_at: 1,
             finished_at: None,
             head: Some("abc".into()),
+            seed: None,
         };
         registry.adopt(&record).unwrap();
         assert_eq!(registry.list().unwrap(), vec![record]);
+    }
+
+    #[test]
+    fn a_provisioning_record_keeps_its_target_seed() {
+        let temporary = tempdir().unwrap();
+        let path = temporary.path().join("registry.sqlite3");
+        let registry = SqliteRegistry::open(&path).unwrap();
+        let mut record = WorktreeRecord {
+            id: WorktreeId::new("seeded").unwrap(),
+            repository_root: "/repo".into(),
+            path: "/trees/seeded".into(),
+            purpose: "test".into(),
+            owner: "test".into(),
+            lifecycle: Lifecycle::Provisioning,
+            created_at: 1,
+            last_seen_at: 1,
+            finished_at: None,
+            head: None,
+            seed: None,
+        };
+        registry.reserve(&record).unwrap();
+        let seed = TargetSeed::copied("/repo".into(), 12, 3456);
+        registry.record_seed("seeded", &seed).unwrap();
+        registry.activate("seeded", "abc", 2).unwrap();
+
+        record.lifecycle = Lifecycle::Active;
+        record.head = Some("abc".into());
+        record.last_seen_at = 2;
+        record.seed = Some(seed.clone());
+        assert_eq!(registry.list().unwrap(), vec![record.clone()]);
+        assert_eq!(
+            registry.find_by_path(Path::new("/trees/seeded")).unwrap(),
+            Some(record)
+        );
+        // A seed for a record that is no longer provisioning and one for no record are refused;
+        // the registry stays at schema version 3, which earlier releases open.
+        for id in ["seeded", "absent"] {
+            assert_eq!(
+                registry.record_seed(id, &seed).unwrap_err().code,
+                "invalid-lifecycle-transition"
+            );
+        }
+        drop(registry);
+        let version: i64 = Connection::open(&path)
+            .unwrap()
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 3);
     }
 
     #[test]
@@ -1008,6 +1081,7 @@ mod tests {
             last_seen_at: 1,
             finished_at: None,
             head: Some("abc".into()),
+            seed: None,
         };
         registry.adopt(&record).unwrap();
         registry.claim_relocation("legacy-one", 2, 60).unwrap();
@@ -1054,6 +1128,7 @@ mod tests {
             last_seen_at: 2,
             finished_at: Some(2),
             head: Some("abc".into()),
+            seed: None,
         };
         registry.adopt(&record).unwrap();
         let relocation = RelocationIntent {
@@ -1142,6 +1217,7 @@ mod tests {
             last_seen_at: 2,
             finished_at: Some(2),
             head: Some("abc".into()),
+            seed: None,
         };
         registry.adopt(&record).unwrap();
         let relocation = RelocationIntent {
@@ -1245,6 +1321,7 @@ mod tests {
             last_seen_at: 1,
             finished_at: Some(2),
             head: Some("abc".into()),
+            seed: None,
         };
         registry.adopt(&record).unwrap();
         assert_eq!(
@@ -1288,6 +1365,7 @@ mod tests {
             last_seen_at: 1,
             finished_at: Some(2),
             head: Some("abc".into()),
+            seed: None,
         };
         registry.adopt(&record).unwrap();
         let proof = RecoveryProof {
@@ -1345,6 +1423,7 @@ mod tests {
             last_seen_at: 1,
             finished_at: None,
             head: Some("old".into()),
+            seed: None,
         };
         registry.adopt(&record).unwrap();
         registry.acquire_lease("one", "session", 10).unwrap();
