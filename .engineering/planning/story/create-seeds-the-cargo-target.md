@@ -7,7 +7,7 @@ title: A new tree starts with the dependency artifacts of a built checkout
 summary: the first cargo build in a new tree compiles the workspace's own crates only
 relations:
 - informed_by: story:recognised-build-cache-is-discarded
-revision: 1
+revision: 2
 ---
 ## Outcome
 
@@ -36,6 +36,10 @@ repository, so the first cargo build in the new tree compiles the workspace's ow
     units compiled;
   - after the built checkout was moved away, the seeded one built a changed member and passed
     13 tests.
+- The experiment ran on cargo 1.99.1. cargo 1.100.0 lays the target directory out differently:
+  a build of a one-crate workspace there has no `target/debug/deps` and no
+  `target/debug/.fingerprint`; the unit lies under `target/debug/build/<package>/<hash>/`. The
+  copy has to name its directories per layout.
 - Not measured: the release profile, a seed built with another rustc or other features (cargo's
   fingerprints then differ and it compiles as without a seed; expected, not run), a crate with a
   native build script, a file system with reflinks, the disk used over a day.
@@ -55,6 +59,8 @@ repository, so the first cargo build in the new tree compiles the workspace's ow
    option off, `create` behaves as it does today and says in one line why nothing was copied.
 6. `discard-cache` classifies the seeded directory as cache, like any cargo target.
 7. The tree's record names the seed's path and the bytes copied.
+8. Acceptance 1 and 2 hold for a target directory written by cargo 1.99 and for one written by
+   cargo 1.100.
 
 ## Scope
 
