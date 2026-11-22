@@ -62,7 +62,9 @@ independent policy: every decision must come from the public façade.
   untagged-target rule, and a profile), whether or not a tracked file below it hides it from
   `discard-cache`'s walk of ignored entries, a file neither HEAD nor the index tracks is build
   layout when its first component below the target is `debug`, `release`, `.rustc_info.json`,
-  `tmp`, a Cargo-signed `CACHEDIR.TAG` or a profile directory (holding `.fingerprint/`; also
+  `tmp`, a Cargo-signed `CACHEDIR.TAG` or a profile directory (holding `.fingerprint/`, or a unit
+  directory `build/<package>/<unit>/` holding `fingerprint/`, the layout of Cargo 1.100 and
+  later, `<unit>` being 16 lowercase hexadecimal digits; also
   `<target>/<triple>/<profile>/`); everything else below the target, every tracked file included,
   stays archived. A file neither HEAD nor the index tracks strictly below a Flutter app's
   `<P>/build/` or `<P>/.dart_tool/` is build layout whatever it holds, when `<P>/pubspec.yaml` is a
@@ -98,7 +100,9 @@ independent policy: every decision must come from the public façade.
   no other section names, and a path HEAD's tree (read from Git, never the patch) holds neither
   as a file or directory nor below a file. Such a path is stripped only when it is build layout
   below a directory the patch's own pure additions recognise as a target (a Cargo-signed
-  `<t>/CACHEDIR.TAG` or `<t>/<p>/.fingerprint/…`; `<t>/tmp/` only beside a profile), or strictly
+  `<t>/CACHEDIR.TAG`, `<t>/<p>/.fingerprint/…`, or `<t>/<p>/build/<package>/<unit>/fingerprint/…`
+  with `<unit>` 16 lowercase hexadecimal digits and `<p>` not `tmp`; `<t>/tmp/` only beside a
+  profile), or strictly
   below a Flutter app's `<P>/build/` or `<P>/.dart_tool/`, where HEAD's tree holds
   `<P>/pubspec.yaml` as anything but a directory or the patch purely adds it (that section stays) and HEAD's tree
   holds nothing at the directory's own path, and the patch recognises no cargo target there (one
@@ -173,7 +177,10 @@ independent policy: every decision must come from the public façade.
   that floats (no `/` but a trailing one) or holds `**`. Everything
   else is discarded; a symbolic link is deleted itself and never followed, and no deletion leaves
   the tree. The structural rules name what they recognise: a Cargo profile holding
-  `.fingerprint/` inside a validly tagged target, a whole target of nothing but Cargo's layout,
+  `.fingerprint/`, or a unit directory `build/<package>/<unit>/` holding `fingerprint/` (Cargo
+  1.100 and later; `build`, `<package>`, `<unit>` and `fingerprint` real directories, `<unit>` 16
+  lowercase hexadecimal digits, the profile not named `tmp`), inside a validly tagged target, a
+  whole target of nothing but Cargo's layout,
   that target's own real `tmp/` (Cargo's `CARGO_TARGET_TMPDIR`) or its direct entries when the
   target holds a profile, `node_modules` at or below a tracked lockfile, a virtual environment
   beside a tracked Python manifest, a Flutter app's `<P>/build/` or `<P>/.dart_tool/` that the
@@ -182,7 +189,8 @@ independent policy: every decision must come from the public façade.
   `.mypy_cache` or `.ruff_cache`; every other disposable entry is `ignored-output`. Cargo tags
   only a target it creates, so a real directory named `target` without a valid tag counts as
   tagged when a tracked `Cargo.toml` sits beside it and a direct child other than `tmp/` holds
-  both `.fingerprint/` and `deps/` as real directories. A target holding anything but Cargo's
+  both `.fingerprint/` and `deps/` as real directories, or a unit directory holding both
+  `fingerprint/` and `out/` as real directories. A target holding anything but Cargo's
   layout falls to its parts, each named by its own rule. The keep file (read again, scoped to the
   entry), the mount table and the walk are repeated immediately before each deletion, and an
   entry that then is or holds a kept path, a mount point or a repository is retained. An ignored path that is not UTF-8 refuses the
@@ -228,6 +236,9 @@ independent policy: every decision must come from the public façade.
 ```console
 task check
 ```
+
+rustc is pinned in `rust-toolchain.toml`: the local gate and the forge's workflows build with the
+toolchain that file names (`rustup toolchain install` reads it).
 
 Anything executable in this repository is Rust. Releases use bare SemVer tags from `main`, after
 `CHANGELOG.md`, every workspace package version and `Cargo.lock` agree. Pushing the tag runs

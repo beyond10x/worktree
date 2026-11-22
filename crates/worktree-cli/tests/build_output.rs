@@ -973,6 +973,379 @@ fn gc_removes_a_tree_with_a_tracked_file_under_its_target() {
     fixture.retire("tracked", &tree);
 }
 
+/// A unit directory's name as Cargo 1.100 writes one: 16 lowercase hexadecimal digits.
+const UNIT: &str = "0123456789abcdef";
+
+/// The files of one profile as Cargo 1.100 lays it out, relative to the profile, and the bytes
+/// each holds. It writes no `.fingerprint/` and no `deps/`: a compile unit lies in
+/// `build/<package>/<unit>/` and holds `fingerprint/` and `out/`, a build-script run holds
+/// `run/` too.
+const UNIT_PROFILE_FILES: [(&str, &[u8]); 7] = [
+    (
+        "build/one/0123456789abcdef/fingerprint/lib-one",
+        b"fingerprint\n",
+    ),
+    (
+        "build/one/0123456789abcdef/fingerprint/dep-lib-one",
+        &[0, 1, 2, 3],
+    ),
+    (
+        "build/one/0123456789abcdef/out/libone.rlib",
+        &[0, 159, 146, 150, 255, 0, 7],
+    ),
+    (
+        "build/one/fedcba9876543210/fingerprint/run-build-script",
+        b"f\n",
+    ),
+    (
+        "build/one/fedcba9876543210/run/output",
+        b"cargo:rerun-if-changed=build.rs\n",
+    ),
+    (".cargo-lock", b""),
+    ("one.d", b"one: src/lib.rs\n"),
+];
+
+/// Write one such profile at `profile`. Returns the files and their bytes.
+fn unit_profile(profile: &Path) -> (u64, u64) {
+    for (path, bytes) in UNIT_PROFILE_FILES {
+        write(&profile.join(path), bytes);
+    }
+    (
+        UNIT_PROFILE_FILES.len() as u64,
+        UNIT_PROFILE_FILES
+            .iter()
+            .map(|(_, bytes)| bytes.len() as u64)
+            .sum(),
+    )
+}
+
+fn patch_of(archive: &Value) -> String {
+    let directory = PathBuf::from(archive["path"].as_str().unwrap());
+    String::from_utf8_lossy(&std::fs::read(directory.join("dirty.patch")).unwrap_or_default())
+        .into_owned()
+}
+
+/// A tagged target whose profiles Cargo 1.100 wrote is recognised like one of the older layout:
+/// its layout is left out, a profile under a name of its own and one below a target-triple
+/// directory included, the target is recorded, a file that is no layout stays archived, and
+/// removal through the archive deletes the layout as cache.
+#[test]
+fn archive_leaves_unit_profiles_out_and_records_the_target() {
+    let fixture = Fixture::new(true);
+    let tree = fixture.tree("units", true);
+    write(&tree.join("target/CACHEDIR.TAG"), TAG);
+    let (mut files, mut bytes) = (1, TAG.len() as u64);
+    for profile in ["debug", "custom", "x86_64-unknown-linux-gnu/custom"] {
+        let (profile_files, profile_bytes) = unit_profile(&tree.join("target").join(profile));
+        files += profile_files;
+        bytes += profile_bytes;
+    }
+    write(&tree.join("target/notes.md"), "a session's scratch\n");
+
+    let archive = fixture.archive("units");
+    let manifest = &archive["manifest"];
+    assert_eq!(manifest["format"], "worktree.archive/3", "{archive}");
+    let output = &manifest["build_output"];
+    let targets = output["targets"].as_array().unwrap();
+    assert_eq!(targets.len(), 1, "{output}");
+    assert_eq!(targets[0]["path"], "target", "{output}");
+    assert_eq!(targets[0]["origin"], "archive", "{output}");
+    assert_eq!(targets[0]["files"], files, "{output}");
+    assert_eq!(targets[0]["bytes"], bytes, "{output}");
+    let patch = patch_of(&archive);
+    assert!(patch.contains("b/target/notes.md"), "{patch}");
+    for left_out in [
+        "target/debug/",
+        "target/custom/",
+        "target/x86_64-unknown-linux-gnu/",
+        "target/CACHEDIR.TAG",
+    ] {
+        assert!(!patch.contains(left_out), "{left_out}: {patch}");
+    }
+
+    fixture.retire("units", &tree);
+}
+
+/// A file Git tracks inside a unit profile hides the target from `discard-cache`'s walk of
+/// ignored entries, and a target without a tag has no `CACHEDIR.TAG` to be found by. The
+/// archive still finds it from the path of a unit's `fingerprint/` and verifies it on disk.
+#[test]
+fn archive_leaves_a_unit_profile_out_beside_a_tracked_file_in_it() {
+    let fixture = Fixture::new(true);
+    let tree = fixture.tree("inside", true);
+    let profile = "target/custom";
+    write(&tree.join(profile).join("kept.txt"), "committed\n");
+    git(&tree, &["add", "-f", &format!("{profile}/kept.txt")]);
+    git(
+        &tree,
+        &["commit", "--quiet", "-m", "track a file in a profile"],
+    );
+    git(
+        &tree,
+        &[
+            "push",
+            "--quiet",
+            "--force",
+            "origin",
+            "HEAD:refs/heads/inside",
+        ],
+    );
+    let (files, _) = unit_profile(&tree.join(profile));
+
+    let archive = fixture.archive("inside");
+    let manifest = &archive["manifest"];
+    assert_eq!(manifest["format"], "worktree.archive/3", "{archive}");
+    let targets = manifest["build_output"]["targets"].as_array().unwrap();
+    assert_eq!(targets.len(), 1, "{archive}");
+    assert_eq!(targets[0]["path"], "target", "{archive}");
+    assert_eq!(targets[0]["files"], files, "{archive}");
+    assert!(manifest["patch"].is_null(), "{archive}");
+
+    fixture.retire("inside", &tree);
+}
+
+/// What the unit rule must not take for a profile stays archived. Beside `control`, which is a
+/// unit profile and so makes the tagged target one, each sibling differs in one point: its
+/// `fingerprint` is a regular file or a symbolic link, its `build` is a symbolic link to a
+/// directory holding the layout, or its unit is named with 15 or 17 hexadecimal digits, an
+/// uppercase digit or a letter past `f`. A target whose only unit layout lies below `tmp/` is
+/// no target at all.
+#[test]
+fn archive_keeps_what_is_no_unit_profile() {
+    use std::os::unix::fs::symlink;
+    let fixture = Fixture::new(true);
+    let tree = fixture.tree("not-units", true);
+    let target = tree.join("target");
+    let outside = fixture.root.path().join("outside");
+    let unit = |profile: &Path, name: &str| {
+        let unit = profile.join("build/one").join(name);
+        write(&unit.join("fingerprint/lib-one"), "fingerprint\n");
+        write(&unit.join("out/libone.rlib"), [7u8; 32]);
+        write(&profile.join("one.d"), "one: src/lib.rs\n");
+        unit
+    };
+    unit(&outside, UNIT);
+    write(&target.join("CACHEDIR.TAG"), TAG);
+    unit(&target.join("control"), UNIT);
+    let made = unit(&target.join("fingerprint-file"), UNIT);
+    std::fs::remove_dir_all(made.join("fingerprint")).unwrap();
+    write(&made.join("fingerprint"), "a file\n");
+    let made = unit(&target.join("fingerprint-link"), UNIT);
+    std::fs::remove_dir_all(made.join("fingerprint")).unwrap();
+    symlink(
+        outside.join("build/one").join(UNIT).join("fingerprint"),
+        made.join("fingerprint"),
+    )
+    .unwrap();
+    write(&target.join("build-link/one.d"), "one: src/lib.rs\n");
+    symlink(outside.join("build"), target.join("build-link/build")).unwrap();
+    unit(&target.join("hex-15"), &UNIT[..15]);
+    unit(&target.join("hex-17"), &format!("{UNIT}0"));
+    unit(&target.join("hex-other"), "0123456789abcdeg");
+    unit(&target.join("hex-upper"), "0123456789ABCDEF");
+
+    let archive = fixture.archive("not-units");
+    let manifest = &archive["manifest"];
+    assert_eq!(manifest["format"], "worktree.archive/3", "{archive}");
+    let targets = manifest["build_output"]["targets"].as_array().unwrap();
+    assert_eq!(targets.len(), 1, "{archive}");
+    assert_eq!(targets[0]["path"], "target", "{archive}");
+    // The tag and the three files of `control`.
+    assert_eq!(targets[0]["files"], 4, "{archive}");
+    let patch = patch_of(&archive);
+    assert!(!patch.contains("target/control/"), "{patch}");
+    for kept in [
+        "fingerprint-file",
+        "fingerprint-link",
+        "build-link",
+        "hex-15",
+        "hex-17",
+        "hex-other",
+        "hex-upper",
+    ] {
+        assert!(
+            patch.contains(&format!("b/target/{kept}/one.d")),
+            "{kept}: {patch}"
+        );
+    }
+    assert!(patch.contains("b/target/fingerprint-link/build/one/0123456789abcdef/fingerprint"));
+    assert!(patch.contains("b/target/build-link/build"), "{patch}");
+    assert!(
+        patch.contains("b/target/hex-15/build/one/0123456789abcde/out/libone.rlib"),
+        "{patch}"
+    );
+
+    let tree = fixture.tree("tmp-only", true);
+    write(&tree.join("target/CACHEDIR.TAG"), TAG);
+    unit(&tree.join("target/tmp"), UNIT);
+    let archive = fixture.archive("tmp-only");
+    assert!(
+        archive["manifest"].get("build_output").is_none(),
+        "{archive}"
+    );
+    let patch = patch_of(&archive);
+    assert!(patch.contains("b/target/CACHEDIR.TAG"), "{patch}");
+    assert!(
+        patch.contains("b/target/tmp/build/one/0123456789abcdef/fingerprint/lib-one"),
+        "{patch}"
+    );
+}
+
+/// A `target/` without a tag counts through a unit directory holding both `fingerprint/` and
+/// `out/`. One whose unit holds `fingerprint/` alone, with the `deps/` of the older layout
+/// beside it, meets neither rule: every file below it stays archived.
+#[test]
+fn archive_recognises_an_untagged_target_only_through_a_whole_unit() {
+    let fixture = Fixture::new(true);
+    let tree = fixture.tree("whole", true);
+    let (files, bytes) = unit_profile(&tree.join("target/debug"));
+    let archive = fixture.archive("whole");
+    let manifest = &archive["manifest"];
+    assert_eq!(manifest["format"], "worktree.archive/3", "{archive}");
+    assert_eq!(manifest["build_output"]["targets"][0]["path"], "target");
+    assert_eq!(manifest["build_output"]["files"], files, "{archive}");
+    assert_eq!(manifest["build_output"]["bytes"], bytes, "{archive}");
+    assert!(manifest["patch"].is_null(), "{archive}");
+
+    let tree = fixture.tree("half", true);
+    let unit = tree.join("target/debug/build/one").join(UNIT);
+    write(&unit.join("fingerprint/lib-one"), "fingerprint\n");
+    write(&tree.join("target/debug/deps/libone.rlib"), [7u8; 32]);
+    let archive = fixture.archive("half");
+    assert!(
+        archive["manifest"].get("build_output").is_none(),
+        "{archive}"
+    );
+    let patch = patch_of(&archive);
+    assert!(
+        patch.contains("b/target/debug/build/one/0123456789abcdef/fingerprint/lib-one"),
+        "{patch}"
+    );
+    assert!(patch.contains("b/target/debug/deps/libone.rlib"), "{patch}");
+}
+
+/// An archive written while the directory was not recognisable on disk (no tag, not named
+/// `target`, not ignored) holds a Cargo 1.100 build in `dirty.patch`. The strip recognises the
+/// target from the patch alone, by the path of a unit's `fingerprint/`, and removes the layout
+/// below it; the file that is no layout stays.
+#[test]
+fn strip_removes_a_unit_profile_the_patch_alone_recognises() {
+    let fixture = Fixture::new(false);
+    let tree = fixture.tree("units", true);
+    let (files, _) = unit_profile(&tree.join("scratch/custom"));
+    write(&tree.join("scratch/tmp/state.json"), "{}\n");
+    write(&tree.join("scratch/notes.md"), "never committed\n");
+    let archive = fixture.archive("units");
+    assert_eq!(
+        archive["manifest"]["format"], "worktree.archive/1",
+        "{archive}"
+    );
+    assert!(
+        patch_of(&archive).contains("b/scratch/custom/build/one/0123456789abcdef/fingerprint/"),
+        "{archive}"
+    );
+    fixture.retire("units", &tree);
+    let archive = PathBuf::from(archive["path"].as_str().unwrap());
+
+    let item = fixture.strip_assessment("units");
+    assert_eq!(item["verdict"], "strippable", "{item}");
+    // The profile's files and the scratch beside it.
+    assert_eq!(item["sections_stripped"], files + 1, "{item}");
+    assert_eq!(item["sections_kept"], 1, "{item}");
+
+    fixture.strip(&["--apply", "--id", "units"]);
+    let patch = std::fs::read_to_string(archive.join("dirty.patch")).unwrap();
+    assert!(patch.contains("b/scratch/notes.md"), "{patch}");
+    assert!(!patch.contains("scratch/custom/"), "{patch}");
+    assert!(!patch.contains("scratch/tmp/"), "{patch}");
+    let manifest: Value =
+        serde_json::from_slice(&std::fs::read(archive.join("manifest.json")).unwrap()).unwrap();
+    let output = &manifest["build_output"];
+    assert_eq!(output["targets"][0]["path"], "scratch", "{output}");
+    assert_eq!(output["targets"][0]["origin"], "strip", "{output}");
+    assert_eq!(output["files"], files + 1, "{output}");
+}
+
+/// An archive recorded the target and holds the files of `custom/`, which was no profile when
+/// it was written: its unit directory had no `fingerprint/`. Once `custom/` is a unit profile,
+/// verification leaves its files out of the fingerprint, which then is not the archived one: it
+/// refuses as `archive-stale` and deletes nothing. An archive an earlier release wrote of a
+/// profile Cargo 1.100 laid out under a name of its own is in that state.
+#[test]
+fn gc_refuses_when_an_archived_directory_has_become_a_unit_profile() {
+    let fixture = Fixture::new(true);
+    let tree = fixture.tree("became", false);
+    Fixture::build(&tree, true);
+    let unit = tree.join("target/custom/build/one").join(UNIT);
+    write(&unit.join("out/libone.rlib"), [7u8; 32]);
+    write(&tree.join("target/custom/notes.md"), "written by hand\n");
+    let archive = fixture.archive("became");
+    let targets = &archive["manifest"]["build_output"]["targets"];
+    assert_eq!(targets[0]["path"], "target", "{archive}");
+    assert!(
+        patch_of(&archive).contains("b/target/custom/notes.md"),
+        "{archive}"
+    );
+    fixture.ok(&["finish", "became"]);
+    // An empty directory changes no file, and makes `custom/` a profile.
+    std::fs::create_dir(unit.join("fingerprint")).unwrap();
+
+    for mode in ["--dry-run", "--apply"] {
+        let assessment = fixture.gc(mode, "became");
+        assert_eq!(
+            assessment["refusal"]["code"], "archive-stale",
+            "{mode}: {assessment}"
+        );
+    }
+    for kept in [
+        "target/custom/notes.md",
+        "target/custom/build/one/0123456789abcdef/out/libone.rlib",
+        "target/debug/deps/libone-1.rlib",
+        "target/CACHEDIR.TAG",
+    ] {
+        assert!(tree.join(kept).is_file(), "{kept}");
+    }
+}
+
+/// An archive that recorded no target holds every file below `target/`, and its verification
+/// leaves nothing out. When `custom/` is a unit profile afterwards, and `target/` so a target,
+/// the archive still verifies, and removal through it deletes only files the archive holds. An
+/// archive an earlier release wrote of a target holding nothing but profiles Cargo 1.100 laid
+/// out is in that state: that release recognised no profile in it and recorded no target.
+#[test]
+fn gc_removes_through_an_archive_that_recorded_no_target_of_a_later_unit_profile() {
+    let fixture = Fixture::new(true);
+    let tree = fixture.tree("unrecorded", true);
+    write(&tree.join("target/CACHEDIR.TAG"), TAG);
+    let unit = tree.join("target/custom/build/one").join(UNIT);
+    write(&unit.join("out/libone.rlib"), [7u8; 32]);
+    write(&tree.join("target/custom/notes.md"), "written by hand\n");
+    let archive = fixture.archive("unrecorded");
+    assert!(
+        archive["manifest"].get("build_output").is_none(),
+        "{archive}"
+    );
+    let directory = PathBuf::from(archive["path"].as_str().unwrap());
+    let held = [
+        "b/target/CACHEDIR.TAG",
+        "b/target/custom/notes.md",
+        "b/target/custom/build/one/0123456789abcdef/out/libone.rlib",
+    ];
+    let patch = patch_of(&archive);
+    for path in held {
+        assert!(patch.contains(path), "{path}: {patch}");
+    }
+    // An empty directory changes no file, and makes `custom/` a profile.
+    std::fs::create_dir(unit.join("fingerprint")).unwrap();
+
+    fixture.retire("unrecorded", &tree);
+    let patch = String::from_utf8_lossy(&std::fs::read(directory.join("dirty.patch")).unwrap())
+        .into_owned();
+    for path in held {
+        assert!(patch.contains(path), "{path}: {patch}");
+    }
+}
+
 impl Fixture {
     /// A retired tree whose format-1 archive holds a Flutter app's work: `pubspec` commits a
     /// `pubspec.yaml` at the root beside `lib/main.dart`, both pushed; `work` then writes what

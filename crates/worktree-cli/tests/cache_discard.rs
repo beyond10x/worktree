@@ -8,6 +8,9 @@ use std::process::{Command, Output};
 const TAG: &str =
     "Signature: 8a477f597d28d172789f06886806bc55\n# This file is a cache directory tag.\n";
 
+/// A unit directory's name as Cargo 1.100 writes one: 16 lowercase hexadecimal digits.
+const UNIT: &str = "0123456789abcdef";
+
 fn git(path: &Path, args: &[&str]) -> String {
     let output = Command::new("git")
         .arg("-C")
@@ -170,6 +173,23 @@ impl Fixture {
             &self.tree.join(relative).join("deps/libone.rlib"),
             &"x".repeat(8192),
         );
+    }
+
+    /// One unit of the profile `profile` as Cargo 1.100 lays it out, which writes no
+    /// `.fingerprint/` and no `deps/`: `build/one/<name>/` holding `fingerprint/` and `out/`.
+    /// Returns the unit directory.
+    fn unit(&self, profile: &str, name: &str) -> PathBuf {
+        let unit = self.tree.join(profile).join("build/one").join(name);
+        write(&unit.join("fingerprint/lib-one"), "fingerprint");
+        write(&unit.join("out/libone.rlib"), &"x".repeat(8192));
+        unit
+    }
+
+    /// A whole profile in that layout: one unit, a lock file and a final artifact.
+    fn unit_profile(&self, profile: &str) {
+        self.unit(profile, UNIT);
+        write(&self.tree.join(profile).join(".cargo-lock"), "");
+        write(&self.tree.join(profile).join("one.d"), "one: src/lib.rs\n");
     }
 
     /// Scratch as integration tests leave it in `CARGO_TARGET_TMPDIR`, holding no repository: a
@@ -660,6 +680,211 @@ fn a_symlinked_tmp_or_one_below_a_target_triple_is_not_cargo_scratch() {
             .join("target/x86_64-unknown-linux-gnu/tmp")
             .exists()
     );
+}
+
+/// Cargo 1.100 lays a profile out as unit directories. A tagged target holding nothing but such
+/// profiles, one of them below a target-triple directory, and its `tmp/` goes whole.
+#[test]
+fn a_tagged_target_of_unit_profiles_goes_whole() {
+    let fixture = Fixture::new();
+    write(&fixture.tree.join("target/CACHEDIR.TAG"), TAG);
+    fixture.unit_profile("target/debug");
+    fixture.unit_profile("target/x86_64-unknown-linux-gnu/release");
+    fixture.plain_scratch("target/tmp");
+
+    let planned = fixture.discard(&["--dry-run"]);
+    assert_eq!(
+        discarded(&planned),
+        pairs(&[("target", "cargo-target")]),
+        "{planned}"
+    );
+    let applied = fixture.discard(&[]);
+    assert_eq!(
+        discarded(&applied),
+        pairs(&[("target", "cargo-target")]),
+        "{applied}"
+    );
+    assert!(paths(&applied, "retained_ignored").is_empty(), "{applied}");
+    assert!(!fixture.tree.join("target").exists());
+}
+
+/// Beside a kept record the same target falls to its parts: each unit profile is a
+/// `cargo-profile`, directly below the target and below a target-triple directory, and the
+/// record stays.
+#[test]
+fn beside_a_kept_record_unit_profiles_are_discarded_as_profiles() {
+    let fixture = Fixture::tracking(&[KEEP_BACKLOG]);
+    write(&fixture.tree.join("target/CACHEDIR.TAG"), TAG);
+    fixture.unit_profile("target/debug");
+    fixture.unit_profile("target/x86_64-unknown-linux-gnu/release");
+    write(
+        &fixture
+            .tree
+            .join("target/x86_64-unknown-linux-gnu/notes.md"),
+        "no layout\n",
+    );
+    fixture.plain_scratch("target/tmp");
+    write(
+        &fixture.tree.join("target/backlog-input/review.md"),
+        "a record a commit cites\n",
+    );
+
+    let applied = fixture.discard(&[]);
+    let mut gone = discarded(&applied);
+    gone.sort();
+    assert_eq!(
+        gone,
+        pairs(&[
+            ("target/CACHEDIR.TAG", "ignored-output"),
+            ("target/debug", "cargo-profile"),
+            ("target/tmp", "cargo-target-tmp"),
+            ("target/x86_64-unknown-linux-gnu/notes.md", "ignored-output"),
+            ("target/x86_64-unknown-linux-gnu/release", "cargo-profile"),
+        ]),
+        "{applied}"
+    );
+    assert_eq!(
+        paths(&applied, "retained_ignored"),
+        ["target/backlog-input/review.md"],
+        "{applied}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.tree.join("target/backlog-input/review.md")).unwrap(),
+        "a record a commit cites\n"
+    );
+}
+
+/// A tracked file inside the target makes Git report its entries one by one: a unit profile is
+/// then named below the tagged target it lies in, and a `tmp/` holding the same layout is not.
+#[test]
+fn a_unit_profile_git_reports_itself_is_discarded_below_a_tagged_target() {
+    let fixture = Fixture::tracking(&[("target/README.md", "kept\n")]);
+    write(&fixture.tree.join("target/CACHEDIR.TAG"), TAG);
+    fixture.unit_profile("target/debug");
+    fixture.unit("target/tmp", UNIT);
+    // The same layout where no target is: `build/` carries no tag.
+    fixture.unit_profile("build/debug");
+
+    let applied = fixture.discard(&[]);
+    let mut gone = discarded(&applied);
+    gone.sort();
+    assert_eq!(
+        gone,
+        pairs(&[
+            ("build", "ignored-output"),
+            ("target/CACHEDIR.TAG", "ignored-output"),
+            ("target/debug", "cargo-profile"),
+            ("target/tmp", "ignored-output"),
+        ]),
+        "{applied}"
+    );
+    assert!(paths(&applied, "retained_ignored").is_empty(), "{applied}");
+    assert_eq!(
+        std::fs::read_to_string(fixture.tree.join("target/README.md")).unwrap(),
+        "kept\n"
+    );
+}
+
+/// A target holding one profile of each layout, the older one with `.fingerprint/` and `deps/`
+/// and one of unit directories, is one Cargo target.
+#[test]
+fn a_target_holding_a_profile_of_each_layout_goes_whole() {
+    let fixture = Fixture::new();
+    write(&fixture.tree.join("target/CACHEDIR.TAG"), TAG);
+    fixture.profile("target/debug");
+    fixture.unit_profile("target/release");
+
+    let applied = fixture.discard(&[]);
+    assert_eq!(
+        discarded(&applied),
+        pairs(&[("target", "cargo-target")]),
+        "{applied}"
+    );
+    assert!(!fixture.tree.join("target").exists());
+}
+
+/// What the unit rule must not take for a profile, each as a direct child of one tagged target
+/// beside `control`, which is one: `fingerprint` as a regular file or a symbolic link; `build`,
+/// the package or the unit as a symbolic link to a directory holding the layout; a unit name of
+/// 15 or 17 hexadecimal digits, with an uppercase digit or a letter past `f`. Each goes as
+/// `ignored-output`, and nothing a link points at is deleted.
+#[test]
+fn a_unit_directory_that_is_not_cargos_makes_no_profile_in_a_tagged_target() {
+    use std::os::unix::fs::symlink;
+    let fixture = Fixture::new();
+    write(&fixture.tree.join("target/CACHEDIR.TAG"), TAG);
+    let outside = fixture.root.path().join("outside");
+    let outside_unit = outside.join("build/one").join(UNIT);
+    write(&outside_unit.join("fingerprint/lib-one"), "outside\n");
+    write(&outside_unit.join("out/libone.rlib"), "outside\n");
+
+    fixture.unit("target/control", UNIT);
+    let unit = fixture.unit("target/fingerprint-file", UNIT);
+    std::fs::remove_dir_all(unit.join("fingerprint")).unwrap();
+    write(&unit.join("fingerprint"), "a file\n");
+    let unit = fixture.unit("target/fingerprint-link", UNIT);
+    std::fs::remove_dir_all(unit.join("fingerprint")).unwrap();
+    symlink(outside_unit.join("fingerprint"), unit.join("fingerprint")).unwrap();
+    let linked = fixture.tree.join("target/build-link");
+    std::fs::create_dir_all(&linked).unwrap();
+    symlink(outside.join("build"), linked.join("build")).unwrap();
+    let linked = fixture.tree.join("target/package-link/build");
+    std::fs::create_dir_all(&linked).unwrap();
+    symlink(outside.join("build/one"), linked.join("one")).unwrap();
+    let linked = fixture.tree.join("target/unit-link/build/one");
+    std::fs::create_dir_all(&linked).unwrap();
+    symlink(&outside_unit, linked.join(UNIT)).unwrap();
+    fixture.unit("target/hex-15", &UNIT[..15]);
+    fixture.unit("target/hex-17", &format!("{UNIT}0"));
+    fixture.unit("target/hex-other", "0123456789abcdeg");
+    fixture.unit("target/hex-upper", "0123456789ABCDEF");
+
+    let applied = fixture.discard(&[]);
+    let mut gone = discarded(&applied);
+    gone.sort();
+    assert_eq!(
+        gone,
+        pairs(&[
+            ("target/CACHEDIR.TAG", "ignored-output"),
+            ("target/build-link", "ignored-output"),
+            ("target/control", "cargo-profile"),
+            ("target/fingerprint-file", "ignored-output"),
+            ("target/fingerprint-link", "ignored-output"),
+            ("target/hex-15", "ignored-output"),
+            ("target/hex-17", "ignored-output"),
+            ("target/hex-other", "ignored-output"),
+            ("target/hex-upper", "ignored-output"),
+            ("target/package-link", "ignored-output"),
+            ("target/unit-link", "ignored-output"),
+        ]),
+        "{applied}"
+    );
+    assert!(paths(&applied, "retained_ignored").is_empty(), "{applied}");
+    assert_eq!(
+        std::fs::read_to_string(outside_unit.join("fingerprint/lib-one")).unwrap(),
+        "outside\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(outside_unit.join("out/libone.rlib")).unwrap(),
+        "outside\n"
+    );
+}
+
+/// `tmp/` is Cargo's test scratch and never a profile: a tagged target whose only unit layout
+/// lies below `tmp/` holds no profile, so it is no Cargo target.
+#[test]
+fn a_unit_layout_only_below_tmp_makes_no_profile_in_a_tagged_target() {
+    let fixture = Fixture::new();
+    write(&fixture.tree.join("target/CACHEDIR.TAG"), TAG);
+    fixture.unit("target/tmp", UNIT);
+
+    let applied = fixture.discard(&[]);
+    assert_eq!(
+        discarded(&applied),
+        pairs(&[("target", "ignored-output")]),
+        "{applied}"
+    );
+    assert!(paths(&applied, "retained_ignored").is_empty(), "{applied}");
 }
 
 const MANIFEST: (&str, &str) = ("Cargo.toml", "[package]\nname = \"one\"\n");

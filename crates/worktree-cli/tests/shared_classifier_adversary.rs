@@ -200,6 +200,55 @@ fn paths(cache: &Value, field: &str) -> Vec<String> {
     paths
 }
 
+/// A cargo target named `build` beside a `pubspec.yaml`, Cargo-signed, whose profile Cargo 1.100
+/// laid out as unit directories (`build/<package>/<unit>/fingerprint/`, no `.fingerprint/`). It
+/// is a cargo target, so the cargo rule alone classifies it in both commands: `discard-cache`
+/// names the profile, and `archive` leaves out the layout and keeps `build/notes.md`, which the
+/// Flutter rule would leave out with everything else below `build/`.
+#[test]
+fn adversary_a_unit_layout_target_named_build_is_classified_by_the_cargo_rule_alone() {
+    let fixture = Fixture::new(true, &[("Cargo.toml", "[package]\nname = \"one\"\n")]);
+    let tree = fixture.tree("units");
+    write(&tree.join("build/CACHEDIR.TAG"), TAG);
+    let unit = tree.join("build/debug/build/one/0123456789abcdef");
+    write(&unit.join("fingerprint/lib-one"), "f\n");
+    write(&unit.join("out/libone.rlib"), [9u8; 16]);
+    write(
+        &tree.join("build/notes.md"),
+        "hand-written, never committed\n",
+    );
+
+    let planned = fixture.discard(&tree, &["--dry-run"]);
+    let mut discarded: Vec<(String, String)> = planned["discarded"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| {
+            (
+                entry["path"].as_str().unwrap().to_owned(),
+                entry["kind"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect();
+    discarded.sort();
+    let expected = [
+        ("build/CACHEDIR.TAG", "ignored-output"),
+        ("build/debug", "cargo-profile"),
+        ("build/notes.md", "ignored-output"),
+    ]
+    .map(|(path, kind)| (path.to_owned(), kind.to_owned()));
+    assert_eq!(discarded, expected, "{planned}");
+
+    let archive = fixture.archive("units");
+    let output = &archive["manifest"]["build_output"];
+    assert_eq!(output["targets"][0]["path"], "build", "{archive}");
+    // The tag and the two files of the unit.
+    assert_eq!(output["files"], 3, "{archive}");
+    let patch = patch_of(&archive);
+    assert!(patch.contains("b/build/notes.md"), "{patch}");
+    assert!(!patch.contains("b/build/debug/"), "{patch}");
+}
+
 /// A repository with commits no remote holds, below a Flutter app's `build/`: Git reports the
 /// ignored `build/` as one entry and never looks inside, so `discard-cache` sees only a
 /// recognised output directory. The nested repository's commits exist nowhere else, so deleting

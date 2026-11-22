@@ -86,8 +86,9 @@ looks for them follows no symbolic link, and it, the mount table and the keep fi
 immediately before each deletion (`archive` images such a repository).
 
 Each deleted entry is named by the structure that recognises it, never by a directory's name: a
-Cargo profile (it holds `.fingerprint/`) inside a target carrying a valid `CACHEDIR.TAG`, that
-target's `tmp/` test scratch (Cargo's `CARGO_TARGET_TMPDIR`) when the target holds a profile,
+Cargo profile (it holds `.fingerprint/`, or with Cargo 1.100 and later a unit directory
+`build/<package>/<unit>/` holding `fingerprint/`, `<unit>` being 16 lowercase hexadecimal digits)
+inside a target carrying a valid `CACHEDIR.TAG`, that target's `tmp/` test scratch (Cargo's `CARGO_TARGET_TMPDIR`) when the target holds a profile,
 `node_modules` at or below a tracked npm, Yarn, pnpm or Bun lockfile, a virtual environment
 (`pyvenv.cfg`) beside a tracked Python manifest, a Flutter app's `<P>/build/` or `<P>/.dart_tool/`
 (as `flutter-output`) when `<P>/pubspec.yaml` is a regular file beside it and neither HEAD nor the
@@ -96,7 +97,9 @@ index tracks anything at or below it, and a tagged `.pytest_cache`, `.mypy_cache
 classified by the cargo rule alone. Cargo writes the tag only when it creates the target itself,
 so a `target/` made before the first build has none; such a directory counts as tagged when a
 tracked `Cargo.toml` sits beside it and a child other than `tmp/` holds both `.fingerprint/` and
-`deps/`. A target holding anything but Cargo's layout falls to its parts. A symbolic link is
+`deps/`, or a unit directory holding both `fingerprint/` and `out/`. Every part of either layout
+must be a real directory, never a symbolic link, and a directory named `tmp` is no profile by its
+unit directories. A target holding anything but Cargo's layout falls to its parts. A symbolic link is
 deleted itself, never followed, and it refuses while a session lease is live, Git locks the tree, or
 another process has its working directory, executable or an open file inside the tree (observed
 through `/proc` on Linux; elsewhere the report says processes were not observed).
@@ -182,7 +185,8 @@ Below a cargo target that `discard-cache` recognises by structure (a valid `CACH
 untagged `target/` beside a tracked `Cargo.toml` holding a full profile), a file neither HEAD nor
 the index tracks is build layout when its first component below the target is `debug`, `release`,
 `.rustc_info.json`, `tmp`, a `CACHEDIR.TAG` carrying Cargo's signature, or a profile directory (one
-holding `.fingerprint/`; also `<target>/<triple>/<profile>/`). The target is recognised on disk by
+holding `.fingerprint/`, or a unit directory `build/<package>/<unit>/fingerprint/` as Cargo 1.100
+and later write it; also `<target>/<triple>/<profile>/`). The target is recognised on disk by
 that structure and a profile, also when a file Git tracks below it keeps `discard-cache` from
 reaching it; the tracked file stays archived. That covers `deps/`, `build/`, `.fingerprint/`, `incremental/`
 and `*.d`. Everything else below the target, such as `target/ess-conformance/report.json`, and
@@ -251,8 +255,8 @@ bottom-up, re-observing every entry against its image immediately before deletin
 `worktree.archive/3` archive it deletes each left-out file as cache only after re-observing it,
 immediately before deletion, as build layout below the same recognised target; build output grown
 since the archive is deleted the same way. Layout below a target the archive did not record, or a
-left-out file that is no longer build layout (its profile lost `.fingerprint/`, its target is no
-longer recognised), changes the fingerprint and refuses as `archive-stale`. A directory it must
+left-out file that is no longer build layout (its profile lost `.fingerprint/` or its last unit
+directory holding `fingerprint/`, its target is no longer recognised), changes the fingerprint and refuses as `archive-stale`. A directory it must
 empty is made owner-writable first, as Git's own removal does. It then removes the tree without
 `--force`. The archive and its images stay.
 
@@ -328,8 +332,9 @@ it would strip, the sections, bytes and nested images that stay, and the prune v
 would have afterwards. Only a section that purely adds an untracked file is stripped: `new file
 mode`, a path, C-unquoted as Git writes it, that no other section names and that HEAD's tree, read
 from Git, does not track, and that is build layout below a directory the patch's own pure
-additions recognise as a target (a Cargo-signed `<t>/CACHEDIR.TAG` or `<t>/<p>/.fingerprint/…`;
-`<t>/tmp/` only beside a profile), or that lies strictly below a Flutter app's output directory:
+additions recognise as a target (a Cargo-signed `<t>/CACHEDIR.TAG`, `<t>/<p>/.fingerprint/…`, or
+`<t>/<p>/build/<package>/<unit>/fingerprint/…` with `<unit>` 16 lowercase hexadecimal digits and
+`<p>` not `tmp`; `<t>/tmp/` only beside a profile), or that lies strictly below a Flutter app's output directory:
 `<P>/build/` or `<P>/.dart_tool/` (the tree root included as `<P>`) where HEAD's tree holds
 `<P>/pubspec.yaml` as anything but a directory or the patch purely adds it (that section stays), and HEAD's tree
 holds nothing at that path, so a tracked source directory named `build` and a `build/` with no

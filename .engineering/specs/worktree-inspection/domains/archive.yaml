@@ -68,7 +68,9 @@ types:
   #   Strip: `--strip-build-output` found its pure-addition section in an existing patch, below a
   #     directory T for which the patch's pure additions hold a `T/CACHEDIR.TAG` whose content
   #     begins with Cargo's `Signature: 8a477f597d28d172789f06886806bc55` line, or
-  #     `T/<p>/.fingerprint/…`; `.rustc_info.json` or an unsigned tag alone never recognises T.
+  #     `T/<p>/.fingerprint/…`, or `T/<p>/build/<package>/<unit>/fingerprint/…` with `<unit>` 16
+  #     lowercase hexadecimal digits and `<p>` not `tmp` (the profile layout of Cargo 1.100 and
+  #     later); `.rustc_info.json` or an unsigned tag alone never recognises T.
   #     A Flutter app's output directory (worktree.archive.FlutterOutputKind) found in the patch is
   #     recorded with this origin, and so is ignored output, per outermost ignored directory
   #     holding no kept path (or per file, when no such ancestor directory exists).
@@ -201,8 +203,9 @@ entities:
   # order. No field says which: removal re-recognises the recorded directory on disk. Below a cargo target a path is build layout when Git tracks it neither in HEAD nor in
   # the index and its first component under T is `debug`, `release`, `.rustc_info.json`, `tmp`
   # (only while T holds a profile), `CACHEDIR.TAG` (only while it carries Cargo's signature), or a
-  # profile directory (one holding `.fingerprint/` as a direct child; also
-  # `T/<triple>/<profile>/`). Every other path under T, every tracked file under T, and every
+  # profile directory (one holding `.fingerprint/` as a direct child, or a unit directory
+  # `build/<package>/<unit>/` holding `fingerprint/`, `<unit>` being 16 lowercase hexadecimal
+  # digits and the profile not named `tmp`; also `T/<triple>/<profile>/`). Every other path under T, every tracked file under T, and every
   # other ignored directory stays in the archive; a tracked file under T never stops T being
   # recognised.
   # A repository is never build layout, cargo's or a Flutter app's: a path with a `.git`

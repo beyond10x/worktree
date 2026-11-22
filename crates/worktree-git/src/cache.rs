@@ -19,11 +19,12 @@
 use crate::ProcessGit;
 use b10x_worktree_domain::{
     CACHEDIR_TAG_FILE, CACHEDIR_TAG_SIGNATURE, CARGO_MANIFEST, CARGO_PROFILE_DEPS,
-    CARGO_PROFILE_MARKER, CARGO_TARGET_METADATA, CARGO_TARGET_TMP, CARGO_UNTAGGED_TARGET,
-    CacheClassification, CacheKind, DiscardedCache, FlutterFacts, FlutterOutputKind,
-    GIT_DIRECTORY_HEAD, GIT_DIRECTORY_OBJECTS, GIT_DIRECTORY_REFS, GIT_ENTRY, GitDirectoryFacts,
-    KEEP_FILE, NODE_LOCKFILES, PYTHON_MANIFESTS, PYTHON_VIRTUALENV_MARKER, Refusal,
-    TAGGED_TOOL_CACHES, drop_keep_negations, flutter_output_kind, is_cache_tag,
+    CARGO_PROFILE_MARKER, CARGO_TARGET_METADATA, CARGO_TARGET_TMP, CARGO_UNIT_BUILD,
+    CARGO_UNIT_FINGERPRINT, CARGO_UNIT_OUT, CARGO_UNTAGGED_TARGET, CacheClassification, CacheKind,
+    DiscardedCache, FlutterFacts, FlutterOutputKind, GIT_DIRECTORY_HEAD, GIT_DIRECTORY_OBJECTS,
+    GIT_DIRECTORY_REFS, GIT_ENTRY, GitDirectoryFacts, KEEP_FILE, NODE_LOCKFILES, PYTHON_MANIFESTS,
+    PYTHON_VIRTUALENV_MARKER, Refusal, TAGGED_TOOL_CACHES, drop_keep_negations,
+    flutter_output_kind, is_cache_tag, is_cargo_unit_name,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
@@ -1045,7 +1046,9 @@ impl Walk<'_> {
         } else if name.is_some_and(|name| TAGGED_TOOL_CACHES.contains(&name)) && cache_tagged(&path)
         {
             Some(CacheKind::ToolCache)
-        } else if cargo_profile(&path) && cargo_target_root(self.worktree, parent, &self.tracked) {
+        } else if cargo_target_root(self.worktree, parent, &self.tracked) && cargo_profile(&path) {
+            // The target is asked first: only below one is a directory read for a profile's
+            // layout. Both only read the disk, so the order decides no result.
             if top {
                 plan.targets.push(parent.to_path_buf());
             }
@@ -1377,7 +1380,8 @@ pub(crate) fn flutter_facts(
 /// Whether `relative` is a Cargo target classified as tagged: it carries a valid `CACHEDIR.TAG`,
 /// or Cargo did not create it and so wrote none, in which case it must be a real directory named
 /// `target`, beside a tracked `Cargo.toml`, with a direct child other than Cargo's `tmp` holding
-/// both `.fingerprint/` and `deps/` as real directories. An unreadable directory does not qualify.
+/// both `.fingerprint/` and `deps/` as real directories, or one unit directory with both
+/// `fingerprint/` and `out/` ([`full_cargo_profile`]). An unreadable directory does not qualify.
 fn cargo_target_root(worktree: &Path, relative: &Path, tracked: &BTreeSet<PathBuf>) -> bool {
     let directory = worktree.join(relative);
     if cache_tagged(&directory) {
@@ -1430,14 +1434,57 @@ fn regular_file(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_file())
 }
 
-/// A Cargo profile: a real directory holding `.fingerprint/` as a real directory.
+/// A Cargo profile: a real directory holding `.fingerprint/` as a real directory, or, as Cargo
+/// 1.100 and later lay one out, a unit directory holding `fingerprint/` ([`holds_unit`]).
 pub(crate) fn cargo_profile(path: &Path) -> bool {
-    real_directory(path) && real_directory(&path.join(CARGO_PROFILE_MARKER))
+    real_directory(path)
+        && (real_directory(&path.join(CARGO_PROFILE_MARKER))
+            || holds_unit(path, &[CARGO_UNIT_FINGERPRINT]))
 }
 
-/// A profile as only Cargo leaves one: `.fingerprint/` and `deps/`, both real directories.
+/// A profile as only Cargo leaves one: `.fingerprint/` and `deps/`, both real directories, or
+/// one unit directory holding both `fingerprint/` and `out/`. A part of each layout does not
+/// make one: `deps/` beside a unit directory holding `fingerprint/` alone is neither.
 fn full_cargo_profile(path: &Path) -> bool {
-    cargo_profile(path) && real_directory(&path.join(CARGO_PROFILE_DEPS))
+    real_directory(path)
+        && ((real_directory(&path.join(CARGO_PROFILE_MARKER))
+            && real_directory(&path.join(CARGO_PROFILE_DEPS)))
+            || holds_unit(path, &[CARGO_UNIT_FINGERPRINT, CARGO_UNIT_OUT]))
+}
+
+/// Whether `profile` holds a unit directory of Cargo 1.100 and later with every one of `parts`
+/// in it as a real directory: `profile/build/<package>/<unit>/<part>`, where `build`, `<package>`
+/// and `<unit>` are real directories, never symbolic links, and `<unit>` is a unit's name
+/// ([`is_cargo_unit_name`]). One unit directory must hold all of `parts`.
+///
+/// A directory named `tmp` holds none: it is Cargo's test scratch, never a profile, whatever a
+/// test wrote into it. Neither does a `build/` or package directory that cannot be read; like an
+/// unreadable target ([`cargo_target_root`]) it does not qualify, and the walk that then
+/// classifies the directory by its content retains what it cannot read.
+fn holds_unit(profile: &Path, parts: &[&str]) -> bool {
+    if profile.file_name() == Some(OsStr::new(CARGO_TARGET_TMP)) {
+        return false;
+    }
+    real_directories(&profile.join(CARGO_UNIT_BUILD)).any(|package| {
+        real_directories(&package).any(|unit| {
+            unit.file_name()
+                .is_some_and(|name| is_cargo_unit_name(name.as_encoded_bytes()))
+                && parts.iter().all(|part| real_directory(&unit.join(part)))
+        })
+    })
+}
+
+/// The direct entries of `directory` that are real directories; none when `directory` is not a
+/// real directory or cannot be read. An entry that cannot be read is no directory.
+fn real_directories(directory: &Path) -> impl Iterator<Item = PathBuf> {
+    real_directory(directory)
+        .then(|| std::fs::read_dir(directory).ok())
+        .flatten()
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .map(|entry| entry.path())
 }
 
 /// Whether any direct child is a Cargo profile, as in `target/<triple>/debug`.
@@ -1798,6 +1845,68 @@ mod tests {
         assert!(!guard.holds_protected(root.path(), Path::new("scratch")));
         std::fs::rename(&bare, scratch.join("deep/remote.git")).unwrap();
         assert!(guard.holds_protected(root.path(), Path::new("scratch")));
+    }
+
+    /// A profile of unit directories, as Cargo 1.100 lays one out: `build/<package>/<unit>/`
+    /// holding `fingerprint/` makes a profile, and with `out/` beside it the profile that
+    /// qualifies a target without a tag. A `build/` that cannot be read holds none; neither does
+    /// a directory named `tmp`, nor a unit holding `fingerprint/` beside the older layout's
+    /// `deps/`.
+    #[cfg(unix)]
+    #[test]
+    fn a_unit_directory_makes_a_profile_only_when_it_can_be_read_as_cargos() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = tempfile::tempdir().unwrap();
+        let unit = |profile: &str, parts: &[&str]| {
+            let profile = root.path().join(profile);
+            for part in parts {
+                std::fs::create_dir_all(profile.join("build/one/0123456789abcdef").join(part))
+                    .unwrap();
+            }
+            profile
+        };
+        let whole = unit("whole", &["fingerprint", "out"]);
+        assert!(cargo_profile(&whole));
+        assert!(full_cargo_profile(&whole));
+
+        let half = unit("half", &["fingerprint"]);
+        std::fs::create_dir(half.join("deps")).unwrap();
+        assert!(cargo_profile(&half));
+        assert!(!full_cargo_profile(&half));
+
+        let no_fingerprint = unit("no-fingerprint", &["out", "run"]);
+        assert!(!cargo_profile(&no_fingerprint));
+        assert!(!full_cargo_profile(&no_fingerprint));
+
+        // Cargo's test scratch is never a profile, whatever it holds.
+        let scratch = unit("tmp", &["fingerprint", "out"]);
+        assert!(!cargo_profile(&scratch));
+        assert!(!full_cargo_profile(&scratch));
+
+        // The older layout is a profile under any name, as before.
+        let older = root.path().join("older");
+        std::fs::create_dir_all(older.join(".fingerprint")).unwrap();
+        assert!(cargo_profile(&older));
+        assert!(!full_cargo_profile(&older));
+        std::fs::create_dir(older.join("deps")).unwrap();
+        assert!(full_cargo_profile(&older));
+
+        for unreadable in ["build", "build/one"] {
+            let profile = unit(
+                unreadable.replace('/', "-").as_str(),
+                &["fingerprint", "out"],
+            );
+            let locked = profile.join(unreadable);
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+            // A user who reads past the mode (root) sees the layout; nothing to observe then.
+            let hidden = std::fs::read_dir(&locked).is_err();
+            let (profile_seen, full_seen) = (cargo_profile(&profile), full_cargo_profile(&profile));
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+            if hidden {
+                assert!(!profile_seen, "{unreadable}");
+                assert!(!full_seen, "{unreadable}");
+            }
+        }
     }
 
     /// A direct entry of Cargo's `tmp/` may be a file; it is deleted as `cargo-target-tmp`.
