@@ -7,7 +7,7 @@ title: A new tree starts with the dependency artifacts of a built checkout
 summary: the first cargo build in a new tree compiles the workspace's own crates only
 relations:
 - informed_by: story:recognised-build-cache-is-discarded
-revision: 2
+revision: 3
 ---
 ## Outcome
 
@@ -43,24 +43,45 @@ repository, so the first cargo build in the new tree compiles the workspace's ow
 - Not measured: the release profile, a seed built with another rustc or other features (cargo's
   fingerprints then differ and it compiles as without a seed; expected, not run), a crate with a
   native build script, a file system with reflinks, the disk used over a day.
+- Measured on 2026-11-22, one workspace of 3 members and 98 dependency units, one run each on a
+  busy host, seed 419 MiB in 1,439 files:
+  - an empty `target/`: first build 51.8 s, 101 units compiled; seed copied (0.6 s): 9.6 s, 3
+    units compiled; both end at 658 MiB per tree;
+  - seed hard-linked: after one dependency was rebuilt under its old file name in the tree, 10
+    of the seed's files had changed, 3 in content, with cargo 1.99.1 and with 1.100.0. Two of
+    them hold the absolute path of the tree that wrote them. With the seed's files read-only,
+    `cargo build` exits 101 on its lock file;
+  - seed as the lower layer of an overlay in a user and mount namespace: a compile server
+    outside the namespace cannot open the seed's files, a `cargo build` outside it compiles
+    all 101 units, and a second namespace cannot mount the same upper directory.
+- Cargo holds a lock file in the profile directory while it builds (`.cargo-lock`; cargo 1.100
+  also `.cargo-build-lock` and `.cargo-artifact-lock`).
 
 ## Acceptance
 
 1. With the option on and a built checkout of the same repository present, the first
    `cargo build` in the new tree runs rustc for workspace members only. A test reads the
    `Fresh` and `Compiling` lines of `cargo build -v` for a fixture workspace with one dependency
-   that is not a member.
+   that is not a member and whose package id does not hold the checkout's path (cargo rebuilds a
+   path dependency in every checkout).
 2. A member whose source differs from the seed's is rebuilt, also when its files are older than
    the copied artifacts.
-3. `incremental/` is not copied, and neither are the members' own artifacts.
-4. The copy uses a reflink where the file system offers one and a plain copy otherwise. It never
-   makes a hard link.
-5. With no built checkout, with a seed whose `.rustc_info.json` names another rustc, or with the
-   option off, `create` behaves as it does today and says in one line why nothing was copied.
+3. Only the `debug` profile is copied. `incremental/` is not copied, and neither are the
+   members' own artifacts.
+4. Every file is a copy made with the system's copy call, which shares the blocks where the
+   file system can. No name in the new tree is a hard link to a file of the seed. Two names
+   that are one file in the seed are one file in the new tree.
+5. `create` behaves as it does today and says in one line why nothing was copied: with no built
+   checkout, with a seed whose `.rustc_info.json` is missing or names another rustc than the
+   new tree runs, and with a seed whose profile lock is held by a running cargo.
 6. `discard-cache` classifies the seeded directory as cache, like any cargo target.
-7. The tree's record names the seed's path and the bytes copied.
-8. Acceptance 1 and 2 hold for a target directory written by cargo 1.99 and for one written by
-   cargo 1.100.
+7. The tree's record names the seed's path, the files and the bytes copied.
+8. The copy set is tested for a target directory in the layout of cargo 1.99 and in the layout
+   of cargo 1.100. Acceptance 1 and 2 run with real cargo in the pinned toolchain; a run of
+   both with the other cargo is in the pull request's text.
+9. The option is off by default. Without it `create` copies nothing and prints nothing new.
+10. The seed is the checkout with the newest build among the repository's main checkout and
+    its managed trees that passes the checks of acceptance 5.
 
 ## Scope
 
@@ -68,3 +89,9 @@ repository, so the first cargo build in the new tree compiles the workspace's ow
   classifier)
 - the create path of `b10x-worktree` and of the CLI, and a test beside
   `crates/worktree-cli/tests/cache_discard.rs`
+
+## Not in this story
+
+- Profiles other than `debug`, and a target directory set by `CARGO_TARGET_DIR` or
+  `build.target-dir`.
+- Switching the option on for a host.
