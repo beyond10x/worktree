@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.21.0 — 2026-11-22
 
 - `worktree create --seed-target` copies the dependency artifacts of a built checkout of the
   same repository into the new tree's `target/`, so the first `cargo build` there compiles only
