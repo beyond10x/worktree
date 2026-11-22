@@ -2,12 +2,16 @@
 format: aep.planning-md/3
 id: story:create-seeds-the-cargo-target
 kind: story
-status: draft
+status: implemented
 title: A new tree starts with the dependency artifacts of a built checkout
 summary: the first cargo build in a new tree compiles the workspace's own crates only
 relations:
 - informed_by: story:recognised-build-cache-is-discarded
-revision: 3
+revision: 6
+transitions:
+- {from: "draft", to: "proposed", at: "2026-11-22T05:25:53Z", actor: "human:timo", revision: 4, decided_on: {"recorded":{"test_result":1}}}
+- {from: "proposed", to: "active", at: "2026-11-22T05:25:53Z", actor: "human:timo", revision: 5, decided_on: {"recorded":{"test_result":1}}}
+- {from: "active", to: "implemented", at: "2026-11-22T05:25:53Z", actor: "human:timo", revision: 6, decided_on: {"recorded":{"test_result":1}}}
 ---
 ## Outcome
 
