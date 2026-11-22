@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+- `worktree create --seed-target` copies the dependency artifacts of a built checkout of the
+  same repository into the new tree's `target/`, so the first `cargo build` there compiles only
+  the workspace's own crates. `WORKTREE_SEED_TARGET=1` (or `true`) switches it on for every
+  `create`. Off by default: without either, `create` copies nothing and prints nothing new.
+  The seed is the repository's primary checkout or a managed tree, the one whose `target/debug`
+  last gained a unit directory, among those with a valid `CACHEDIR.TAG`, a `.rustc_info.json`
+  holding what `rustc -vV` prints in the new tree, and no profile lock held. Copied are
+  `CACHEDIR.TAG`, `.rustc_info.json` and the dependency units of `debug` in both Cargo layouts,
+  with their modification times; never `incremental/`, another profile, the files at the top of
+  the profile, a lock file or a unit of the workspace's own packages. Every file is a copy,
+  never a hard link to the seed; two names of one file in the seed are one file in the new tree.
+  The seed is only read. `create` prints one line on standard error (`target seeded from …: <n>
+  files, <n> bytes` or `target not seeded: <why>`), `create --json` carries `seed` (`seed`,
+  `files`, `bytes`, or `skipped` with `reason`), and the tree's record keeps it. Reasons:
+  `no-built-checkout`, `rustc-unavailable`, `rustc-info-missing`, `rustc-mismatch`, `lock-held`,
+  `no-dependency-units`, `target-exists`, `target-not-ignored`, `copy-failed`, `unsupported`.
+  The fields are absent unless seeding was asked for; CLI JSON stays at version 4.
+- Library: `WorktreeManager::create_with` with `CreateOptions` and `CreateEvidence`;
+  `GitPort::seed_target` and `RegistryPort::record_seed`, both with a default; `TargetSeed`,
+  `SeedSkip`, `SeedMembers` and `WorktreeRecord::seed` in `b10x-worktree-domain`. The registry
+  gains the table `target_seeds` and stays at schema version 3.
 - A Cargo profile written by Cargo 1.100 is recognised as build cache. That Cargo writes no
   `.fingerprint/` and no `deps/` into a profile: each unit lies in
   `<profile>/build/<package>/<unit>/`, `<unit>` being 16 lowercase hexadecimal digits, and holds

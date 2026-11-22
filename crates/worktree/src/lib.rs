@@ -7,9 +7,9 @@ use b10x_worktree_domain::{
     CreateRequest, DiscoveredWorktree, GitRevision, Lifecycle, OperationEvidence, PatchStripPlan,
     PruneVerdict, ReconciliationAction, ReconciliationAssessment, RecoveryEvidence, RecoveryKind,
     RecoveryProof, Refusal, RelocationIntent, RemoteObservation, RemovalIntent, RepositorySnapshot,
-    ScannedPatch, SkippedArchiveEntry, StripVerdict, SweepItem, WorkspacePolicy, WorktreeId,
-    WorktreeRecord, WorktreeSnapshot, contents_after_strip, decide_archive_prune,
-    decide_archive_strip, require_child,
+    ScannedPatch, SeedSkip, SkippedArchiveEntry, StripVerdict, SweepItem, TargetSeed,
+    WorkspacePolicy, WorktreeId, WorktreeRecord, WorktreeSnapshot, contents_after_strip,
+    decide_archive_prune, decide_archive_strip, require_child,
 };
 use std::path::{Path, PathBuf};
 
@@ -211,6 +211,17 @@ pub trait GitPort: Send + Sync {
     fn last_activity(&self, _worktree: &Path) -> Option<i64> {
         None
     }
+    /// Copy the dependency artifacts of a built checkout into the `target/` of the new tree
+    /// `worktree`, or say why nothing was copied. `candidates` are the checkouts of the same
+    /// repository, the primary one first; the adapter picks the one built last that the rustc
+    /// the new tree runs built and in which no Cargo is building, reads it without changing
+    /// it, and writes only below `worktree`'s `target/`. The default copies nothing.
+    fn seed_target(&self, _candidates: &[PathBuf], _worktree: &Path) -> TargetSeed {
+        TargetSeed::skipped(
+            SeedSkip::Unsupported,
+            "this Git adapter cannot seed a Cargo target",
+        )
+    }
     /// Whether the repository recorded at this root is gone: nothing exists at the path, or a
     /// directory is there with no `.git` of its own.
     ///
@@ -294,6 +305,16 @@ pub trait RegistryPort: Send + Sync {
     fn activate(&self, id: &str, head: &str, now: i64) -> Result<(), Refusal>;
     /// Retain a failed provisioning attempt as evidence.
     fn fail(&self, id: &str, now: i64) -> Result<(), Refusal>;
+    /// Keep in the tree's record what seeding its Cargo target did, so that every later read
+    /// of the record carries it as [`WorktreeRecord::seed`]. Called at most once per record,
+    /// while it is provisioning. The default refuses: a registry that cannot keep it must not
+    /// be asked to seed.
+    fn record_seed(&self, id: &str, _seed: &TargetSeed) -> Result<(), Refusal> {
+        Err(Refusal::new(
+            "target-seed-record-unsupported",
+            format!("this registry cannot record the target seed of {id}"),
+        ))
+    }
     /// Find a record by managed path.
     fn find_by_path(&self, path: &Path) -> Result<Option<WorktreeRecord>, Refusal>;
     /// Return all records.
@@ -985,6 +1006,25 @@ where
         policy: &WorkspacePolicy,
         plan: &CreatePlan,
     ) -> Result<OperationEvidence, Refusal> {
+        self.create_with(policy, plan, CreateOptions::default())
+            .map(|created| created.evidence)
+    }
+
+    /// Reserve and create one detached worktree and, with [`CreateOptions::seed_target`],
+    /// copy the dependency artifacts of a built checkout of the same repository into its
+    /// `target/`.
+    ///
+    /// The candidates are the repository's primary checkout and its active and finished
+    /// managed trees; the Git port picks among them ([`GitPort::seed_target`]). Seeding never
+    /// refuses the creation: when nothing is copied the tree is created as without the
+    /// option, and the seed says why. What the seed did is kept in the tree's record before
+    /// the record becomes active. Without the option nothing is observed, copied or recorded.
+    pub fn create_with(
+        &self,
+        policy: &WorkspacePolicy,
+        plan: &CreatePlan,
+        options: CreateOptions,
+    ) -> Result<CreateEvidence, Refusal> {
         require_canonical_policy(policy)?;
         let repository = self.git.repository_snapshot(&plan.repository_root)?;
         if repository.root != plan.repository_root
@@ -1026,6 +1066,7 @@ where
             last_seen_at: plan.planned_at,
             finished_at: None,
             head: None,
+            seed: None,
         };
         self.registry.reserve(&record)?;
         if let Err(refusal) = self.git.create_detached(plan) {
@@ -1033,17 +1074,47 @@ where
             return Err(refusal);
         }
         let snapshot = self.exact_worktree_snapshot(&plan.repository_root, &plan.path)?;
+        let seed = if options.seed_target {
+            let seed = self
+                .git
+                .seed_target(&self.seed_candidates(plan)?, &plan.path);
+            self.registry.record_seed(plan.id.as_str(), &seed)?;
+            Some(seed)
+        } else {
+            None
+        };
         let now = self.clock.now();
         self.registry
             .activate(plan.id.as_str(), &snapshot.head, now)?;
-        Ok(OperationEvidence {
-            operation: "create".into(),
-            id: plan.id.clone(),
-            path: plan.path.clone(),
-            head: Some(snapshot.head),
-            recovery: None,
-            recorded_at: now,
+        Ok(CreateEvidence {
+            evidence: OperationEvidence {
+                operation: "create".into(),
+                id: plan.id.clone(),
+                path: plan.path.clone(),
+                head: Some(snapshot.head),
+                recovery: None,
+                recorded_at: now,
+            },
+            seed,
         })
+    }
+
+    /// The checkouts a new tree's target may be seeded from: the repository's primary
+    /// checkout first, then its active and finished managed trees in the registry's order.
+    fn seed_candidates(&self, plan: &CreatePlan) -> Result<Vec<PathBuf>, Refusal> {
+        let mut candidates = vec![plan.repository_root.clone()];
+        candidates.extend(
+            self.registry
+                .list()?
+                .into_iter()
+                .filter(|record| {
+                    record.repository_root == plan.repository_root
+                        && record.path != plan.path
+                        && matches!(record.lifecycle, Lifecycle::Active | Lifecycle::Finished)
+                })
+                .map(|record| record.path),
+        );
+        Ok(candidates)
     }
 
     /// Mark a manager-owned worktree finished after checking it is idle and clean.
@@ -1637,6 +1708,7 @@ where
             last_seen_at: now,
             finished_at: None,
             head: Some(snapshot.head.clone()),
+            seed: None,
         };
         self.registry.adopt(&record)?;
         Ok(OperationEvidence {
@@ -3279,6 +3351,24 @@ impl Default for SweepOptions {
     }
 }
 
+/// What [`WorktreeManager::create_with`] does besides creating the tree.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CreateOptions {
+    /// Copy the dependency artifacts of a built checkout of the same repository into the new
+    /// tree's `target/`.
+    pub seed_target: bool,
+}
+
+/// Evidence of [`WorktreeManager::create_with`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateEvidence {
+    /// The creation itself.
+    pub evidence: OperationEvidence,
+    /// What seeding the target did, when requested: the seed with the files and bytes
+    /// copied, or why nothing was copied.
+    pub seed: Option<TargetSeed>,
+}
+
 /// Steps [`WorktreeManager::finish_with`] takes before finishing.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct FinishOptions {
@@ -3460,6 +3550,19 @@ mod tests {
             Ok(())
         }
 
+        /// Copies nothing and names the candidates it was given, in order, as the reason.
+        fn seed_target(&self, candidates: &[PathBuf], _worktree: &Path) -> TargetSeed {
+            self.observations.lock().unwrap().push("seed");
+            TargetSeed::skipped(
+                SeedSkip::NoBuiltCheckout,
+                candidates
+                    .iter()
+                    .map(|candidate| candidate.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(","),
+            )
+        }
+
         fn recovery_refs(&self, _repository: &Path, _head: &str) -> Result<Vec<String>, Refusal> {
             self.observations.lock().unwrap().push("proof");
             Ok(if self.recoverable {
@@ -3602,6 +3705,17 @@ mod tests {
         }
 
         fn fail(&self, _id: &str, _now: i64) -> Result<(), Refusal> {
+            Ok(())
+        }
+
+        fn record_seed(&self, id: &str, seed: &TargetSeed) -> Result<(), Refusal> {
+            let mut records = self.records.lock().unwrap();
+            let record = records
+                .iter_mut()
+                .find(|record| record.id.as_str() == id)
+                .unwrap();
+            assert_eq!(record.lifecycle, Lifecycle::Provisioning);
+            record.seed = Some(seed.clone());
             Ok(())
         }
 
@@ -3861,6 +3975,7 @@ mod tests {
             last_seen_at: 1,
             finished_at: None,
             head: Some("abc".into()),
+            seed: None,
         }
     }
 
@@ -4859,6 +4974,136 @@ mod tests {
             manager.registry().list().unwrap(),
             [] as [b10x_worktree_domain::WorktreeRecord; 0]
         );
+    }
+
+    /// A manager over `records` whose fake Git reports the tree `id` once it is created, and
+    /// the reviewed plan to create it.
+    fn seed_world(
+        temporary: &Path,
+        id: &str,
+        records: impl FnOnce(&Path, &Path) -> Vec<WorktreeRecord>,
+    ) -> (
+        WorktreeManager<FakeGit, FakeRegistry, FixedClock>,
+        WorkspacePolicy,
+        CreatePlan,
+    ) {
+        let workspace = temporary.join("workspace");
+        let repository = workspace.join("repo");
+        let managed_root = temporary.join("managed");
+        std::fs::create_dir_all(&repository).unwrap();
+        let manager = WorktreeManager::new(
+            fake_git(repository.clone()),
+            fake_registry(records(&repository, &managed_root)),
+            FixedClock,
+        );
+        let policy = policy(workspace, managed_root);
+        let plan = manager
+            .plan_create(
+                &policy,
+                CreateRequest {
+                    id: WorktreeId::new(id).unwrap(),
+                    repository,
+                    purpose: "test".into(),
+                    base: b10x_worktree_domain::GitRevision::new("immutable-base").unwrap(),
+                    owner: "test".into(),
+                },
+            )
+            .unwrap();
+        manager.git.snapshots.lock().unwrap().insert(
+            plan.path.clone(),
+            WorktreeSnapshot {
+                path: plan.path.clone(),
+                head: "abc".into(),
+                dirty: false,
+                locked: false,
+            },
+        );
+        (manager, policy, plan)
+    }
+
+    #[test]
+    fn a_seeding_create_offers_the_primary_checkout_and_the_repositorys_live_trees() {
+        let temporary = tempdir().unwrap();
+        let (manager, policy, plan) =
+            seed_world(temporary.path(), "seeded", |repository, managed| {
+                let other = repository.parent().unwrap().join("other");
+                let tree = |name: &str| managed.join("repo").join(name);
+                vec![
+                    named_record(
+                        "active",
+                        repository.to_path_buf(),
+                        tree("active"),
+                        Lifecycle::Active,
+                    ),
+                    named_record(
+                        "removed",
+                        repository.to_path_buf(),
+                        tree("removed"),
+                        Lifecycle::Removed,
+                    ),
+                    named_record(
+                        "failed",
+                        repository.to_path_buf(),
+                        tree("failed"),
+                        Lifecycle::Failed,
+                    ),
+                    named_record(
+                        "elsewhere",
+                        other,
+                        managed.join("other/elsewhere"),
+                        Lifecycle::Active,
+                    ),
+                    named_record(
+                        "finished",
+                        repository.to_path_buf(),
+                        tree("finished"),
+                        Lifecycle::Finished,
+                    ),
+                ]
+            });
+        let created = manager
+            .create_with(&policy, &plan, CreateOptions { seed_target: true })
+            .unwrap();
+
+        let siblings = plan.path.parent().unwrap();
+        let seed = created.seed.expect("a seeding create reports its seed");
+        assert_eq!(
+            seed.reason.as_deref().unwrap(),
+            format!(
+                "{},{},{}",
+                plan.repository_root.display(),
+                siblings.join("active").display(),
+                siblings.join("finished").display()
+            )
+        );
+        let record = manager
+            .registry()
+            .find_by_path(&plan.path)
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.lifecycle, Lifecycle::Active);
+        assert_eq!(record.seed, Some(seed));
+        assert_eq!(created.evidence.operation, "create");
+    }
+
+    #[test]
+    fn a_create_without_the_option_asks_for_no_seed_and_records_none() {
+        let temporary = tempdir().unwrap();
+        let (manager, policy, plan) = seed_world(temporary.path(), "plain", |_, _| Vec::new());
+
+        let created = manager
+            .create_with(&policy, &plan, CreateOptions::default())
+            .unwrap();
+
+        assert_eq!(created.seed, None);
+        assert_eq!(*manager.git.observations.lock().unwrap(), [""; 0]);
+        let record = manager
+            .registry()
+            .find_by_path(&plan.path)
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.seed, None);
+        assert_eq!(record.lifecycle, Lifecycle::Active);
     }
 
     #[cfg(unix)]

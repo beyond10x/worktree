@@ -11,6 +11,10 @@ const TAG: &str =
 /// A unit directory's name as Cargo 1.100 writes one: 16 lowercase hexadecimal digits.
 const UNIT: &str = "0123456789abcdef";
 
+#[cfg(unix)]
+#[path = "cache_discard/target_seed.rs"]
+mod target_seed;
+
 fn git(path: &Path, args: &[&str]) -> String {
     let output = Command::new("git")
         .arg("-C")

@@ -606,6 +606,7 @@ mod tests {
             last_seen_at: 0,
             finished_at: None,
             head: None,
+            seed: None,
         }
     }
 

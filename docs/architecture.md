@@ -286,6 +286,60 @@ repository root, policy-derived destination, and commit before reservation. Git 
 the repository's worktree inventory: the primary checkout and unrelated paths cannot be mistaken
 for a removable linked worktree.
 
+### Seeding the Cargo target
+
+With `CreateOptions::seed_target` (`create --seed-target`, or `WORKTREE_SEED_TARGET=1` or `true`
+for the CLI; off by default) `WorktreeManager::create_with` asks the Git port to seed the new
+tree's `target/` once Git created the tree and before its record becomes active. Seeding refuses
+no creation: the port returns a `TargetSeed` that names the seed with the files and bytes copied,
+or a reason code with one line.
+
+- **Candidates.** The façade names them: the repository's primary checkout, then its active and
+  finished managed trees in the registry's order.
+- **Built.** A candidate counts when its `target/` is a real directory with a valid
+  `CACHEDIR.TAG` and a `debug` profile only Cargo leaves (`.fingerprint/` and `deps/`, or a unit
+  directory with `fingerprint/` and `out/`).
+- **Newest.** Built candidates are tried in the order of the time their profile last gained a
+  unit directory: the latest modification time among `debug/.fingerprint`, `debug/build` and the
+  directories directly in `debug/build`. Cargo creates a unit directory for a unit of a new
+  identity (another dependency version, feature set, profile setting or rustc) and compiles an
+  edited member into the directory it has, so this is the time the checkout last took in a
+  change of its dependency graph. Equal times keep the candidates' order.
+- **Checks.** `rustc -vV` is run once with the new tree as working directory (`RUSTC` names the
+  compiler when set), and the candidate's `.rustc_info.json` must hold that output among the
+  outputs Cargo cached there; Cargo writes no such file when it runs with an empty
+  `RUSTC_WRAPPER`, and a checkout built only that way is no seed. Each profile lock that exists
+  (`.cargo-lock`, `.cargo-build-lock`, `.cargo-artifact-lock`) is opened read-only and locked
+  shared without waiting, and held until the copy ended. A building Cargo holds one of them
+  exclusively (Cargo 1.99 and 1.100: the last two, beside a shared `.cargo-lock`), so the
+  shared lock fails during a build, keeps a Cargo from starting one during the copy, and lets
+  two creations read one seed at once. A candidate that fails is passed over for the next;
+  when none passes, the line names what the newest one failed.
+- **Copy set.** `CACHEDIR.TAG`, `.rustc_info.json`, and of `debug` the entries of `build/` and
+  `.fingerprint/` and the files of `deps/` that are not the workspace's own. Nothing else of the
+  profile is read: not `incremental/`, `examples/`, the lock files or the files at its top.
+- **The workspace's own units.** A unit is the workspace's own when its dep-info file names a
+  source by a relative path, and so is every unit of a package of the same name (a build
+  script's run has no dep-info file). Cargo passes rustc a relative crate root exactly for a
+  package of a path source below the workspace root. The rule errs in three ways, none of which
+  gives a wrong build, since Cargo checks each unit's fingerprint itself: a dependency that
+  shares a member's package name is left out and compiled once; a path dependency outside the
+  workspace root is copied although its hash holds its path; a unit of the workspace without a
+  dep-info file, in a package none of whose units has one, is copied and never used.
+- **Copies.** Each regular file is copied with the standard library's file copy, which shares
+  blocks where the file system can, and gets the seed's access and modification times;
+  directories get the seed's modification time after everything is written. Two names of one
+  file in the seed (same device and inode) become two names of one file in the new tree. A
+  relative symbolic link without `..` is recreated; a unit directory holding any other link, or
+  a socket, pipe or device, is left out of both `build/` and `.fingerprint/`.
+- **Not seeded.** A new tree that already holds `target`, or whose `target/` Git does not ignore
+  (`git check-ignore`); a seed without a dependency unit. A copy that fails removes the
+  `target/` it created and tries no other candidate.
+- **Record.** The `TargetSeed` is stored for the provisioning record in the registry table
+  `target_seeds` and read back as `seed` of the record. `create --json` carries it as `seed`
+  beside `evidence`. Both are absent unless seeding was asked for, so the CLI JSON stays at
+  version 4 and the registry at schema version 3, which earlier releases open.
+
 ## Legacy reconciliation
 
 Reconciliation dry-runs may inventory every candidate, but apply requires exact reviewed ids. An

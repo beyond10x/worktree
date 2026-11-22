@@ -1445,7 +1445,7 @@ pub(crate) fn cargo_profile(path: &Path) -> bool {
 /// A profile as only Cargo leaves one: `.fingerprint/` and `deps/`, both real directories, or
 /// one unit directory holding both `fingerprint/` and `out/`. A part of each layout does not
 /// make one: `deps/` beside a unit directory holding `fingerprint/` alone is neither.
-fn full_cargo_profile(path: &Path) -> bool {
+pub(crate) fn full_cargo_profile(path: &Path) -> bool {
     real_directory(path)
         && ((real_directory(&path.join(CARGO_PROFILE_MARKER))
             && real_directory(&path.join(CARGO_PROFILE_DEPS)))
