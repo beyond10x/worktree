@@ -49,13 +49,63 @@ pub const CACHEDIR_TAG_FILE: &str = "CACHEDIR.TAG";
 /// The bytes a valid `CACHEDIR.TAG` starts with.
 pub const CACHEDIR_TAG_SIGNATURE: &[u8] = b"Signature: 8a477f597d28d172789f06886806bc55";
 
-/// The directory Cargo writes into every profile directory and nowhere else.
+/// The directory Cargo before 1.100 writes into every profile directory and nowhere else. Cargo
+/// 1.100 and later write none; a profile of theirs is known by a unit directory
+/// ([`CARGO_UNIT_BUILD`]).
 pub const CARGO_PROFILE_MARKER: &str = ".fingerprint";
 
-/// The directory Cargo writes compiled crates into, in every profile directory. A target
-/// without a valid tag counts only through a profile holding both this and
-/// [`CARGO_PROFILE_MARKER`] as real directories.
+/// The directory Cargo before 1.100 writes compiled crates into, in every profile directory. A
+/// target without a valid tag counts only through a profile holding both this and
+/// [`CARGO_PROFILE_MARKER`] as real directories, or through one holding a whole unit directory
+/// ([`CARGO_UNIT_OUT`]).
 pub const CARGO_PROFILE_DEPS: &str = "deps";
+
+/// The directory of a profile in which Cargo 1.100 and later keep every unit, each in its own
+/// unit directory `<profile>/build/<package>/<unit>/`, where `<unit>` is a name
+/// [`is_cargo_unit_name`] accepts. Such a profile holds neither [`CARGO_PROFILE_MARKER`] nor
+/// [`CARGO_PROFILE_DEPS`].
+pub const CARGO_UNIT_BUILD: &str = "build";
+
+/// The directory Cargo 1.100 and later write into every unit directory, for a compile unit and
+/// for a build-script run alike. A real directory is a profile when it holds a unit directory
+/// holding this as a real directory, every part of the path a real directory and the profile not
+/// named [`CARGO_TARGET_TMP`].
+pub const CARGO_UNIT_FINGERPRINT: &str = "fingerprint";
+
+/// The directory a unit's output lies in, beside [`CARGO_UNIT_FINGERPRINT`] in its unit
+/// directory. A target without a valid tag counts through a profile with one unit directory
+/// holding both as real directories.
+pub const CARGO_UNIT_OUT: &str = "out";
+
+/// Whether `name` is the name Cargo 1.100 and later give a unit directory: exactly 16 lowercase
+/// hexadecimal digits.
+pub fn is_cargo_unit_name(name: &[u8]) -> bool {
+    name.len() == 16
+        && name
+            .iter()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// The profiles the components of one path place a unit's [`CARGO_UNIT_FINGERPRINT`] in: each
+/// index `n` for which `components[..n]` is a profile directory by the path alone, because the
+/// path goes on `build/<package>/<unit>/fingerprint/<at least one more component>`.
+///
+/// The profile is never the root of the path (`n >= 1`) and never named [`CARGO_TARGET_TMP`],
+/// which Cargo reserves for test scratch. A path that ends at `fingerprint` names none: nothing
+/// shows it to be a directory.
+pub fn cargo_unit_profiles(components: &[&[u8]]) -> Vec<usize> {
+    (1..components.len().saturating_sub(4))
+        .filter(|&index| {
+            let profile = components[index - 1];
+            !profile.is_empty()
+                && profile != CARGO_TARGET_TMP.as_bytes()
+                && components[index] == CARGO_UNIT_BUILD.as_bytes()
+                && !components[index + 1].is_empty()
+                && is_cargo_unit_name(components[index + 2])
+                && components[index + 3] == CARGO_UNIT_FINGERPRINT.as_bytes()
+        })
+        .collect()
+}
 
 /// The one name a Cargo target without a valid tag may carry to count as tagged.
 ///
@@ -159,12 +209,14 @@ pub fn is_cache_tag(contents: &[u8]) -> bool {
 /// A Cargo target is tagged by a valid `CACHEDIR.TAG`. One without a valid tag counts as tagged
 /// when it is named [`CARGO_UNTAGGED_TARGET`], a tracked [`CARGO_MANIFEST`] sits beside it, and a
 /// direct child is a profile holding both [`CARGO_PROFILE_MARKER`] and [`CARGO_PROFILE_DEPS`] as
-/// real directories. The Cargo kinds below then apply to it unchanged. A target holding anything
-/// but Cargo's layout falls to its parts, each named by its own rule.
+/// real directories, or one unit directory holding both [`CARGO_UNIT_FINGERPRINT`] and
+/// [`CARGO_UNIT_OUT`] as real directories. The Cargo kinds below then apply to it unchanged. A
+/// target holding anything but Cargo's layout falls to its parts, each named by its own rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum CacheKind {
-    /// A directory holding `.fingerprint/` inside a tagged Cargo target.
+    /// A profile inside a tagged Cargo target: a directory holding `.fingerprint/`, or with
+    /// Cargo 1.100 and later a unit directory `build/<package>/<unit>/` holding `fingerprint/`.
     CargoProfile,
     /// A tagged Cargo target holding nothing but profiles, Cargo's own metadata and its `tmp/`,
     /// and no `.git` at any depth.
@@ -281,6 +333,83 @@ mod tests {
         ));
         assert!(!is_cache_tag(b""));
         assert!(!is_cache_tag(b"Signature: 0000"));
+    }
+
+    /// A unit directory is named by exactly 16 lowercase hexadecimal digits.
+    #[test]
+    fn a_unit_name_is_sixteen_lowercase_hexadecimal_digits() {
+        assert!(is_cargo_unit_name(b"0123456789abcdef"));
+        assert!(is_cargo_unit_name(b"ffffffffffffffff"));
+        assert!(is_cargo_unit_name(b"0000000000000000"));
+        for name in [
+            &b""[..],
+            b"0123456789abcde",
+            b"0123456789abcdef0",
+            b"0123456789ABCDEF",
+            b"0123456789abcdeg",
+            b"0123456789abcde/",
+            b"0123456789abcde ",
+            b"0123456789abcd\xc3\xa9",
+            b"one-0123456789abcdef",
+        ] {
+            assert!(!is_cargo_unit_name(name), "{name:?}");
+        }
+    }
+
+    /// A path names a profile by a unit's `fingerprint/` only through
+    /// `<profile>/build/<package>/<unit>/fingerprint/<more>`.
+    #[test]
+    fn a_path_names_a_profile_by_a_units_fingerprint_directory() {
+        let profiles = |path: &str| {
+            let components = path
+                .as_bytes()
+                .split(|byte| *byte == b'/')
+                .collect::<Vec<_>>();
+            cargo_unit_profiles(&components)
+        };
+        assert_eq!(
+            profiles("target/debug/build/one/0123456789abcdef/fingerprint/lib-one"),
+            [2]
+        );
+        assert_eq!(
+            profiles("debug/build/one/0123456789abcdef/fingerprint/lib-one"),
+            [1]
+        );
+        assert_eq!(
+            profiles(
+                "t/x86_64-unknown-linux-gnu/release/build/one/0123456789abcdef/fingerprint/a/b"
+            ),
+            [3]
+        );
+        // Each `build` that starts the pattern names its own profile.
+        assert_eq!(
+            profiles(
+                "a/build/one/0123456789abcdef/fingerprint/build/two/fedcba9876543210/fingerprint/x"
+            ),
+            [1, 5]
+        );
+        for path in [
+            "",
+            "build",
+            "build/one/0123456789abcdef/fingerprint/lib-one",
+            "/build/one/0123456789abcdef/fingerprint/lib-one",
+            "target/debug/build/one/0123456789abcdef/fingerprint",
+            "target/debug/build/one/0123456789abcdef/out/libone.rlib",
+            "target/debug/build/one/0123456789abcdef/.fingerprint/lib-one",
+            "target/debug/build/one/0123456789abcdef/Fingerprint/lib-one",
+            "target/debug/build/0123456789abcdef/fingerprint/lib-one",
+            "target/debug/build//0123456789abcdef/fingerprint/lib-one",
+            "target/debug/build/one/0123456789abcde/fingerprint/lib-one",
+            "target/debug/build/one/0123456789abcdef0/fingerprint/lib-one",
+            "target/debug/build/one/0123456789ABCDEF/fingerprint/lib-one",
+            "target/debug/build/one/0123456789abcdeg/fingerprint/lib-one",
+            "target/debug/Build/one/0123456789abcdef/fingerprint/lib-one",
+            "target/debug/deps/one/0123456789abcdef/fingerprint/lib-one",
+            "target/tmp/build/one/0123456789abcdef/fingerprint/lib-one",
+            "target/debug/.fingerprint/one-0123456789abcdef/lib-one",
+        ] {
+            assert_eq!(profiles(path), [] as [usize; 0], "{path}");
+        }
     }
 
     /// `ignored-output` is a new kind value on the unchanged JSON protocol.

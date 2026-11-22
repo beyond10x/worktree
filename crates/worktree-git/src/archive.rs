@@ -18,9 +18,9 @@ use b10x_worktree_domain::{
     BuildOutputOrigin, BuildOutputTarget, CACHEDIR_TAG_FILE, CARGO_PROFILE_MARKER,
     ExcludeObservations, FlutterFacts, FlutterOutputKind, KEEP_FILE, KeepSource,
     NestedRepositoryImage, NewFileSize, PatchStripPlan, Refusal, ScannedPatch, ScannedSection,
-    TargetFacts, WorktreeRecord, archive_image_file, diff_git_path, drop_keep_negations,
-    exclude_queries, exclude_query_path, flutter_output, is_extended_header, is_keep_file,
-    keep_sources, layout_directory, layout_target, relative_path,
+    TargetFacts, WorktreeRecord, archive_image_file, cargo_unit_profiles, diff_git_path,
+    drop_keep_negations, exclude_queries, exclude_query_path, flutter_output, is_extended_header,
+    is_keep_file, keep_sources, layout_directory, layout_target, relative_path,
 };
 use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -1098,7 +1098,8 @@ impl Layout {
 
 /// The cargo targets of a tree that a manifest can name (UTF-8 relative paths): those
 /// `discard-cache` recognises among the ignored entries Git reports, and every directory in which
-/// one of `paths` is a `CACHEDIR.TAG` or below a profile's `.fingerprint/` that the archive's own
+/// one of `paths` is a `CACHEDIR.TAG`, or below a profile's `.fingerprint/` or a unit directory's
+/// `fingerprint/` ([`cargo_unit_profiles`]), that the archive's own
 /// structural rule ([`cache::archive_target`]) recognises on disk. One tracked file below a target
 /// hides the target from the first and never from the second; the tracked file itself stays
 /// archived because it is never build layout.
@@ -1121,6 +1122,17 @@ fn recognised_targets(worktree: &Path, paths: &[Vec<u8>]) -> Result<Vec<Vec<u8>>
                 if index >= 3 {
                     candidates.insert(prefix(index - 2));
                 }
+            }
+        }
+        // A unit directory's `fingerprint/` names its profile as `.fingerprint/` does: the
+        // candidates are the directory holding the profile, and the one above it for
+        // `<target>/<triple>/<profile>/`.
+        for index in cargo_unit_profiles(&components) {
+            if index >= 2 {
+                candidates.insert(prefix(index - 1));
+            }
+            if index >= 3 {
+                candidates.insert(prefix(index - 2));
             }
         }
     }

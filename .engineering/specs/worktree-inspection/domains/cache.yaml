@@ -22,8 +22,15 @@ types:
   # the directory, so a `target/` made before Cargo's first build has none. Such a directory
   # counts as tagged when it is named `target`, a tracked `Cargo.toml` sits beside it, and it
   # holds a direct child other than `tmp/` with both `.fingerprint/` and `deps/` as real
+  # directories, or with a unit directory holding both `fingerprint/` and `out/` as real
   # directories; a CACHEDIR.TAG with a bad signature inside it is not Cargo's metadata. The same three
   # kinds then apply; no new variant.
+  # A profile has one of two layouts. Cargo before 1.100 writes `.fingerprint/` into it. Cargo
+  # 1.100 and later write a unit directory per unit instead, `<profile>/build/<package>/<unit>/`,
+  # `<unit>` being 16 lowercase hexadecimal digits, holding `fingerprint/`. A real directory
+  # holding `.fingerprint/`, or such a unit directory holding `fingerprint/`, is a profile; every
+  # part is a real directory, never a symbolic link, a `build/` or package directory that cannot
+  # be read holds no unit, and a directory named `tmp` is no profile by its unit directories.
   # FlutterOutput: an ignored real directory `P/build/` or `P/.dart_tool/` that is a Flutter app's
   # output directory (worktree.archive.FlutterOutputKind) by the one build-output classifier
   # `archive` and `prune-archives --strip-build-output` use: `P/pubspec.yaml` is a regular file on

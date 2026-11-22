@@ -10,11 +10,14 @@
 //! Inside a recognised cargo target `T` a path is build layout when its first component below `T`
 //! is `debug`, `release` or `.rustc_info.json`, `tmp` while `T` holds a profile, `CACHEDIR.TAG`
 //! while it carries Cargo's signature, or a profile directory (one holding `.fingerprint/` as a
-//! direct child; also `T/<triple>/<profile>/`). Every other path below `T` stays archived. On
+//! direct child, or with Cargo 1.100 and later a unit directory `build/<package>/<unit>/` holding
+//! `fingerprint/`; also `T/<triple>/<profile>/`). Every other path below `T` stays archived. On
 //! disk, `T` is recognised by `discard-cache`'s structural rule (a valid tag or the untagged-target
 //! rule, and at least one profile); in a patch, `T` is a directory for which the patch purely adds
-//! a Cargo-signed `T/CACHEDIR.TAG` or `T/<p>/.fingerprint/…`. A section that is not a pure addition
-//! of an untracked path, or whose path another section names too, is never stripped.
+//! a Cargo-signed `T/CACHEDIR.TAG`, `T/<p>/.fingerprint/…` or
+//! `T/<p>/build/<package>/<unit>/fingerprint/…` ([`crate::cargo_unit_profiles`]). A section that
+//! is not a pure addition of an untracked path, or whose path another section names too, is never
+//! stripped.
 //!
 //! A Flutter app's output ([`FlutterOutputKind`]) is `P/build/` and `P/.dart_tool/` beside a
 //! `pubspec.yaml`, where nothing is tracked at that path. One classifier
@@ -37,7 +40,7 @@
 use crate::{
     ARCHIVE_PATCH_FILE, ArchiveContents, ArchiveEntryKind, ArchiveManifest, CACHEDIR_TAG_FILE,
     CARGO_PROFILE_MARKER, CARGO_TARGET_TMP, GIT_DIRECTORY_HEAD, GIT_DIRECTORY_OBJECTS, GIT_ENTRY,
-    KEEP_FILE, PruneVerdict, SkippedArchiveEntry, is_cache_tag,
+    KEEP_FILE, PruneVerdict, SkippedArchiveEntry, cargo_unit_profiles, is_cache_tag,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -231,7 +234,8 @@ pub struct TargetFacts {
 /// layout.
 ///
 /// `profile(prefix)` reports whether `prefix`, one or two components below the target, is a
-/// profile directory: one holding `.fingerprint/` as a direct child.
+/// profile directory: one holding `.fingerprint/` as a direct child, or a unit directory
+/// `build/<package>/<unit>/` holding `fingerprint/`.
 pub fn is_build_layout(
     rest: &[u8],
     facts: TargetFacts,
@@ -745,7 +749,8 @@ pub struct PatchStripPlan {
 struct PatchTargets {
     /// Targets that are UTF-8 relative paths, in path-byte order.
     targets: Vec<Vec<u8>>,
-    /// Profile directories: each holds an added `.fingerprint/…` file.
+    /// Profile directories: each holds an added `.fingerprint/…` file, or an added
+    /// `build/<package>/<unit>/fingerprint/…` file.
     profiles: BTreeSet<Vec<u8>>,
     /// Directories holding an added, Cargo-signed `CACHEDIR.TAG`.
     tagged: BTreeSet<Vec<u8>>,
@@ -753,7 +758,8 @@ struct PatchTargets {
 
 impl PatchTargets {
     /// Recognise targets from added paths, each with whether its content is a signed tag: a
-    /// signed `T/CACHEDIR.TAG`, or `T/<p>/.fingerprint/…`.
+    /// signed `T/CACHEDIR.TAG`, `T/<p>/.fingerprint/…`, or
+    /// `T/<p>/build/<package>/<unit>/fingerprint/…` ([`cargo_unit_profiles`]).
     fn recognise(added: &[(&[u8], bool)]) -> Self {
         let mut profiles = BTreeSet::new();
         let mut targets = BTreeSet::new();
@@ -772,6 +778,14 @@ impl PatchTargets {
                     if index >= 2 {
                         targets.insert(prefix(index - 1));
                     }
+                }
+            }
+            // The profile of a unit directory is `components[..index]`, as that of
+            // `.fingerprint` above.
+            for index in cargo_unit_profiles(&components) {
+                profiles.insert(prefix(index));
+                if index >= 2 {
+                    targets.insert(prefix(index - 1));
                 }
             }
         }
@@ -796,7 +810,8 @@ impl PatchTargets {
         }
     }
 
-    /// Whether `target/prefix` is a profile the patch adds a `.fingerprint/` file to.
+    /// Whether `target/prefix` is a profile the patch adds a `.fingerprint/` file to, or a
+    /// unit's `fingerprint/` file.
     fn profile(&self, target: &[u8], prefix: &[u8]) -> bool {
         let mut directory = target.to_vec();
         directory.push(b'/');
@@ -969,7 +984,8 @@ enum Stripped<'a> {
 /// path when the keep file is unreadable), and none at or below a directory whose rules are
 /// unknown ([`ExcludeObservations::unknown_rules`]). It is build layout when its path lies below a
 /// directory the patch's own pure additions recognise as a cargo target, by a Cargo-signed
-/// `CACHEDIR.TAG` or a profile's `.fingerprint/`, or strictly below a Flutter app's output
+/// `CACHEDIR.TAG`, a profile's `.fingerprint/` or a unit directory's `fingerprint/`
+/// ([`cargo_unit_profiles`]), or strictly below a Flutter app's output
 /// directory ([`FlutterOutputKind`]) beside a `pubspec.yaml` HEAD holds or the patch purely adds
 /// and that is no cargo target the patch recognises; the outermost such directory is recorded.
 /// It is ignored output when both HEAD's and the tree's exclude rules ignore its path
@@ -2128,6 +2144,97 @@ mod tests {
             section("target/tmp/scratch", true),
         ]);
         assert_eq!(plan.strip, [true, true, true], "{plan:?}");
+    }
+
+    /// Cargo 1.100 writes no `.fingerprint/`: a unit's `fingerprint/` below
+    /// `<profile>/build/<package>/<unit>/` names the profile and the target holding it, as
+    /// `.fingerprint/` does, directly below the target and below a target-triple directory.
+    #[test]
+    fn a_unit_fingerprint_recognises_a_patch_target() {
+        let plan = strip_plan(&[
+            section(
+                "target/custom/build/one/0123456789abcdef/fingerprint/lib-one",
+                true,
+            ),
+            section(
+                "target/custom/build/one/0123456789abcdef/out/libone.rlib",
+                true,
+            ),
+            section("target/custom/.cargo-lock", true),
+            section("target/debug/one.d", true),
+            section("target/tmp/scratch", true),
+            section("target/notes.md", true),
+            section("target/doc/index.html", true),
+            section("evidence/custom/notes.txt", true),
+        ]);
+        assert_eq!(
+            plan.strip,
+            [true, true, true, true, true, false, false, false],
+            "{plan:?}"
+        );
+        assert_eq!(plan.targets, [strip_target("target", 5)]);
+
+        // Below a target-triple directory the directory holding the profile is the target.
+        let plan = strip_plan(&[
+            section(
+                "target/x86_64-unknown-linux-gnu/custom/build/one/0123456789abcdef/fingerprint/a",
+                true,
+            ),
+            section("target/x86_64-unknown-linux-gnu/custom/one.d", true),
+            section("target/x86_64-unknown-linux-gnu/notes.md", true),
+            section("target/custom/one.d", true),
+        ]);
+        assert_eq!(plan.strip, [true, true, false, false], "{plan:?}");
+        assert_eq!(
+            plan.targets,
+            [strip_target("target/x86_64-unknown-linux-gnu", 2)]
+        );
+
+        // Only a pure addition recognises a target, as with `.fingerprint/`.
+        let unit = "target/custom/build/one/0123456789abcdef/fingerprint/lib-one";
+        for disguised in [
+            ScannedSection {
+                tracked: true,
+                ..section(unit, true)
+            },
+            section(unit, false),
+        ] {
+            let plan = strip_plan(&[disguised, section("target/custom/one.d", true)]);
+            assert_eq!(plan.sections_stripped, 0, "{plan:?}");
+        }
+    }
+
+    /// What names no profile in a patch: `fingerprint` added as a file (nothing below it), a
+    /// unit name that is not 16 lowercase hexadecimal digits, another name where `build` or
+    /// `fingerprint` belongs, a profile that would be the tree root or is named `tmp`, and a
+    /// profile at the tree's top, which has no directory above it to be the target.
+    #[test]
+    fn a_path_that_is_no_unit_fingerprint_recognises_no_patch_target() {
+        for unrecognised in [
+            "x/custom/build/pkg/0123456789abcdef/fingerprint",
+            "x/custom/build/pkg/0123456789abcde/fingerprint/lib",
+            "x/custom/build/pkg/0123456789abcdef0/fingerprint/lib",
+            "x/custom/build/pkg/0123456789ABCDEF/fingerprint/lib",
+            "x/custom/build/pkg/0123456789abcdeg/fingerprint/lib",
+            "x/custom/build/pkg/0123456789abcdef/.fingerprint-lib/lib",
+            "x/custom/build/pkg/0123456789abcdef/out/lib",
+            "x/custom/build/0123456789abcdef/fingerprint/lib",
+            "x/custom/Build/pkg/0123456789abcdef/fingerprint/lib",
+            "x/custom/out/pkg/0123456789abcdef/fingerprint/lib",
+            "x/tmp/build/pkg/0123456789abcdef/fingerprint/lib",
+            "build/pkg/0123456789abcdef/fingerprint/lib",
+            "custom/build/pkg/0123456789abcdef/fingerprint/lib",
+        ] {
+            let plan = strip_plan(&[
+                section(unrecognised, true),
+                section("x/custom/one.d", true),
+                section("x/debug/one.d", true),
+                section("x/tmp/scratch", true),
+                section("custom/one.d", true),
+                section("debug/one.d", true),
+            ]);
+            assert_eq!(plan.sections_stripped, 0, "{unrecognised}: {plan:?}");
+        }
     }
 
     #[test]
