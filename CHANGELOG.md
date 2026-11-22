@@ -1,5 +1,29 @@
 # Changelog
 
+## Unreleased
+
+- A Cargo profile written by Cargo 1.100 is recognised as build cache. That Cargo writes no
+  `.fingerprint/` and no `deps/` into a profile: each unit lies in
+  `<profile>/build/<package>/<unit>/`, `<unit>` being 16 lowercase hexadecimal digits, and holds
+  `fingerprint/` and `out/`. Such a profile was no profile to any rule: `discard-cache` named it
+  `ignored-output`, a `target/` without a tag was not recognised, and `archive` wrote the
+  target's files into `dirty.patch`. Now a directory holding a unit directory with `fingerprint/`
+  is a profile wherever one holding `.fingerprint/` is: inside a tagged target, below a
+  target-triple directory, in `archive` and its removal, and in the pure additions
+  `prune-archives --strip-build-output` reads from a patch
+  (`<t>/<p>/build/<package>/<unit>/fingerprint/…`). A `target/` without a tag counts through a
+  unit directory holding both `fingerprint/` and `out/`. `build`, the package, the unit,
+  `fingerprint` and `out` must be real directories, never symbolic links, and a directory named
+  `tmp` is no profile by this rule. The older layout is recognised as before.
+- An archive an earlier release wrote of a still-linked tree holds the files of such a profile.
+  Where it recorded no target for them, it verifies as before and removal through it deletes
+  only files it holds. Where it recorded the target, because an older profile lay beside the
+  new one, and the new profile is named neither `debug` nor `release`, this release leaves the
+  profile's files out, so verifying that archive answers `archive-stale` and deletes nothing;
+  `worktree archive --replace` writes a new one.
+- `rust-toolchain.toml` pins rustc 1.100.0 with `rustfmt` and `clippy`. The gate and release
+  workflows install the toolchain that file names instead of the forge's current stable.
+
 ## 0.20.0 — 2026-11-10
 
 - `gc` reports each assessment on standard error as it finishes, so a long dry run no longer

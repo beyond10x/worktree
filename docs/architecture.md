@@ -109,7 +109,16 @@ ignored entries, which now also reports each target it recognised) and, because 
 below a target keeps that walk from reaching it, also checks each directory a listed path places a
 `CACHEDIR.TAG` or a profile's `.fingerprint/` in against the same structure on disk
 (`cache::archive_target`, used only by archives; `discard-cache`'s deletions are unchanged). It
-excludes the paths HEAD or the index tracks and observes profiles on disk. The capture leaves those files out of the
+excludes the paths HEAD or the index tracks and observes profiles on disk. A profile has one of
+two layouts. Cargo before 1.100 writes `.fingerprint/` and `deps/` into it. Cargo 1.100 and later
+write neither: each unit lies in `<profile>/build/<package>/<unit>/`, `<unit>` being 16 lowercase
+hexadecimal digits, and holds `fingerprint/` and `out/`. A profile is a real directory holding
+`.fingerprint/`, or such a unit directory holding `fingerprint/`, every part a real directory;
+the rule for a target without a tag asks for `.fingerprint/` and `deps/`, or for one unit
+directory holding both `fingerprint/` and `out/`. The domain names the parts and decides, I/O-free,
+whether a name is a unit's (`is_cargo_unit_name`) and which profiles a path's components place a
+unit's `fingerprint/` in (`cargo_unit_profiles`, never one named `tmp`); the Git adapter reads the
+disk, and a `build/` or package directory it cannot read holds no unit. The capture leaves those files out of the
 scratch index, so the patch and the fingerprint never see them, and the manifest records them per
 target as `build_output` in format `worktree.archive/3`.
 
